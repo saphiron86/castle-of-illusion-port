@@ -1,0 +1,21 @@
+# Hardware addresses: <hex address> <name> [comment]
+# tools/disasm.py writes these to src/hardware.asm and uses the names in place of
+# matching absolute addresses.
+
+# Z80 RAM, as seen from the 68000. The $1C00 area is the sound driver's mailbox
+# (see docs/sound.md); LoadSoundDriver seeds it with Z80Data_1C00.
+A00000 Z80_RAM
+A01C08 Z80_LoopRelease  1 lets a looping sound (data command $FD) finish; 0 re-arms it
+A01C0A Z80_SfxRequest   sound effects and special commands, IDs $A0-$D3; $C1 on pause
+A01C0C Z80_MusicRequest music, IDs $81-$9F
+A01C12 Z80_PauseState   driver pause state; the 68000 writes $80 (resume) on unpause
+A01C13 Z80_Paused       1 while the game is paused, 0 otherwise (read by data command $FC)
+
+# Z80 control
+A11100 Z80_BusReq       write $100 to request the Z80 bus, 0 to release; bit 0 reads 0 when granted
+A11200 Z80_Reset        write 0 to hold the Z80 in reset, $100 to release
+
+# I/O and VDP
+A10001 IO_Version       console version register
+C00000 VDP_Data
+C00004 VDP_Ctrl

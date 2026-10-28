@@ -1,0 +1,17 @@
+# RAM variables: <hex address> <name> [comment]
+# tools/disasm.py writes these to src/ram.asm and uses the names in place of
+# matching absolute addresses.
+FFF300 GameState        word: GameStateTable offset (state number x 2)
+FFF302 VIntMode         word: VInt_ModeTable entry
+FFF400 VBlankWait       byte: set by WaitVBlank, cleared by VInt
+FFF40E SoundRequest     byte: sound ID for PlaySound
+FFF41D PauseFlag        byte: bit 0 toggled when bit 7 of $FFF309 is set (probably Start)
+FFCA00 SpawnGrid        byte width, byte height (128 px cells), cell list offsets, spawn entries
+FF9820 FollowWindow     4 words, screen pixels: right, left, bottom, top thresholds for CameraFollow
+FFFA80 CameraA          plane A camera ($40 bytes), see docs/widescreen.md
+FFFA84 CameraA_X
+FFFAC0 CameraB          plane B camera, same layout as CameraA
+FFFAC4 CameraB_X
+FFFF0C ConsoleVersion   byte: copy of the version register $A10001
+FFFF60 RamStubs_RAM     21 jmp stubs copied from RamStubs by InstallRamStubs
+FFFF8A PlaySound_RAM    RAM stub that jumps to PlaySound

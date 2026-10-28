@@ -1,0 +1,22 @@
+# Copyrighted game data: never commit the ROM or anything extracted from it.
+rom/*
+!rom/README.md
+*.bin
+*.md5
+build/
+assets/
+# The disassembly, generated from your ROM by tools/disasm.py (only these two are written by hand)
+src/*.asm
+!src/main.asm
+!src/header.asm
+# MD+ soundtrack packs (a patched ROM and the music): supplied by you, like the ROM
+mdplus/
+*.7z
+
+# Third-party libraries, fetched by tools/fetch_deps.py
+third_party/
+
+# Tool output
+tools/bin/
+__pycache__/
+*.lst

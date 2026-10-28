@@ -1,0 +1,45 @@
+# Z80 address names for the sound driver: <hex address> <name> [code] [comment]
+# Entries marked "code" name routines and tables in the driver; the others are
+# used as operands (ld a,(nn), ld hl,nn and similar) and written to
+# src/z80names.asm. See docs/sound.md.
+
+# Routines and tables
+0028 z80_TableLookup code       rst $28: hl = word at hl + 2*a (falls into $0030)
+0038 z80_VBlankIRQ code         counts down Drv_StartDelay; runs z80_UpdateFrame only while Drv_IrqUpdateOff is 0
+0053 z80_Init code
+006F z80_MainLoop code          polls YM2612 timers A and B
+00D9 z80_UpdateFrame code       full update when Drv_TickCounter runs out on timer A
+04DB z80_ProcessRequests code   music request, then the pending sound from z80_PickSound
+0509 z80_SpecialTable code      IDs $D0-$D3
+0532 z80_StartMusic code        ID - $81, reset playback, start the song
+070F z80_CheckPause code        Drv_PauseState: 1 pauses (once), 2 stays paused, $80 resumes
+0720 z80_Resume code
+086D z80_PickSound code         move a request from Mbox_SfxRequest/$1C0B to Drv_PendingSound
+09AD z80_DataCommandTable code  sound data commands $E0-$FF
+0A12 z80_Cmd_FC code            pause or resume depending on Mbox_Paused
+0A98 z80_Cmd_F4 code            queue a music request from the data
+0CD7 z80_Cmd_FD code            jump unless Mbox_LoopRelease is set (then clear it and continue)
+0CE4 z80_Cmd_F6 code            jump in the sound data
+
+# Mailbox written by the 68000 (see config/hardware.txt)
+1C08 Mbox_LoopRelease
+1C0A Mbox_SfxRequest           sound effects and special commands, IDs $A0 and up
+1C0C Mbox_MusicRequest         music, IDs $81-$9F
+1C13 Mbox_Paused               set by the 68000 while the game is paused
+
+# Driver state
+1C07 Drv_IrqUpdateOff          seeded with $80; nothing traced clears it
+1C09 Drv_PendingSound          set by z80_PickSound, dispatched by z80_ProcessRequests
+1C0B Drv_SfxRequest2           second request slot read by z80_PickSound
+1C12 Drv_PauseState            0 running, 1 pause requested, 2 paused, $80 resume (written by both CPUs)
+1C16 Drv_TickCounter           counted down on each timer A tick; at zero, z80_UpdateFrame runs
+1C17 Drv_TickPeriod            reload value for Drv_TickCounter
+1FFF Drv_StartDelay            set to 3 by z80_Init, counted down by z80_VBlankIRQ
+
+# Hardware, as seen from the Z80
+4000 YM_Port0_Addr      YM2612 part I address (status on read: timer A/B flags in bits 0/1)
+4001 YM_Port0_Data
+4002 YM_Port1_Addr      YM2612 part II address
+4003 YM_Port1_Data
+6000 BankReg            68000 bank register (serial, one bit per write)
+7F11 PSG                SN76489

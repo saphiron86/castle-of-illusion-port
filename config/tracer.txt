@@ -1,0 +1,55 @@
+# Tracer directives for tools/trace.py
+#
+# ramcopy <ram address> <rom address> <size> [stubs=N]
+#   Code copied from ROM into RAM at boot. Calls into the RAM range are traced
+#   at the matching ROM address. stubs=N traces N 6-byte jmp stubs at the start
+#   of the copy, including ones nothing calls.
+# table <address> <kind> <jump site> [count=N] [skip=i,j,...]
+#   A jump table the tracer cannot recognise on its own, and the address of the
+#   indirect jump or call that uses it. count fixes the number of entries
+#   (otherwise the table ends at the lowest target after it); skip lists entry
+#   indexes (decimal) that hold stale pointers and must not be traced. Kinds:
+#     abs16    16-bit zero-extended code addresses
+#     abs32    32-bit code addresses
+#     rel16    16-bit offsets from the table start
+#     abs16x2  16-bit addresses of abs16 sub-tables (two-level dispatch)
+#     rel8     unsigned byte offsets from base=<address>; needs count=N
+# targets <jump site> <address>,<address>,...
+#   The possible destinations of an indirect jump the tracer cannot work out,
+#   such as a routine address passed in a register by the caller.
+# helper <address> <kind> <register> <jump site>
+#   A shared dispatch routine that jumps through a table the caller passes in
+#   <register>. At each call, the tracer reads the table from the closest
+#   preceding lea into that register.
+
+# RAM jump stubs at $FFFF60. InstallRamStubs ($000438) copies 160 bytes from
+# $00044C to $FFFF60-$FFFFFF; only the first $7E bytes are the 21 jmp stubs.
+ramcopy FFFF60 00044C 007E stubs=21
+
+# Two-level dispatch at $00DC66: $FFFF44 selects the sub-table, $FFFF46 the routine
+table 00DC86 abs16x2 00DC7E
+
+# Dispatch by ID at $001904: IDs below $C8 use $001D40, the rest use $001ED0.
+# Stale entries: 0 -> $60A6 (inside the instruction at $60A0), 92 -> $2156
+# (inside the move.b at $2152), 94 -> $27B8 (inside the bsr.w at $27B6),
+# 99 -> $1D70 (inside this table).
+table 001D40 abs16 00192A count=200 skip=0,92,94,99
+table 001ED0 abs32 00192A
+
+# $00CC04: byte $A of the current object, halved, picks one of four
+# moveq d1/d2 snippets at $00CC14 through this byte table
+table 00CC38 rel8 00CC10 count=16 base=00CC14
+
+# Object state dispatch on byte 3 of the current object (a0)
+helper 001C74 abs16 a1 001C82
+helper 001C84 rel16 a1 001C92
+helper 07C146 rel16 a1 07C152
+
+# Decompressor row output: a3 is set to one of four routines by NemDec_ToVDP
+# ($07FBAE) or NemDec_ToRAM ($07FBC0), plus $A for XOR mode
+targets 07FC38 07FC70,07FC7A,07FC86,07FC90
+
+# $00BED8: rel16 table in a1, index in d7. Callers jump here with their own a1;
+# $00BED0 loads its table at $00BEE2 and falls through.
+helper 00BED8 rel16 a1 00BEDE
+table 00BEE2 rel16 00BEDE

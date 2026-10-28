@@ -1,0 +1,108 @@
+# Known addresses: <hex address> <name> [code|data]
+# Code labels seed the tracer in tools/trace.py; all names are used by tools/disasm.py.
+
+# Boot and main loop
+000200 EntryPoint code          # reset vector: Sega boot code (TMSS, VDP/Z80/PSG init)
+00029C BootInitData data        # register values and Z80 program used by EntryPoint
+000300 GameInit code
+0003C2 MainLoop code            # call the current game state, then wait for vblank
+0003D8 GameStateTable data      # 24 routines, indexed by GameState
+000438 InstallRamStubs code     # copy 160 bytes from RamStubs to $FFFF60-$FFFFFF
+00044C RamStubs code            # 21 jmp stubs, run from RAM at $FFFF60
+
+# Game states: GameStateTable entries, named after the GameState value that selects them.
+# States $18-$26 are jmp stubs into the module at $07A000.
+009C94 GameState_00 code
+009CA6 GameState_02 code
+009CAC GameState_04 code
+009CDE GameState_06 code
+009E96 GameState_08 code
+009F38 GameState_0A code
+0095D2 GameState_0C code
+0097BA GameState_0E code
+00FC50 GameState_10 code
+009D56 GameState_12 code
+00A0B8 GameState_14 code
+00A0FE GameState_16 code
+000408 GameState_18 code
+00040E GameState_1A code
+000414 GameState_1C code
+00041A GameState_1E code
+000420 GameState_20 code
+000426 GameState_22 code
+00042C GameState_24 code
+000432 GameState_26 code
+00A170 GameState_28 code
+00A1C8 GameState_2A code
+00A110 GameState_2C code
+00A158 GameState_2E code
+
+# Utilities
+009486 FillLongs32 code         # unrolled fill: d1 to (a1)+, 32 longs
+0094A6 FillLongs16 code         # last 16 longs of the same sequence
+0094B6 FillLongs8 code          # last 8 longs of the same sequence
+0094C8 WriteLongsToPort code    # unrolled d1 to (a1) without increment (VDP data port)
+00950A CopyLongs32 code         # unrolled copy of 32 longs, (a1)+ to (a2)+
+00953A CopyLongs8 code          # last 8 longs of the same sequence
+0095B8 WaitVBlank code          # set VBlankWait, enable interrupts, spin until VInt clears it
+
+# VDP
+00A78E LoadGraphicsSets code    # up to 4 set IDs packed in d0, decompressed to VRAM via NemDec_ToVDP
+00AC50 ClearVRAM code           # DMA fill all of VRAM with 0, then wait for the DMA
+00ADB4 LoadSolidColorTiles code # tiles 0-15 at VRAM $0000, each filled with one palette index
+00ADFA FillPlaneRect code       # fill a rectangle of a 64-cell-wide plane: d0 VDP command, d1/d2 size-1, d4 tile
+00AE1E LoadPlaneRectBytes code  # same rectangle, tiles from bytes at (a1)+ plus d3
+
+# Objects
+00C5DC AnimateObject code       # step animation: script at $6(a0), anim $A, frame $B, timer $C
+001AB6 DrawObject code          # animate, convert to screen space, delete if out of range, build sprites
+001C94 DeleteObject code        # release the spawn-list entry at $24(a0), clear the 64-byte slot
+001C1E ClipSpriteY code         # keep a sprite piece only if $60 <= Y < $180 (screen Y -32 to 255)
+001C34 ClipSpriteX code         # keep a sprite piece only if $60 <= X < $1E0 (screen X -32 to 351), unless bit 5 of $E(a0)
+001CD2 ApplyVelocity code       # 16.16 position $10/$14(a0) += velocity $18/$1C(a0)
+00F32E IsRectVisibleA code      # block rect at $18-$1E(a0) vs CameraA view of $14 x $E blocks (320 x 224)
+00DA9C IsRectVisibleB code      # same test against CameraB, $14 x $C blocks
+
+# Object spawning (spawn grid of 128 x 128 px cells at SpawnGrid)
+06D52A UpdateSpawns code        # per frame: SpawnColumn when CameraA X crosses a 128 px boundary
+06D5BA SpawnColumn code         # d0 = camera X: grid column at X+384 (moving right) or X-113 (left), 5 cells from Y-128
+06D612 SpawnCell code           # spawn every not-yet-spawned entry in one cell into a free slot
+06D6B4 LoadLevelObjects code    # load the spawn grid, spawn the fixed objects, fill the initial columns
+
+# Camera
+00E896 LoadLevelHeader code     # LevelTable[level][act]: follow window, then InitCamera for both cameras
+00E8F2 LevelTable data          # per level: pointer to a list of 16-bit level header addresses, one per act
+00EEAC InitCamera code          # copy 16 bytes from (a0); min X/Y = 0 (or from the start X), max = level size - 320 x 224
+00F71A CameraFollow code        # clamp the player to the level, then set CameraA velocity from FollowWindow
+00F872 UpdateCamera code        # add velocity, clamp to min/max, then stream columns and rows
+
+# Plane streaming
+00F982 StreamColumn code        # a6 = camera: when X crosses 16 px, build the column 384 px right / 128 px left
+00FA9A FlushPlaneUpdates code   # from VInt: write pending rows ($3E) and columns ($3F) of both cameras
+00FAE4 WritePlaneColumn code    # auto-increment $80, two 8 px columns from the buffer at (a1)
+00FB04 WritePlaneRow code
+00954C CopyLongsToPort code     # unrolled (a1)+ to (a2)
+
+# Sound: the 68000 loads a program into Z80 RAM and lets the Z80 run it
+079EE0 LoadSoundDriver code     # reset Z80, take its bus, copy the blocks below, restart it
+0784B0 Z80Driver data           # $EF0 bytes to Z80 RAM $0000
+0793A0 Z80Data_0F00 data        # $880 bytes to Z80 RAM $0F00
+079C20 Z80Data_1900 data        # $2C0 bytes to Z80 RAM $1900
+079F76 Z80Data_1C00 data        # $F bytes to Z80 RAM $1C00
+079F86 PlaySound code           # send SoundRequest: IDs below $A0 to Z80_MusicRequest, others to Z80_SfxRequest
+009770 UpdateSoundPause code    # tell the driver the new PauseFlag state
+002412 SetSoundLoopRelease code # write d0 to Z80_LoopRelease: 1 lets a looping sound end, 0 re-arms
+
+# Graphics decompression (matches the Nemesis format used by many Genesis games)
+07FBAE NemDec_ToVDP code        # decompress (a0) to the VDP data port
+07FBC0 NemDec_ToRAM code        # decompress (a0) to RAM at (a4)
+07FC70 NemDec_WriteVDP code     # row output routines, selected through a3
+07FC7A NemDec_WriteVDP_XOR code
+07FC86 NemDec_WriteRAM code
+07FC90 NemDec_WriteRAM_XOR code
+
+# Interrupts
+00CF92 VInt code                # vertical blank, IRQ 6
+00D036 VInt_ModeTable data      # bra table, indexed by VIntMode
+00D478 VInt_Lag code            # VBlankWait was clear: the main loop did not finish the frame
+00D4C6 HInt code                # horizontal blank, IRQ 4: per-line vertical scroll

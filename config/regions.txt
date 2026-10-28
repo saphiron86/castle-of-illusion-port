@@ -1,0 +1,16 @@
+# Disassembled regions: <start> <end (exclusive)> <file name in src/> [z80@<load address>]
+# A z80@ region holds Z80 code, traced from $0000 and the interrupt handler at $0038.
+# Everything between regions stays a binclude of build/baserom.bin.
+# tools/disasm.py regenerates src/<name>.asm, src/symbols.asm and src/layout.asm.
+000200 00066C boot
+00066C 009010 objects_a
+009010 00A5E4 core
+00A5E4 00CF3E engine
+00CF3E 00D6E4 vint
+00D6E4 010000 system
+010000 0144AC objects_b
+058994 059102 code_58
+06D52A 06D78E code_6D
+0784B0 0793A0 z80driver z80@0000
+079EE0 07C472 module
+07FBAE 07FE6C nemdec
