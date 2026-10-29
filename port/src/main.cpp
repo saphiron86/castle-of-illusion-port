@@ -29,6 +29,8 @@
 // Testing (headless): --poke FRAME:ADDR=VALUE, --poke-file FILE, --peek ADDR, --watch ADDR, --ram FILE,
 //   --vram FILE, --cram FILE (CRAM, registers, VSRAM), --wav FILE, --log-state, --log-ram ADDR, --trace-vdp, --no-sprite-masking,
 //   --capture FRAME FILE (windowed: save the window's picture after FRAME frames, then quit)
+//   Debug builds: F9 saves the frame and the --ram/--vram/--cram files as snapshots/snapN.* beside
+//   the exe (--snapshots DIR to save them elsewhere)
 //   --switch-widescreen FRAME, --switch-smooth-swing FRAME, --reset FRAME, --go-to-stage FRAME:STAGE (the menu's
 //   actions, at the start of a frame)
 //   --frames N   run N frames without a window, then exit (with --dump: save the last frame)
@@ -217,28 +219,99 @@ std::vector<uint8_t> load_rom(const std::string& explicit_path)
 enum class StripRule { None, TowerFill, ArenaWalls };
 StripRule g_strip_rule = StripRule::None;
 
-// Floor block to repeat as walls in an arena's strips, in plane A pixels.
-struct WallSource { int x, y, w, h; };
+// Floor block to repeat as walls in an arena's strips, in plane A pixels, and the tiles it
+// is made of.
+struct WallSource { int x, y, w, h, first_tile, last_tile; };
 WallSource g_wall;
-constexpr WallSource kLevel2BossWalls = {192, 224, 32, 32};  // stage 9: 32 x 32 blocks, tiles $101-$110
-constexpr WallSource kFinalBossWalls = {192, 464, 64, 32};   // stage 28: 64 x 32 floor slabs, tiles $175-$189
+constexpr WallSource kLevel2BossWalls = {192, 224, 32, 32, 0x101, 0x110};  // stage 9: 32 x 32 blocks
+constexpr WallSource kFinalBossWalls = {192, 464, 64, 32, 0x175, 0x189};   // stage 28: 64 x 32 floor slabs
+
+// The wall block's name table entries, as last seen intact. The final boss's hit flash
+// uses the plane A rows that hold the slab (Y 448-511, off screen) as scratch space for a
+// moment, which emptied the walls; drawing them from this copy keeps them in place.
+std::vector<uint16_t> g_wall_cells;
+
+void update_wall_cells()
+{
+    static const int kSizes[4] = {32, 64, 32, 128};
+    const int base = (g_vdp.reg[2] & 0x38) << 10, plane_w = kSizes[g_vdp.reg[16] & 3];
+    const int cells_w = g_wall.w / 8, cells_h = g_wall.h / 8;
+    std::vector<uint16_t> cells;
+    for (int cy = 0; cy < cells_h; cy++)
+        for (int cx = 0; cx < cells_w; cx++) {
+            const int at = (base + ((g_wall.y / 8 + cy) * plane_w + g_wall.x / 8 + cx) * 2) & 0xFFFF;
+            const uint16_t entry = g_vdp.vram[at] << 8 | g_vdp.vram[at | 1];
+            if ((entry & 0x7FF) < g_wall.first_tile || (entry & 0x7FF) > g_wall.last_tile)
+                return;                             // in use for something else: keep the last copy
+            cells.push_back(entry);
+        }
+    g_wall_cells = cells;
+}
 
 int wrap(int value, int size) { return ((value % size) + size) % size; }
 
-// Remaps plane A coordinates for pixels in the widened strips (view_x < 0 or >= 320).
+// Plane A camera X at the start of the frame, for rules that need to know which lap of the
+// 512-pixel plane a pixel shows.
+int g_strip_camera_x = 0;
+
+// Whether plane A holds the castle exterior. For level 5, $22 first shows a hallway walk on
+// the same state, then loads the exterior; the tower and castle cells tell them apart.
+bool exterior_in_plane_a()
+{
+    static const int kSizes[4] = {32, 64, 32, 128};
+    const int base = (g_vdp.reg[2] & 0x38) << 10, plane_w = kSizes[g_vdp.reg[16] & 3];
+    auto tile = [&](int col, int row) {
+        const int at = (base + (row * plane_w + col) * 2) & 0xFFFF;
+        return (g_vdp.vram[at] << 8 | g_vdp.vram[at | 1]) & 0x7FF;
+    };
+    return plane_w == 64 && tile(63, 3) == 0x213 && tile(52, 8) == 0x200 && tile(0, 8) == 0x1A9;
+}
+
+// Remaps plane A coordinates for pixels in the widened strips (view_x < 0 or >= 320), and
+// for the rules that set Vdp::extend_plane_a_inside, inside the original columns too.
 bool extend_plane_a(int view_x, int line, int& plane_x, int& plane_y)
 {
     (void)line;
     switch (g_strip_rule) {
-    case StripRule::TowerFill:
-        // Castle exterior before the final boss: the brick tower ends at plane A X 512 (0),
-        // and past it the plane starts over with the pale castle wall. In the right strip,
-        // repeat the tower's last 8-pixel column (its dark shading) instead.
-        if (view_x >= 320 && wrap(plane_x, 512) < 40) {
-            plane_x = 504 + wrap(plane_x, 8);
+    case StripRule::TowerFill: {
+        // The scene's plane A X, unwrapped: the camera pans from 0 to 192, so the view shows
+        // plane X -40 to 551, which wraps round to the same 512 pixels at both ends.
+        const int x = g_strip_camera_x + view_x + wrap(plane_x - g_strip_camera_x - view_x + 256, 512) - 256;
+        // At the start the pale castle's left edge is at plane X 0, so the left strip showed
+        // the brick tower's end. Continue the castle instead with its own columns: its rows
+        // repeat every 64 pixels, except the panel rows around the door (plane rows 12-24),
+        // which repeat every 112, so each row joins its first column without a seam.
+        if (x < 0) {
+            const int row = wrap(plane_y, 512) / 8;
+            plane_x = x + (row >= 12 && row <= 24 ? 112 : 64);
+            return true;
+        }
+        // The brick tower ends at plane A X 512 (0), and past it the plane starts over with
+        // the pale castle wall. Make the tower 40 pixels wider instead: after its column 61
+        // (X 488-495), 40 more pixels of its own brick, then its dark right edge (columns
+        // 62-63, X 496-511) at X 536-551, the end of the widened view at the scene's last
+        // camera X (192). The bricks repeat every 16 pixels (columns 60-61) and alternate
+        // by row: rows 3-5 take them from rows 3-4, rows 7 and below from rows 8-9 (rows 2
+        // and 6, the last merlon's cap and the cornice, from column 62; rows 0-1 are sky).
+        // The door and everything left of column 62 stay as they are.
+        if (x >= 496 && x < 552) {
+            const int k = x - 496;                  // 0-55 across the moved part
+            const int y = wrap(plane_y, 512), row = y / 8;
+            if (k >= 40) {
+                plane_x = 456 + k;                  // the edge, columns 62-63
+            } else if (row < 2) {
+                plane_x = 472 + wrap(k, 8);         // sky: the blank tile at (472, 0)
+                plane_y = wrap(y, 8);
+            } else if (row == 2 || row == 6) {
+                plane_x = 496 + wrap(k, 8);         // cap and cornice
+            } else {
+                plane_x = 480 + wrap(k, 16);        // brick, columns 60-61
+                plane_y = row < 6 ? 24 + wrap(y - 24, 16) : 64 + wrap(y, 16);
+            }
             return true;
         }
         return false;
+    }
     case StripRule::ArenaWalls:
         // Locked boss arenas whose strips lie outside the player's reach (stages 9 and 28):
         // walls of the arena's own floor blocks on both sides, aligned to the floor's grid
@@ -330,9 +403,16 @@ void render_interpolated(uint32_t* pixels, double back)
     Vdp& v = g_interp_vdp;
     std::memcpy(v.vram, now.vram.data(), sizeof(v.vram));
     v.extend_plane_a = g_vdp.extend_plane_a;
+    v.extend_plane_a_inside = g_vdp.extend_plane_a_inside;
     v.strip_fill_in_front = g_vdp.strip_fill_in_front;
+    v.strip_fill_in_front_left = g_vdp.strip_fill_in_front_left;
+    v.strip_cells = g_vdp.strip_cells;
+    v.strip_cells_x = g_vdp.strip_cells_x;
+    v.strip_cells_y = g_vdp.strip_cells_y;
+    v.strip_cells_w = g_vdp.strip_cells_w;
     v.clean_black_edges = g_vdp.clean_black_edges;
     v.edge_tiles = g_vdp.edge_tiles;
+    std::memcpy(v.edge_palette, g_vdp.edge_palette, sizeof(v.edge_palette));
     v.sprite_limit = g_vdp.sprite_limit;
     v.palette = nullptr;
     if (g_vdp.palette) {
@@ -439,6 +519,26 @@ void set_smooth_scroll(bool on)
     g_scroll_smoother.reset();
 }
 
+// Stage 26 (level 4, act 2): the spawn grid ($FFCA00, see docs/widescreen.md) files a yellow
+// gear (object $0D at X 720) and an enemy that waits for the player ($3F at X 688) under the
+// cell for X 768-895 instead of their own, so they spawn a cell late, and the gear popped in
+// at the widened view's right edge (on the console too, 40 pixels further in, mostly off
+// screen). In widescreen, file their list under their own cell. The grid is rebuilt
+// whenever the level loads, so this checks the bytes each frame and is done once per load.
+void fix_spawn_grid(uint16_t level, uint16_t act)
+{
+    uint8_t* grid = &g_bus.ram[0xCA00];
+    constexpr int kCell5 = 4 + 10 * 8 + 5, kCell6 = kCell5 + 1;   // cells (5, 10) and (6, 10)
+    if (level != 4 || act != 2 || grid[2] != 8 || grid[3] != 11 || grid[kCell5] != 0 || grid[kCell6] != 1)
+        return;
+    const uint16_t lists = grid[0] << 8 | grid[1];
+    const uint8_t* list = grid + lists + ((grid[lists] << 8) | grid[lists + 1]);   // list 1
+    if (list[2] != 0x0D || (list[8] << 8 | list[9]) != 720)  // its first entry: the gear at X 720
+        return;
+    grid[kCell5] = 1;
+    grid[kCell6] = 0;
+}
+
 void run_frame(uint32_t* pixels)
 {
     g_audio.clear();
@@ -455,11 +555,15 @@ void run_frame(uint32_t* pixels)
     const uint16_t level = g_bus.ram[0xFF44] << 8 | g_bus.ram[0xFF45];
     const uint16_t act = g_bus.ram[0xFF46] << 8 | g_bus.ram[0xFF47];
     const bool wide = g_widescreen && is_wide_state(state, level);
+    if (g_widescreen)
+        fix_spawn_grid(level, act);
     // $20/$22 pick the castle exterior for level 5, or for level 3 when $FFFF0D is 2
     // (the scene table at $07AB74).
     const bool exterior = level == 5 || (g_bus.ram[0xFF0D] == 2 && level == 3);
-    if (state == 0x22 && exterior)
+    if (state == 0x22 && exterior && exterior_in_plane_a()) {
         g_strip_rule = StripRule::TowerFill;
+        g_strip_camera_x = (int16_t)(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]);
+    }
     else if (state == 0x0E && level == 1 && act == 3) {
         g_strip_rule = StripRule::ArenaWalls;
         g_wall = kLevel2BossWalls;
@@ -469,10 +573,26 @@ void run_frame(uint32_t* pixels)
     } else {
         g_strip_rule = StripRule::None;
     }
+    if (g_strip_rule == StripRule::ArenaWalls) {
+        update_wall_cells();
+        g_vdp.strip_cells = g_wall_cells;
+        g_vdp.strip_cells_x = g_wall.x / 8;
+        g_vdp.strip_cells_y = g_wall.y / 8;
+        g_vdp.strip_cells_w = g_wall.w / 8;
+    } else {
+        g_wall_cells.clear();
+        g_vdp.strip_cells.clear();
+    }
     // In the ending ($2E, in the final arena) the characters run out past the left edge:
     // draw the walls in front of them so they exit behind the wall, not through it.
     g_vdp.strip_fill_in_front = state == 0x2E && g_strip_rule == StripRule::ArenaWalls;
+    // The castle exterior's left fill likewise covers Mickey (and the sprites the scene
+    // keeps there) before he comes out of the door.
+    g_vdp.strip_fill_in_front_left = g_strip_rule == StripRule::TowerFill;
+    g_vdp.extend_plane_a_inside = wide && g_strip_rule == StripRule::TowerFill;
     g_vdp.clean_black_edges = g_clean_rock_edges && state == 0x0E && level == 0;   // forest stages
+    for (int i = 0; i < 64; i++)
+        g_vdp.edge_palette[i] = g_bus.ram[0xF800 + i * 2] << 8 | g_bus.ram[0xF801 + i * 2];
     // Stage 15's building tops (objects $BE and $BF) are sprites the game moves with plane
     // B; for smooth scrolling, mark their sprites by the tiles they use (32 from the base
     // in the object's word at $4, palette included).
@@ -653,6 +773,34 @@ bool save_ppm(const char* path, const uint32_t* pixels)
     return true;
 }
 
+// Saves the state that --ram, --vram and --cram write (empty paths are skipped).
+void save_state(const std::string& ram_path, const std::string& vram_path, const std::string& cram_path)
+{
+    if (!ram_path.empty())
+        if (FILE* f = std::fopen(ram_path.c_str(), "wb")) {
+            std::fwrite(g_bus.ram, 1, sizeof(g_bus.ram), f);
+            std::fclose(f);
+        }
+    if (!vram_path.empty())
+        if (FILE* f = std::fopen(vram_path.c_str(), "wb")) {
+            std::fwrite(g_vdp.vram, 1, sizeof(g_vdp.vram), f);
+            std::fclose(f);
+        }
+    if (!cram_path.empty())
+        if (FILE* f = std::fopen(cram_path.c_str(), "wb")) {   // CRAM (64 words, big-endian), the 32 registers, VSRAM (40 words)
+            for (uint16_t c : g_vdp.cram) {
+                std::fputc(c >> 8, f);
+                std::fputc(c & 0xFF, f);
+            }
+            std::fwrite(g_vdp.reg, 1, sizeof(g_vdp.reg), f);
+            for (uint16_t v : g_vdp.vsram) {
+                std::fputc(v >> 8, f);
+                std::fputc(v & 0xFF, f);
+            }
+            std::fclose(f);
+        }
+}
+
 // Game controllers, through SDL's gamepad API (XInput, DirectInput and the newer Windows
 // input APIs are all handled by SDL). Buttons are named by position: on an Xbox pad
 // South is A, East is B, West is X, and Start is the menu button.
@@ -766,7 +914,7 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++)
         if (std::strcmp(argv[i], "--console") == 0)
             show_console();
-    std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path;
+    std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path, snapshot_dir;
     int headless_frames = 0;
     std::vector<Press> presses;
     std::vector<uint32_t> peeks;                    // RAM words to print after a headless run
@@ -825,6 +973,9 @@ int main(int argc, char** argv)
         }
         else if (arg == "--peek" && i + 1 < argc) peeks.push_back(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--ram" && i + 1 < argc) ram_path = argv[++i];
+#ifndef NDEBUG
+        else if (arg == "--snapshots" && i + 1 < argc) snapshot_dir = argv[++i];
+#endif
         else if (arg == "--vram" && i + 1 < argc) vram_path = argv[++i];
         else if (arg == "--cram" && i + 1 < argc) cram_path = argv[++i];
         else if (arg == "--log-state") log_state = true;
@@ -1091,29 +1242,7 @@ int main(int argc, char** argv)
         std::printf("Ran %d frames; PC=%06X GameState=$%02X VIntMode=$%02X\n", headless_frames,
                     m68k_get_reg(nullptr, M68K_REG_PC), g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
                     g_bus.ram[0xF302] << 8 | g_bus.ram[0xF303]);
-        if (!ram_path.empty())
-            if (FILE* f = std::fopen(ram_path.c_str(), "wb")) {
-                std::fwrite(g_bus.ram, 1, sizeof(g_bus.ram), f);
-                std::fclose(f);
-            }
-        if (!vram_path.empty())
-            if (FILE* f = std::fopen(vram_path.c_str(), "wb")) {
-                std::fwrite(g_vdp.vram, 1, sizeof(g_vdp.vram), f);
-                std::fclose(f);
-            }
-        if (!cram_path.empty())
-            if (FILE* f = std::fopen(cram_path.c_str(), "wb")) {   // CRAM (64 words, big-endian), the 32 registers, VSRAM (40 words)
-                for (uint16_t c : g_vdp.cram) {
-                    std::fputc(c >> 8, f);
-                    std::fputc(c & 0xFF, f);
-                }
-                std::fwrite(g_vdp.reg, 1, sizeof(g_vdp.reg), f);
-                for (uint16_t v : g_vdp.vsram) {
-                    std::fputc(v >> 8, f);
-                    std::fputc(v & 0xFF, f);
-                }
-                std::fclose(f);
-            }
+        save_state(ram_path, vram_path, cram_path);
         for (uint32_t a : peeks)
             std::printf("RAM $%06X = %d ($%04X)\n", a, (int16_t)(g_bus.ram[a & 0xFFFF] << 8 | g_bus.ram[(a + 1) & 0xFFFF]),
                         g_bus.ram[a & 0xFFFF] << 8 | g_bus.ram[(a + 1) & 0xFFFF]);
@@ -1333,8 +1462,11 @@ int main(int argc, char** argv)
         const int multiple = refresh > 0 ? (int)std::lround(refresh / native_hz) : 0;
         // Only while the swaps really wait for the refresh: shown faster than it, V-Sync isn't
         // working (some drivers ignore it), and counting refreshes would run the game too fast.
+        // Nor while pictures can't keep up with it (drawing one takes longer than a refresh,
+        // as the CRT shader can at 4K and 120 Hz): every swap then waits two refreshes, and
+        // counting them would run the game at half speed. Frames then come due by the clock.
         const bool locked = vsync_on && multiple >= 1 && std::fabs(refresh - multiple * native_hz) < multiple
-                            && !(fps > refresh * 1.03);
+                            && !(fps > refresh * 1.03) && !(fps > 0 && fps < refresh * 0.95);
         // Or a chosen frame rate (Video > Frame Rate: 60, 120 or 240, for variable-refresh
         // displays such as G-Sync or FreeSync ones): pictures are timed by the port at that
         // multiple of the console's 59.92 a second, whatever the display reports, and the game
@@ -1430,6 +1562,20 @@ int main(int argc, char** argv)
                 } else if (key == SDLK_F12) {
                     settings.crt.enabled = !settings.crt.enabled;
                     save_settings(settings);
+#ifndef NDEBUG
+                } else if (key == SDLK_F9) {
+                    if (snapshot_dir.empty()) {
+                        const char* exe_dir = SDL_GetBasePath();
+                        snapshot_dir = std::string(exe_dir ? exe_dir : "") + "snapshots";
+                    }
+                    std::error_code error;
+                    std::filesystem::create_directories(snapshot_dir, error);
+                    static int snapshots = 0;
+                    const std::string base = snapshot_dir + "/snap" + std::to_string(++snapshots);
+                    save_state(base + ".ram", base + ".vram", base + ".cram");
+                    save_ppm((base + ".ppm").c_str(), pixels.data());
+                    std::printf("Saved %s (frame %d)\n", base.c_str(), frames_run);
+#endif
                 }
             }
         }

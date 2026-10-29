@@ -117,8 +117,10 @@ void Sound::run(double z80_cycles, std::vector<int16_t>& out)
 
         // Run the Z80 for one sample's worth of cycles, unless it is held.
         if (!reset_held && !bus_requested) {
+            // cyc is 32 bits on Windows and wraps after about 20 minutes, so compare the
+            // difference rather than the values, or the Z80 stops for good at the wrap.
             unsigned long target = cpu.cyc + (unsigned long)z80_cycles_per_sample;
-            while (cpu.cyc < target)
+            while ((long)(cpu.cyc - target) < 0)
                 z80_step(&cpu);
         }
 

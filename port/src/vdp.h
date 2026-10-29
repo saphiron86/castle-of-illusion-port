@@ -60,14 +60,27 @@ public:
     // original columns (view_x < 0 or >= 320) with the plane coordinates about to be sampled;
     // it may change them to sample a different part of the plane, and returns true if it did.
     std::function<bool(int view_x, int line, int& plane_x, int& plane_y)> extend_plane_a;
+    // When set, extend_plane_a is asked about pixels inside the original columns too (for a
+    // rule that moves part of the scene, such as the castle exterior's widened tower).
+    bool extend_plane_a_inside = false;
     // When set, opaque pixels remapped by extend_plane_a are drawn in front of everything,
     // sprites included, so sprites pass behind the fill (used for the ending's walls).
     bool strip_fill_in_front = false;
+    bool strip_fill_in_front_left = false;      // the same, in the left strip only
+    // Name table entries for pixels remapped by extend_plane_a, used in place of plane A's
+    // own for the cells from (strip_cells_x, strip_cells_y), strip_cells_w cells wide (the
+    // final boss arena's wall cache in main.cpp). Empty: plane A's own.
+    std::vector<uint16_t> strip_cells;
+    int strip_cells_x = 0, strip_cells_y = 0, strip_cells_w = 0;
     // When set, the black gaps between stones that reach the outside of a rock wall are
     // drawn as what lies beyond them (see clean_black_edge): in the original they show as
     // black notches along the forest's rock edges. edge_tiles lists the rock edge tiles
     // (outer side on the left as stored; flipped for right-hand edges).
     bool clean_black_edges = false;
+    // The palette the game's fades move towards ($FFF800). A colour counts as black for
+    // clean_black_edges only if it is black there too, so the dark colours that pass
+    // through black during a fade are left alone.
+    uint16_t edge_palette[64] = {};
     // The VDP shows at most 20 sprites on a line (16 in the 256-pixel mode); later ones are
     // dropped. When false, every sprite on the line is drawn (Remove Sprite Limit).
     bool sprite_limit = true;
@@ -105,6 +118,8 @@ private:
     uint32_t color(int index) const;
     int plane_pixel(int plane_base, int x, int y, int width_cells, int height_cells, bool& priority,
                     uint16_t* entry = nullptr) const;
+    int entry_pixel(uint16_t entry, int x, int y, bool& priority) const;
+    int strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority) const;
     int clean_black_edge(int a, int base, int x, int y, int width_cells, int height_cells) const;
 
     Bus& bus;

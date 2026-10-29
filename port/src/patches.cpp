@@ -12,9 +12,11 @@ struct Patch {
 };
 
 // Helper routines go in the $FF padding at the end of the ROM.
+constexpr uint32_t kSpawnRowStart = 0x7FED6;
+constexpr uint32_t kRectVisibleA = 0x7FEE4;
+constexpr uint32_t kRectVisibleB = 0x7FEF2;
 constexpr uint32_t kInitCameraMin = 0x7FF00;
-constexpr uint32_t kRectVisibleA = 0x7FF10;
-constexpr uint32_t kRectVisibleB = 0x7FF1A;
+// $7FF10-$7FF23 is free again (the first IsRectVisibleA/B routines).
 constexpr uint32_t kPlayerLeftLimit = 0x7FF24;
 constexpr uint32_t kClampBeforeFill = 0x7FF36;
 constexpr uint32_t kCameraMaxX = 0x7FF6E;
@@ -98,21 +100,27 @@ const std::vector<Patch>& patches()
                    "initial plane fill (clamp routine)"},
 
         // IsRectVisibleA/B: start the visible block range 3 blocks earlier, 26 blocks wide.
+        // The game compares the range unsigned, so near the left end (camera X under 48)
+        // a start below 0 hid every animated block (stage 6's flowers): clamp it at 0.
         {0x00F332, {0x34, 0x38, 0xFA, 0x84, 0xE8, 0x42},
-                   {0x4E, 0xB9, 0x00, 0x07, 0xFF, 0x10}, "IsRectVisibleA start (jsr)"},
-        {kRectVisibleA, std::vector<uint8_t>(10, 0xFF),
+                   {0x4E, 0xB9, 0x00, 0x07, 0xFE, 0xE4}, "IsRectVisibleA start (jsr)"},
+        {kRectVisibleA, std::vector<uint8_t>(14, 0xFF),
                    {0x34, 0x38, 0xFA, 0x84,                     // move.w  (CameraA_X).w,d2
                     0xE8, 0x42,                                 // asr.w   #4,d2
                     0x57, 0x42,                                 // subq.w  #3,d2
+                    0x6A, 0x02,                                 // bpl.s   +2
+                    0x74, 0x00,                                 // moveq   #0,d2
                     0x4E, 0x75},                                // rts
                    "IsRectVisibleA start (routine)"},
         {0x00F346, {0x00, 0x14}, {0x00, 0x1A}, "IsRectVisibleA width"},
         {0x00DA9C, {0x34, 0x38, 0xFA, 0xC4, 0xE8, 0x42},
-                   {0x4E, 0xB9, 0x00, 0x07, 0xFF, 0x1A}, "IsRectVisibleB start (jsr)"},
-        {kRectVisibleB, std::vector<uint8_t>(10, 0xFF),
+                   {0x4E, 0xB9, 0x00, 0x07, 0xFE, 0xF2}, "IsRectVisibleB start (jsr)"},
+        {kRectVisibleB, std::vector<uint8_t>(14, 0xFF),
                    {0x34, 0x38, 0xFA, 0xC4,                     // move.w  (CameraB_X).w,d2
                     0xE8, 0x42,                                 // asr.w   #4,d2
                     0x57, 0x42,                                 // subq.w  #3,d2
+                    0x6A, 0x02,                                 // bpl.s   +2
+                    0x74, 0x00,                                 // moveq   #0,d2
                     0x4E, 0x75},                                // rts
                    "IsRectVisibleB start (routine)"},
         {0x00DAAE, {0x00, 0x14}, {0x00, 0x1A}, "IsRectVisibleB width"},
@@ -126,36 +134,52 @@ const std::vector<Patch>& patches()
         {0x00FE90, {0x00, 0x60}, {0x00, 0x38}, "building tops: hide past screen X -72"},
         {0x00FE96, {0x01, 0xE0}, {0x02, 0x08}, "building tops: hide past screen X 392"},
 
-        // Spawning on the left. Objects come from a grid of 128-pixel cells: when the camera
-        // X crosses a multiple of 128 moving left, UpdateSpawns spawns the cell just left of
-        // it (0-127 pixels left of the camera), and the drawer deletes objects more than 128
-        // pixels left. In the original that is just in time; the widened view shows 40 pixels
-        // of that cell before it spawns (stage 16's falling floor blocks were missing at the
-        // left edge until the camera passed the cell's boundary). Moving left, test the
-        // crossing on X - 40 instead, so the cell spawns 40-167 pixels left of the camera
-        // (moving right is unchanged: those spawn 384 or more pixels right), and delete only
-        // past 168 pixels left, so the earlier spawns are not removed at once.
+        // Spawning. Objects come from a grid of 128-pixel cells: when the camera X crosses a
+        // multiple of 128, UpdateSpawns spawns a column of cells, moving left the one just
+        // left of the camera (0-127 pixels left), moving right the one 384-511 pixels right,
+        // and the drawer deletes objects more than 128 pixels left or 512 or more right. In
+        // the original that is just in time on the left and 64 pixels past the view on the
+        // right; the widened view shows 40 pixels more on each side, so objects popped in at
+        // both edges (stage 16's falling floor blocks on the left, stage 26's yellow gears on
+        // the right). Run the same scheme 40 pixels further out on each side, keeping the
+        // original timing relative to the visible edges: moving left, test the crossing on
+        // X - 40 (cells spawn 40-167 pixels left), moving right on X + 40 (424-551 right),
+        // and delete past 168 left or from 552 right.
         {0x06D53C, {0x30, 0x2E, 0x00, 0x04, 0x36, 0x2E},
                    {0x4E, 0xF9, 0x00, 0x07, 0xFF, 0xA0}, "UpdateSpawns column test (jmp)"},
         {kSpawnLeft, std::vector<uint8_t>(38, 0xFF),
                    {0x30, 0x2E, 0x00, 0x04,                     // move.w  4(a6),d0           X
                     0x36, 0x2E, 0x00, 0x18,                     // move.w  $18(a6),d3         X at the last update
+                    0x72, kWideMargin,                          // moveq   #40,d1
                     0x4A, 0x6E, 0x00, 0x1E,                     // tst.w   $1E(a6)            X velocity
-                    0x6A, 0x08,                                 // bpl.s   test
-                    0x04, 0x40, 0x00, kWideMargin,              // subi.w  #40,d0             moving left: the
-                    0x04, 0x43, 0x00, kWideMargin,              // subi.w  #40,d3             widened left edge
-                    0xB1, 0x43,                                 // test: eor.w d0,d3
+                    0x6A, 0x02,                                 // bpl.s   +2                 moving right: +40,
+                    0x44, 0x41,                                 // neg.w   d1                 moving left: -40
+                    0xD0, 0x41,                                 // add.w   d1,d0
+                    0xD6, 0x41,                                 // add.w   d1,d3
+                    0xB1, 0x43,                                 // eor.w   d0,d3
                     0x08, 0x03, 0x00, 0x07,                     // btst    #7,d3
                     0x67, 0x06,                                 // beq.s   done
-                    0x4E, 0xF9, 0x00, 0x06, 0xD5, 0xBA,         // jmp     SpawnColumn ($06D5BA)
+                    0x4E, 0xF9, 0x00, 0x06, 0xD5, 0xBA,         // jmp     SpawnColumn ($06D5BA), from X +- 40
                     0x4E, 0x75},                                // done: rts
                    "UpdateSpawns column test (routine)"},
+        // Moving up or down, a crossing spawns a row of 5 cells from the one left of the
+        // camera's (camera X - 128 to at least X + 384). Start from the cell left of X - 40's
+        // and take 6, so rows reach both widened edges as the columns do.
+        {0x06D586, {0x30, 0x2E, 0x00, 0x04, 0x02, 0x40, 0xFF, 0x80},
+                   {0x4E, 0xB9, 0x00, 0x07, 0xFE, 0xD6, 0x4E, 0x71}, "UpdateSpawns row start (jsr)"},
+        {kSpawnRowStart, std::vector<uint8_t>(14, 0xFF),
+                   {0x30, 0x2E, 0x00, 0x04,                     // move.w  4(a6),d0           X
+                    0x04, 0x40, 0x00, kWideMargin,              // subi.w  #40,d0
+                    0x02, 0x40, 0xFF, 0x80,                     // andi.w  #$FF80,d0          (replaced)
+                    0x4E, 0x75},                                // rts
+                   "UpdateSpawns row start (routine)"},
+        {0x06D59C, {0x7E, 0x04}, {0x7E, 0x05}, "UpdateSpawns row: 6 cells"},
         {0x001B12, {0x0C, 0x44, 0x02, 0x80, 0x64, 0x00, 0x01, 0x7C, 0x4A, 0x44, 0x6B, 0x00, 0x01, 0x76},
                    {0x4E, 0xB9, 0x00, 0x07, 0xFF, 0x8A, 0x4E, 0x71, 0x4E, 0x71, 0x4E, 0x71, 0x4E, 0x71},
                    "off-screen deletion, X (jsr)"},
         {kDeleteRange, std::vector<uint8_t>(22, 0xFF),
-                   {0x0C, 0x44, 0x02, 0x80,                     // cmpi.w  #$280,d4           X + 128 - camera X
-                    0x6C, 0x08,                                 // bge.s   delete             512 or more right
+                   {0x0C, 0x44, 0x02, 0x80 + kWideMargin,       // cmpi.w  #$2A8,d4           X + 128 - camera X
+                    0x6C, 0x08,                                 // bge.s   delete             552 or more right
                     0x0C, 0x44, 0xFF, 0x100 - kWideMargin,      // cmpi.w  #-40,d4
                     0x6D, 0x02,                                 // blt.s   delete             over 168 left
                     0x4E, 0x75,                                 // rts

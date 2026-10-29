@@ -203,6 +203,12 @@ int Vdp::plane_pixel(int base, int x, int y, int width_cells, int height_cells, 
     uint16_t entry = vram[entry_at] << 8 | vram[entry_at | 1];
     if (entry_out)
         *entry_out = entry;
+    return entry_pixel(entry, x, y, priority);
+}
+
+// The pixel at (x, y) within the cell of name table entry `entry`.
+int Vdp::entry_pixel(uint16_t entry, int x, int y, bool& priority) const
+{
     priority = entry & 0x8000;
     int fx = x & 7, fy = y & 7;
     if (entry & 0x0800) fx = 7 - fx;
@@ -212,6 +218,18 @@ int Vdp::plane_pixel(int base, int x, int y, int width_cells, int height_cells, 
     return pixel ? ((entry >> 9) & 0x30) | pixel : 0;
 }
 
+// A plane A pixel remapped by extend_plane_a: from strip_cells where they cover it.
+int Vdp::strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority) const
+{
+    x &= width_cells * 8 - 1;
+    y &= height_cells * 8 - 1;
+    const int cx = (x >> 3) - strip_cells_x, cy = (y >> 3) - strip_cells_y;
+    if (strip_cells_w > 0 && cx >= 0 && cx < strip_cells_w && cy >= 0
+        && (size_t)(cy * strip_cells_w + cx) < strip_cells.size())
+        return entry_pixel(strip_cells[cy * strip_cells_w + cx], x, y, priority);
+    return plane_pixel(base, x, y, width_cells, height_cells, priority);
+}
+
 // For a black plane pixel `a` (CRAM colour 0) at plane coordinates (x, y): a black gap
 // between stones that reaches the outside of a rock wall takes the colour of the first pixel
 // beyond it (0 when that is transparent, which shows what is behind). Inside a rock edge tile
@@ -219,7 +237,7 @@ int Vdp::plane_pixel(int base, int x, int y, int width_cells, int height_cells, 
 // pixels of a transparent pixel. Returns the pixel to draw.
 int Vdp::clean_black_edge(int a, int base, int x, int y, int width_cells, int height_cells) const
 {
-    auto black = [this](int p) { return p && (cram[p] & 0xEEE) == 0; };
+    auto black = [this](int p) { return p && (cram[p] & 0xEEE) == 0 && (edge_palette[p] & 0xEEE) == 0; };
     bool pri;
     uint16_t entry;
     plane_pixel(base, x, y, width_cells, height_cells, pri, &entry);
@@ -429,11 +447,13 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
             a = plane_pixel(base_window, extended_window_x(x), line, window_w, 32, pri_a);
         else {
             int px = xa - hs_a, py = line + vs_a;
-            bool remapped = (xa < 0 || xa >= native_width) && extend_plane_a && extend_plane_a(xa, line, px, py);
-            a = plane_pixel(base_a, px, py, plane_w, plane_h, pri_a);
-            if (clean_black_edges && a && (cram[a] & 0xEEE) == 0)
+            bool remapped = (extend_plane_a_inside || xa < 0 || xa >= native_width) && extend_plane_a
+                            && extend_plane_a(xa, line, px, py);
+            a = remapped ? strip_pixel(base_a, px, py, plane_w, plane_h, pri_a)
+                         : plane_pixel(base_a, px, py, plane_w, plane_h, pri_a);
+            if (clean_black_edges && a && (cram[a] & 0xEEE) == 0 && (edge_palette[a] & 0xEEE) == 0)
                 a = clean_black_edge(a, base_a, px, py, plane_w, plane_h);
-            if (remapped && strip_fill_in_front && a) {
+            if (remapped && (strip_fill_in_front || (strip_fill_in_front_left && xa < 0)) && a) {
                 if (layers)                         // in front of everything
                     layers->layer[LineLayers::SpritesHigh][ox] = color(a);
                 else
