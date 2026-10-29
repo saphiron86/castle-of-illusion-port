@@ -18,6 +18,7 @@ struct MenuState {
     CrtSettings* crt;           // edited in place by the CRT settings window
     int* scanlines;             // simple scanline strength in percent, edited in place
     int* hqx;                   // hqx scale (1 = off), edited in place
+    float* clean_edge_line_width;   // edited in place
     bool* clean_rock_edges;     // edited in place
     bool* smooth_fades;         // edited in place
     bool* remove_sprite_limit;  // edited in place

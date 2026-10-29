@@ -1,5 +1,6 @@
 // The display: uploads each frame to an OpenGL texture and draws it letterboxed, either as
-// sharp pixels (optionally with simple scanlines), through hqx, or through the CRT shader.
+// sharp pixels (optionally with simple scanlines), through hqx or cleanEdge, or through the
+// CRT shader.
 //
 // hqx (HQ2x/3x/4x, Maxim Stepin's filter) runs as the two-pass GPU version from libretro's
 // glsl-shaders (LGPL 2.1 or later, fetched into third_party/ and built in through a
@@ -17,6 +18,8 @@
 // the layer's other pixels), so the smoothing spreads outward over what is behind and never
 // lets hidden parts of the layers behind show through. The final pass moves each layer by
 // its line's fraction of a pixel and stacks them in priority order over the backdrop.
+// cleanEdge (kCleanEdgeShader) takes the same path with its picture in place of hqx's; it
+// draws at the window's scale rounded up, and its edges are already hard.
 //
 // The simple scanlines darken a band across the boundary between game lines, a third of a line
 // tall, by the chosen strength (100% = black). Each screen pixel averages the band over the
@@ -34,6 +37,7 @@
 #include "display.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -93,6 +97,7 @@ constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_FRAM
     X(void, glUniform1i, (GLint, GLint)) \
     X(void, glUniform1f, (GLint, GLfloat)) \
     X(void, glUniform2f, (GLint, GLfloat, GLfloat)) \
+    X(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
     X(void, glGenVertexArrays, (GLsizei, GLuint*)) \
     X(void, glDeleteVertexArrays, (GLsizei, const GLuint*)) \
     X(void, glBindVertexArray, (GLuint)) \
@@ -351,6 +356,217 @@ void main()
 }
 )";
 
+// cleanEdge, torcado's pixel-art upscaler (MIT licence, Copyright (c) 2022 torcado; see
+// THIRD_PARTY_NOTICES.txt), from its Shadertoy version with the texture reads and settings
+// adapted: each output pixel finds where it lies inside its source pixel, looks at the
+// 5x5 pixels around it and, where an edge or a 45 or 2:1 slope runs through that corner,
+// takes the colour of the neighbour across it. Every output pixel is one source colour,
+// so a layer's edges stay hard (opaque or transparent) and nothing needs a separate alpha
+// pass. Draws into a framebuffer `scale` times the source's size; the output is
+// premultiplied.
+const char* kCleanEdgeShader = R"(#version 330 core
+out vec4 frag;
+uniform sampler2D source;
+uniform vec2 size;            // source texels
+uniform float scale;          // output pixels per source texel
+uniform vec3 highestColor;    // the colour that wins where shapes overlap
+uniform float similarThreshold;
+uniform float lineWidth;
+uniform int opaque;           // 1: ignore the source's alpha (a whole frame)
+
+#define SLOPE
+#define CLEANUP
+
+bool similar(vec4 col1, vec4 col2){
+	return (col1.a == 0. && col2.a == 0.) || distance(col1, col2) <= similarThreshold;
+}
+bool similar3(vec4 col1, vec4 col2, vec4 col3){
+	return similar(col1, col2) && similar(col2, col3);
+}
+bool similar4(vec4 col1, vec4 col2, vec4 col3, vec4 col4){
+	return similar(col1, col2) && similar(col2, col3) && similar(col3, col4);
+}
+bool higher(vec4 thisCol, vec4 otherCol){
+	if(similar(thisCol, otherCol)) return false;
+	if(thisCol.a == otherCol.a){
+		return distance(thisCol.rgb, highestColor) < distance(otherCol.rgb, highestColor);
+	} else {
+		return thisCol.a > otherCol.a;
+	}
+}
+float cd(vec4 col1, vec4 col2){
+	return distance(col1.rgba, col2.rgba);
+}
+float distToLine(vec2 testPt, vec2 pt1, vec2 pt2, vec2 dir){
+  vec2 lineDir = pt2 - pt1;
+  vec2 perpDir = vec2(lineDir.y, -lineDir.x);
+  vec2 dirToPt1 = pt1 - testPt;
+  return (dot(perpDir, dir) > 0.0 ? 1.0 : -1.0) * (dot(normalize(perpDir), dirToPt1));
+}
+
+vec4 sliceDist(vec2 point, vec2 mainDir, vec2 pointDir, vec4 ub, vec4 u, vec4 uf, vec4 uff, vec4 b, vec4 c, vec4 f, vec4 ff, vec4 db, vec4 d, vec4 df, vec4 dff, vec4 ddb, vec4 dd, vec4 ddf){
+	float minWidth = 0.45;
+	float maxWidth = 1.142;
+	float _lineWidth = max(minWidth, min(maxWidth, lineWidth));
+	point = mainDir * (point - 0.5) + 0.5;
+
+	float distAgainst = 4.0*cd(f,d) + cd(uf,c) + cd(c,db) + cd(ff,df) + cd(df,dd);
+	float distTowards = 4.0*cd(c,df) + cd(u,f) + cd(f,dff) + cd(b,d) + cd(d,ddf);
+	bool shouldSlice =
+	  (distAgainst < distTowards)
+	  || (distAgainst < distTowards + 0.001) && !higher(c, f);
+	if(similar4(f, d, b, u) && similar4(uf, df, db, ub) && !similar(c, f)){
+		shouldSlice = false;
+	}
+	if(!shouldSlice) return vec4(-1.0);
+
+	float dist = 1.0;
+	bool flip = false;
+	vec2 center = vec2(0.5,0.5);
+
+	if(similar3(f, d, db) && !similar3(f, d, b) && !similar(uf, db)){ //lower shallow 2:1 slant
+		if(similar(c, df) && higher(c, f)){
+		} else {
+			if(higher(c, f)) flip = true;
+			if(similar(u, f) && !similar(c, df) && !higher(c, u)) flip = true;
+		}
+		if(flip){
+			dist = _lineWidth-distToLine(point, center+vec2(1.5, -1.0)*pointDir, center+vec2(-0.5, 0.0)*pointDir, -pointDir);
+		} else {
+			dist = distToLine(point, center+vec2(1.5, 0.0)*pointDir, center+vec2(-0.5, 1.0)*pointDir, pointDir);
+		}
+		if(!flip && similar(c, uf) && !(similar3(c, uf, uff) && !similar3(c, uf, ff) && !similar(d, uff))){
+			float dist2 = distToLine(point, center+vec2(2.0, -1.0)*pointDir, center+vec2(-0.0, 1.0)*pointDir, pointDir);
+			dist = min(dist, dist2);
+		}
+		dist -= (_lineWidth/2.0);
+		return dist <= 0.0 ? ((cd(c,f) <= cd(c,d)) ? f : d) : vec4(-1.0);
+	} else if(similar3(uf, f, d) && !similar3(u, f, d) && !similar(uf, db)){ //forward steep 2:1 slant
+		if(similar(c, df) && higher(c, d)){
+		} else {
+			if(higher(c, d)) flip = true;
+			if(similar(b, d) && !similar(c, df) && !higher(c, d)) flip = true;
+		}
+		if(flip){
+			dist = _lineWidth-distToLine(point, center+vec2(0.0, -0.5)*pointDir, center+vec2(-1.0, 1.5)*pointDir, -pointDir);
+		} else {
+			dist = distToLine(point, center+vec2(1.0, -0.5)*pointDir, center+vec2(0.0, 1.5)*pointDir, pointDir);
+		}
+		if(!flip && similar(c, db) && !(similar3(c, db, ddb) && !similar3(c, db, dd) && !similar(f, ddb))){
+			float dist2 = distToLine(point, center+vec2(1.0, 0.0)*pointDir, center+vec2(-1.0, 2.0)*pointDir, pointDir);
+			dist = min(dist, dist2);
+		}
+		dist -= (_lineWidth/2.0);
+		return dist <= 0.0 ? ((cd(c,f) <= cd(c,d)) ? f : d) : vec4(-1.0);
+	} else if(similar(f, d)) { //45 diagonal
+		if(similar(c, df) && higher(c, f)){
+			if(!similar(c, dd) && !similar(c, ff)) flip = true;
+		} else {
+			if(higher(c, f)) flip = true;
+			if(!similar(c, b) && similar4(b, f, d, u)) flip = true;
+		}
+		if((( (similar(f, db) && similar3(u, f, df)) || (similar(uf, d) && similar3(b, d, df)) ) && !similar(c, df))){
+			flip = true;
+		}
+		if(flip){
+			dist = _lineWidth-distToLine(point, center+vec2(1.0, -1.0)*pointDir, center+vec2(-1.0, 1.0)*pointDir, -pointDir);
+		} else {
+			dist = distToLine(point, center+vec2(1.0, 0.0)*pointDir, center+vec2(0.0, 1.0)*pointDir, pointDir);
+		}
+		if(!flip && similar3(c, uf, uff) && !similar3(c, uf, ff) && !similar(d, uff)){
+			float dist2 = distToLine(point, center+vec2(1.5, 0.0)*pointDir, center+vec2(-0.5, 1.0)*pointDir, pointDir);
+			dist = max(dist, dist2);
+		}
+		if(!flip && similar3(ddb, db, c) && !similar3(dd, db, c) && !similar(ddb, f)){
+			float dist2 = distToLine(point, center+vec2(1.0, -0.5)*pointDir, center+vec2(0.0, 1.5)*pointDir, pointDir);
+			dist = max(dist, dist2);
+		}
+		dist -= (_lineWidth/2.0);
+		return dist <= 0.0 ? ((cd(c,f) <= cd(c,d)) ? f : d) : vec4(-1.0);
+	} else if(similar3(ff, df, d) && !similar3(ff, df, c) && !similar(uff, d)){ //far corner of shallow slant
+		if(similar(f, dff) && higher(f, ff)){
+		} else {
+			if(higher(f, ff)) flip = true;
+			if(similar(uf, ff) && !similar(f, dff) && !higher(f, uf)) flip = true;
+		}
+		if(flip){
+			dist = _lineWidth-distToLine(point, center+vec2(1.5+1.0, -1.0)*pointDir, center+vec2(-0.5+1.0, 0.0)*pointDir, -pointDir);
+		} else {
+			dist = distToLine(point, center+vec2(1.5+1.0, 0.0)*pointDir, center+vec2(-0.5+1.0, 1.0)*pointDir, pointDir);
+		}
+		dist -= (_lineWidth/2.0);
+		return dist <= 0.0 ? ((cd(f,ff) <= cd(f,df)) ? ff : df) : vec4(-1.0);
+	} else if(similar3(f, df, dd) && !similar3(c, df, dd) && !similar(f, ddb)){ //far corner of steep slant
+		if(similar(d, ddf) && higher(d, dd)){
+		} else {
+			if(higher(d, dd)) flip = true;
+			if(similar(db, dd) && !similar(d, ddf) && !higher(d, dd)) flip = true;
+		}
+		if(flip){
+			dist = _lineWidth-distToLine(point, center+vec2(0.0, -0.5+1.0)*pointDir, center+vec2(-1.0, 1.5+1.0)*pointDir, -pointDir);
+		} else {
+			dist = distToLine(point, center+vec2(1.0, -0.5+1.0)*pointDir, center+vec2(0.0, 1.5+1.0)*pointDir, pointDir);
+		}
+		dist -= (_lineWidth/2.0);
+		return dist <= 0.0 ? ((cd(d,df) <= cd(d,dd)) ? df : dd) : vec4(-1.0);
+	}
+	return vec4(-1.0);
+}
+
+// A 2x2 cell (p q / r s) whose diagonal pairs match but differ from each other.
+bool crossed(vec4 p, vec4 q, vec4 r, vec4 s){
+	return similar(p, s) && similar(q, r) && !similar(p, q);
+}
+bool samePair(vec4 p, vec4 q, vec4 a, vec4 b){
+	return (similar(p, a) && similar(q, b)) || (similar(p, b) && similar(q, a));
+}
+// The cell (c f / d df) is crossed, and so is one of the two cells two pixels away, in the
+// same two colours.
+bool dither(vec4 c, vec4 f, vec4 d, vec4 df, vec4 p1, vec4 q1, vec4 r1, vec4 s1, vec4 p2, vec4 q2, vec4 r2, vec4 s2){
+	return crossed(c, f, d, df)
+	    && ((crossed(p1, q1, r1, s1) && samePair(p1, q1, c, f)) || (crossed(p2, q2, r2, s2) && samePair(p2, q2, c, f)));
+}
+
+vec2 px;
+vec2 pointDir;
+vec4 at(float x, float y)
+{
+	ivec2 p = ivec2(clamp(px + vec2(x, y) * pointDir, vec2(0.0), size - 1.0));
+	vec4 t = texelFetch(source, p, 0);
+	return opaque == 1 ? vec4(t.rgb, 1.0) : t;
+}
+
+void main()
+{
+	vec2 pos = gl_FragCoord.xy / scale;       // row 0 is the top in source and target alike
+	vec2 local = fract(pos);
+	px = floor(pos);
+	pointDir = round(local)*2.0-1.0;
+
+	vec4 uub = at(-1.0,-2.0), uu = at(0.0,-2.0), uuf = at(1.0,-2.0);
+	vec4 ubb = at(-2.0,-2.0), ub = at(-1.0,-1.0), u = at(0.0,-1.0), uf = at(1.0,-1.0), uff = at(2.0,-1.0);
+	vec4 bb = at(-2.0, 0.0), b = at(-1.0, 0.0), c = at(0.0, 0.0), f = at(1.0, 0.0), ff = at(2.0, 0.0);
+	vec4 dbb = at(-2.0, 1.0), db = at(-1.0, 1.0), d = at(0.0, 1.0), df = at(1.0, 1.0), dff = at(2.0, 1.0);
+	vec4 ddb = at(-1.0, 2.0), dd = at(0.0, 2.0), ddf = at(1.0, 2.0);
+
+	vec4 col = c;
+	vec4 c_col = sliceDist(local, vec2( 1.0, 1.0), pointDir, ub, u, uf, uff, b, c, f, ff, db, d, df, dff, ddb, dd, ddf);
+	vec4 b_col = sliceDist(local, vec2(-1.0, 1.0), pointDir, uf, u, ub, ubb, f, c, b, bb, df, d, db, dbb, ddf, dd, ddb);
+	vec4 u_col = sliceDist(local, vec2( 1.0,-1.0), pointDir, db, d, df, dff, b, c, f, ff, ub, u, uf, uff, uub, uu, uuf);
+	// Not part of cleanEdge: leave dithering alone. A corner where the 2x2 cell's diagonal
+	// pairs match (an X) is cut by a slice; when the same X of the same two colours repeats
+	// two pixels across or down, it is a checkerboard or hatching rather than a line, so
+	// that slice is dropped.
+	if(dither(c, f, d, df, bb, b, at(-2.0, 1.0), db, uu, uuf, u, uf)) c_col = vec4(-1.0);
+	if(dither(c, b, d, db, ff, f, dff, df, uu, uub, u, ub)) b_col = vec4(-1.0);
+	if(dither(c, f, u, uf, bb, b, at(-2.0, -1.0), ub, dd, ddf, d, df)) u_col = vec4(-1.0);
+	if(c_col.r >= 0.0) col = c_col;
+	if(b_col.r >= 0.0) col = b_col;
+	if(u_col.r >= 0.0) col = u_col;
+	frag = vec4(col.rgb * col.a, col.a);
+}
+)";
+
 GLuint compile(GLenum type, const char* source)
 {
     GLuint shader = glCreateShader(type);
@@ -542,7 +758,42 @@ bool Display::init(SDL_Window* w)
     hqx_ready = init_hqx();
     if (!hqx_ready)
         std::fprintf(stderr, "hqx is not available.\n");
+    clean_edge = link(kVertexShader, kCleanEdgeShader);
+    if (!clean_edge)
+        std::fprintf(stderr, "cleanEdge is not available.\n");
     return true;
+}
+
+// cleanEdge's scale: the window's game-pixel size rounded up, so the final stretch only ever
+// shrinks its picture a little (kept at 6 or less for speed).
+int Display::clean_edge_scale(int logical_width, int height) const
+{
+    int out_w = 0, out_h = 0;
+    SDL_GetWindowSizeInPixels(window, &out_w, &out_h);
+    const float s = std::min((float)out_w / logical_width, (float)out_h / height);
+    return std::clamp((int)std::ceil(s - 0.01f), 2, 6);
+}
+
+// Draws `source` (width x height) through cleanEdge into `fbo`, `scale` times the size.
+void Display::clean_edge_run(GLuint source, int width, int height, int scale, GLuint fbo, bool opaque)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, width * scale, height * scale);
+    glUseProgram(clean_edge);
+    auto loc = [this](const char* name) { return glGetUniformLocation(clean_edge, name); };
+    glUniform1i(loc("source"), 0);
+    glUniform2f(loc("size"), (float)width, (float)height);
+    glUniform1f(loc("scale"), (float)scale);
+    glUniform3f(loc("highestColor"), 1.0f, 1.0f, 1.0f);
+    glUniform1f(loc("similarThreshold"), 0.0f);
+    glUniform1f(loc("lineWidth"), clean_edge_line_width);
+    glUniform1i(loc("opaque"), opaque ? 1 : 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source);
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 void Display::shutdown()
@@ -560,7 +811,10 @@ void Display::shutdown()
     }
     for (GLuint* t : {&hqx_lut[0], &hqx_lut[1], &hqx_lut[2], &line_shifts, &line_backdrop})
         if (*t) glDeleteTextures(1, t), *t = 0;
-    for (GLuint* p : {&hqx_pass1, &hqx_pass1_layer, &hqx_pass2, &composite, &layer_merge})
+    if (clean_flat) glDeleteTextures(1, &clean_flat), clean_flat = 0;
+    if (clean_flat_fbo) glDeleteFramebuffers(1, &clean_flat_fbo), clean_flat_fbo = 0;
+    clean_flat_width = clean_flat_height = 0;
+    for (GLuint* p : {&hqx_pass1, &hqx_pass1_layer, &hqx_pass2, &composite, &layer_merge, &clean_edge})
         if (*p) glDeleteProgram(*p), *p = 0;
     hqx_ready = false;
 }
@@ -591,6 +845,20 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
                          && hqx_resize(hqx_flat, width, height, hqx, false);
     if (use_hqx)
         hqx_run(hqx_flat, hqx_pass1, texture, false);
+    const int clean_scale = clean_edge_scale(logical_width, height);
+    bool use_clean = hqx == kCleanEdge && clean_edge && !crt.enabled && width == logical_width;
+    if (use_clean && (clean_flat_width != width * clean_scale || clean_flat_height != height * clean_scale)) {
+        if (!clean_flat) {
+            clean_flat = new_texture(GL_LINEAR);
+            glGenFramebuffers(1, &clean_flat_fbo);
+        }
+        use_clean = render_target(clean_flat_fbo, clean_flat, width * clean_scale, height * clean_scale);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        clean_flat_width = use_clean ? width * clean_scale : 0;
+        clean_flat_height = use_clean ? height * clean_scale : 0;
+    }
+    if (use_clean)
+        clean_edge_run(texture, width, height, clean_scale, clean_flat_fbo, true);
     glViewport(0, 0, out_w, out_h);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -606,10 +874,13 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     if (use_hqx) {
         glBindTexture(GL_TEXTURE_2D, hqx_flat.color);
         glUniform2f(loc("texels"), (float)(width * hqx), (float)(height * hqx));
+    } else if (use_clean) {
+        glBindTexture(GL_TEXTURE_2D, clean_flat);
+        glUniform2f(loc("texels"), (float)clean_flat_width, (float)clean_flat_height);
     } else {
         glUniform2f(loc("texels"), (float)width, (float)height);
     }
-    glUniform1i(loc("smooth_sample"), use_hqx ? 1 : 0);
+    glUniform1i(loc("smooth_sample"), use_hqx || use_clean ? 1 : 0);
     glUniform1f(loc("rows"), (float)height);
     glUniform1f(loc("sub"), (float)(width / logical_width));
     glUniform1i(loc("crt"), crt.enabled ? 1 : 0);
@@ -632,8 +903,10 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
 
 bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
 {
-    if (!hqx_ready || hqx < 2 || hqx > 4)
+    const bool clean = hqx == kCleanEdge;
+    if (clean ? !clean_edge : (!hqx_ready || hqx < 2 || hqx > 4))
         return false;
+    const int scale = clean ? clean_edge_scale(f.width - 2 * f.margin, f.height) : hqx;
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -649,21 +922,30 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
         } else {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f.width, f.height, GL_BGRA, GL_UNSIGNED_BYTE, f.layers[i]);
         }
-        if (!hqx_resize(l.hqx, f.width, f.height, hqx, true))
-            return false;
-        hqx_run(l.hqx, hqx_pass1_layer, l.source, true);
-        if (l.merged_width != f.width * hqx || l.merged_height != f.height * hqx) {
+        if (!clean) {
+            if (!hqx_resize(l.hqx, f.width, f.height, hqx, true))
+                return false;
+            hqx_run(l.hqx, hqx_pass1_layer, l.source, true);
+        }
+        if (l.merged_width != f.width * scale || l.merged_height != f.height * scale) {
             if (!l.merged) {
                 l.merged = new_texture(GL_LINEAR);
                 glGenFramebuffers(1, &l.merged_fbo);
             }
-            if (!render_target(l.merged_fbo, l.merged, f.width * hqx, f.height * hqx)) {
+            if (!render_target(l.merged_fbo, l.merged, f.width * scale, f.height * scale)) {
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                hqx_ready = false;
+                l.merged_width = l.merged_height = 0;
+                if (!clean)
+                    hqx_ready = false;
                 return false;
             }
-            l.merged_width = f.width * hqx;
-            l.merged_height = f.height * hqx;
+            l.merged_width = f.width * scale;
+            l.merged_height = f.height * scale;
+        }
+        if (clean) {
+            // cleanEdge keeps edges hard, so its picture is already the merged one.
+            clean_edge_run(l.source, f.width, f.height, scale, l.merged_fbo, false);
+            continue;
         }
         glBindFramebuffer(GL_FRAMEBUFFER, l.merged_fbo);
         glViewport(0, 0, f.width * hqx, f.height * hqx);
@@ -699,8 +981,8 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     const int logical_width = f.width - 2 * f.margin;
-    const float scale = std::min((float)out_w / logical_width, (float)out_h / f.height);
-    const int vw = (int)(logical_width * scale + 0.5f), vh = (int)(f.height * scale + 0.5f);
+    const float fit = std::min((float)out_w / logical_width, (float)out_h / f.height);
+    const int vw = (int)(logical_width * fit + 0.5f), vh = (int)(f.height * fit + 0.5f);
     glViewport((out_w - vw) / 2, (out_h - vh) / 2, vw, vh);
 
     glUseProgram(composite);

@@ -334,6 +334,21 @@ MenuChoice menu_frame(const MenuState& state)
                         if (scale == 2)
                             ImGui::SetItemTooltip("Recommended to activate 25%% scanlines when using this mode.");
                     }
+                    if (ImGui::MenuItem("cleanEdge", nullptr, *state.hqx == kCleanEdge)) {
+                        *state.hqx = kCleanEdge;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("torcado's cleanEdge: keeps the pixel art's hard edges and redraws\n"
+                                          "its diagonals and slopes as clean lines, at the window's size.");
+                    ImGui::BeginDisabled(*state.hqx != kCleanEdge);
+                    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
+                    ImGui::SliderFloat("Line Width", state.clean_edge_line_width, 0.45f, 1.14f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                    if (ImGui::IsItemDeactivatedAfterEdit())
+                        choice.save_settings = true;
+                    ImGui::SetItemTooltip("cleanEdge only. Lower: thinner diagonal lines, closer to the original\n"
+                                          "pixels. Higher: bolder lines and rounder corners. Default 1.00.\n"
+                                          "Ctrl+click to type a value.");
+                    ImGui::EndDisabled();
                     ImGui::EndMenu();
                 }
                 ImGui::SetItemTooltip(state.crt->enabled ? "Turn the CRT shader off to use hqx."

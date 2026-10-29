@@ -98,6 +98,7 @@ add_executable(coi
     src/settings.cpp
     src/smooth_scroll.cpp
     src/smooth_swing.cpp
+    src/boss_rush.cpp
     src/sound.cpp
     src/vdp.cpp)
 target_link_libraries(coi PRIVATE musashi ymfm z80 imgui SDL3::SDL3-static)

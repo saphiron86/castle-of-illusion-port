@@ -58,6 +58,7 @@ const Entry kEntries[] = {
     entry("smooth_scrolling", FIELD(smooth_scroll)),
     entry("scanlines", FIELD(scanlines)),
     entry("hqx", FIELD(hqx)),
+    entry("clean_edge_line_width", FIELD(clean_edge_line_width)),
     entry("clean_rock_edges", FIELD(clean_rock_edges)),
     entry("smooth_fades", FIELD(smooth_fades)),
     entry("remove_sprite_limit", FIELD(remove_sprite_limit)),

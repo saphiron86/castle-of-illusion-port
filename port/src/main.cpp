@@ -21,7 +21,8 @@
 //   --crt        start with the CRT shader on (Enhancements > Graphics)
 //   --console    show a terminal window for messages (Windows; none opens otherwise)
 //   --scanlines N start with simple scanlines at N percent and the CRT shader off
-//   --hqx N      start with hqx at scale N (2-4, 1 = off) and the CRT shader off
+//   --hqx N      start with hqx at scale N (2-4, 1 = off; 5 = cleanEdge) and the CRT shader off
+//   --clean-edge-width W  start with cleanEdge's line width at W (0.45-1.14)
 // Menu settings are remembered between runs (settings.cpp); the options above apply to
 // this run only. Headless runs ignore the saved settings.
 // While running: F1 opens the menu, F11 or Alt+Enter toggles fullscreen, F12 the CRT shader,
@@ -30,7 +31,8 @@
 //   --vram FILE, --cram FILE (CRAM, registers, VSRAM), --wav FILE, --log-state, --log-ram ADDR, --trace-vdp, --no-sprite-masking,
 //   --capture FRAME FILE (windowed: save the window's picture after FRAME frames, then quit)
 //   Debug builds: F9 saves the frame and the --ram/--vram/--cram files as snapshots/snapN.* beside
-//   the exe (--snapshots DIR to save them elsewhere)
+//   the exe (--snapshots DIR to save them elsewhere); --sprite-capture DIR (headless) saves the
+//   VRAM and CRAM behind each sprite set the run shows (see capture_sprites)
 //   --switch-widescreen FRAME, --switch-smooth-swing FRAME, --reset FRAME, --go-to-stage FRAME:STAGE (the menu's
 //   actions, at the start of a frame)
 //   --frames N   run N frames without a window, then exit (with --dump: save the last frame)
@@ -50,6 +52,7 @@
 #include <string>
 #include <vector>
 
+#include "boss_rush.h"
 #include "bus.h"
 #include "cheats.h"
 #include "display.h"
@@ -539,6 +542,63 @@ void fix_spawn_grid(uint16_t level, uint16_t act)
     grid[kCell6] = 0;
 }
 
+#ifndef NDEBUG
+// --sprite-capture DIR (Debug builds, headless): for each sprite set an object shows (its
+// mapping table at $6 and tile base at $4), once the object has been alive for 8 frames,
+// save VRAM, CRAM and the palette at $FFF800 (what fades move towards) as DIR/capN.vram,
+// .cram and .pal, and add a line to DIR/captures.txt
+// (N, stage index, object ID, mapping address, tile base, RAM slot, frame). The animation
+// frames are drawn from these by a script outside the repository.
+void save_state(const std::string& ram_path, const std::string& vram_path, const std::string& cram_path);
+
+void capture_sprites(const std::string& dir, int frame)
+{
+    struct Slot { uint32_t key = 0; int age = 0; };
+    static Slot slots[128];
+    static std::vector<uint64_t> seen, anims_seen;
+    static int captures = 0;
+    auto w = [](uint32_t a) { return (uint32_t)(g_bus.ram[a & 0xFFFF] << 8 | g_bus.ram[(a + 1) & 0xFFFF]); };
+    const int stage = g_bus.ram[0xFF43];
+    for (int i = 0; i < 128; i++) {
+        const uint32_t a = 0xD000 + i * 0x40;
+        const uint32_t id = w(a) & 0xFF, mapping = w(a + 6) << 16 | w(a + 8), base = w(a + 4);
+        const uint32_t key = id ? (mapping ^ (base << 8) ^ (id << 24)) : 0;
+        Slot& s = slots[i];
+        s.age = key && key == s.key ? s.age + 1 : 0;
+        s.key = key;
+        // The animations each set really plays (byte $A), to DIR/anims.txt: several kinds of
+        // object can share one mapping table, each with its own tile base.
+        if (key && mapping && mapping < 0x80000) {
+            const uint64_t anim = (uint64_t)stage << 56 | (uint64_t)id << 48 | (uint64_t)base << 32
+                                  | (uint64_t)g_bus.ram[(a + 0xA) & 0xFFFF] << 24 | mapping;
+            if (std::find(anims_seen.begin(), anims_seen.end(), anim) == anims_seen.end()) {
+                anims_seen.push_back(anim);
+                if (FILE* f = std::fopen((dir + "/anims.txt").c_str(), "a")) {
+                    std::fprintf(f, "%d %02X %06X %04X %d\n", stage, id, mapping, base, g_bus.ram[(a + 0xA) & 0xFFFF]);
+                    std::fclose(f);
+                }
+            }
+        }
+        if (s.age != 8 || mapping == 0 || mapping >= 0x80000 || (mapping & 1))
+            continue;
+        const uint64_t full = (uint64_t)stage << 56 | (uint64_t)id << 48 | (uint64_t)base << 32 | mapping;
+        if (std::find(seen.begin(), seen.end(), full) != seen.end())
+            continue;
+        seen.push_back(full);
+        const std::string name = dir + "/cap" + std::to_string(++captures);
+        save_state("", name + ".vram", name + ".cram");
+        if (FILE* f = std::fopen((name + ".pal").c_str(), "wb")) {   // the palette fades move towards
+            std::fwrite(&g_bus.ram[0xF800], 1, 128, f);
+            std::fclose(f);
+        }
+        if (FILE* f = std::fopen((dir + "/captures.txt").c_str(), "a")) {
+            std::fprintf(f, "%d %d %02X %06X %04X %04X %d\n", captures, stage, id, mapping, base, a, frame);
+            std::fclose(f);
+        }
+    }
+}
+#endif
+
 void run_frame(uint32_t* pixels)
 {
     g_audio.clear();
@@ -715,6 +775,9 @@ void build_rom()
         apply_widescreen_patches(rom);
     if (g_smooth_swing)
         apply_smooth_swing(rom);
+    const std::string rush = apply_boss_rush(rom);
+    if (!rush.empty())
+        std::fprintf(stderr, "%s\n", rush.c_str());
     const std::string skipped = apply_cheats(rom, g_cheats);
     if (!skipped.empty())
         std::fprintf(stderr, "%s\n", skipped.c_str());
@@ -914,7 +977,7 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++)
         if (std::strcmp(argv[i], "--console") == 0)
             show_console();
-    std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path, snapshot_dir;
+    std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path, snapshot_dir, sprite_capture_dir;
     int headless_frames = 0;
     std::vector<Press> presses;
     std::vector<uint32_t> peeks;                    // RAM words to print after a headless run
@@ -938,6 +1001,7 @@ int main(int argc, char** argv)
     std::vector<std::string> cheats;                // --cheat NAME (this run only)
     int scanlines = -1;                             // percent, -1 = the saved setting
     int hqx = -1;                                   // scale, -1 = the saved setting
+    float clean_edge_width = -1;                    // cleanEdge's line width, -1 = the saved setting
     int capture_frame = -1;                         // windowed test: save the picture at this frame
     std::string capture_path;
     for (int i = 1; i < argc; i++) {
@@ -967,6 +1031,7 @@ int main(int argc, char** argv)
         else if (arg == "--console") {}           // handled first thing in main
         else if (arg == "--scanlines" && i + 1 < argc) scanlines = std::atoi(argv[++i]);
         else if (arg == "--hqx" && i + 1 < argc) hqx = std::atoi(argv[++i]);
+        else if (arg == "--clean-edge-width" && i + 1 < argc) clean_edge_width = (float)std::atof(argv[++i]);
         else if (arg == "--capture" && i + 2 < argc) {
             capture_frame = std::atoi(argv[++i]);
             capture_path = argv[++i];
@@ -975,6 +1040,7 @@ int main(int argc, char** argv)
         else if (arg == "--ram" && i + 1 < argc) ram_path = argv[++i];
 #ifndef NDEBUG
         else if (arg == "--snapshots" && i + 1 < argc) snapshot_dir = argv[++i];
+        else if (arg == "--sprite-capture" && i + 1 < argc) sprite_capture_dir = argv[++i];
 #endif
         else if (arg == "--vram" && i + 1 < argc) vram_path = argv[++i];
         else if (arg == "--cram" && i + 1 < argc) cram_path = argv[++i];
@@ -1210,6 +1276,10 @@ int main(int argc, char** argv)
             if (g_vdp.trace)
                 std::printf("[frame %d]\n", frame);
             run_frame(pixels.data());
+#ifndef NDEBUG
+            if (!sprite_capture_dir.empty())
+                capture_sprites(sprite_capture_dir, frame);
+#endif
             if (log_scroll) {
                 int hs = (g_vdp.reg[13] & 0x3F) << 10;
                 auto word = [](const uint8_t* p) { return p[0] << 8 | p[1]; };
@@ -1300,9 +1370,12 @@ int main(int argc, char** argv)
         settings.hqx = hqx;
         settings.crt.enabled = false;               // as is hqx
     }
+    if (clean_edge_width >= 0)
+        settings.clean_edge_line_width = std::clamp(clean_edge_width, 0.45f, 1.14f);
     // hqx needs whole pixels, so with smooth scrolling the frame is drawn as layers instead.
     auto hqx_on = [&] {
-        return settings.hqx >= 2 && settings.hqx <= 4 && !settings.crt.enabled && display.hqx_available();
+        return !settings.crt.enabled && (settings.hqx == kCleanEdge ? display.clean_edge_available()
+                                         : settings.hqx >= 2 && settings.hqx <= 4 && display.hqx_available());
     };
     menu_init(window, gl);
 
@@ -1594,7 +1667,7 @@ int main(int argc, char** argv)
             pad = 0;
         act(menu_frame({g_widescreen, g_wide_available, fullscreen(), current_stage(), g_easy_bounce,
                         g_smooth_swing, g_smooth_swing_available, smooth_scroll_on, &settings.crt,
-                        &settings.scanlines, &settings.hqx, &settings.clean_rock_edges, &settings.smooth_fades,
+                        &settings.scanlines, &settings.hqx, &settings.clean_edge_line_width, &settings.clean_rock_edges, &settings.smooth_fades,
                         &settings.remove_sprite_limit, &settings.vsync, &settings.show_fps, fps, game_fps,
                         &settings.cheats, &settings.interpolate, refresh, &settings.frame_rate,
                         g_mdplus_on, g_mdplus.loaded() ? g_mdplus.name().c_str() : nullptr, settings.quick}),
@@ -1644,6 +1717,7 @@ int main(int argc, char** argv)
         g_mdplus.feed(music);
         if (interpolating && g_interp.ready())
             render_interpolated(pixels.data(), back);
+        display.clean_edge_line_width = settings.clean_edge_line_width;
         if (g_layered) {
             LayeredFrame frame;
             for (int i = 0; i < LayeredFrame::kLayers; i++)

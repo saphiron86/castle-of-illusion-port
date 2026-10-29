@@ -177,6 +177,38 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ------------------------------------------------------------------------------
+cleanEdge (torcado), MIT License
+https://gist.github.com/torcado194/e2794f5a4b22049ac0a41f972d14c329
+------------------------------------------------------------------------------
+
+coi.exe contains the cleanEdge shader, adapted from its Shadertoy version (texture reads,
+settings as uniforms, and an added rule that leaves dithering alone).
+
+MIT LICENSE
+Copyright (c) 2022 torcado
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------
 hqx shaders (libretro glsl-shaders, hqx/), GNU LGPL 2.1 or later
 https://github.com/libretro/glsl-shaders/tree/7b9df1a8abd68140ddb28c81c607f5ffab319c25/hqx
 ------------------------------------------------------------------------------

@@ -34,7 +34,8 @@ struct Settings {
     bool smooth_swing = true;
     bool smooth_scroll = true;
     int scanlines = 0;          // percent: 0 (off), 25, 50, 75 or 100
-    int hqx = 1;                // hqx scale: 2, 3 or 4; 1 = off
+    int hqx = 1;                // hqx scale: 2, 3 or 4; 1 = off; kCleanEdge = cleanEdge
+    float clean_edge_line_width = 1.0f;     // cleanEdge's line width, 0.45-1.14
     bool clean_rock_edges = true;
     bool smooth_fades = true;
     bool remove_sprite_limit = true;

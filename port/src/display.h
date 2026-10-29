@@ -1,5 +1,5 @@
 // Puts the emulated frame on screen with OpenGL: a plain nearest-neighbour stretch (with
-// optional scanlines), hqx upscaling, or the CRT shader (Enhancements > Graphics). See
+// optional scanlines), hqx or cleanEdge upscaling, or the CRT shader (Enhancements > Graphics). See
 // display.cpp.
 #pragma once
 
@@ -39,6 +39,10 @@ struct LayeredFrame {
     const uint32_t* backdrop;   // per line, 0xAARRGGBB
 };
 
+// The `hqx` value that picks cleanEdge (torcado's upscaler, display.cpp) instead of hqx; it
+// draws at the window's scale rounded up, so it takes no scale of its own.
+constexpr int kCleanEdge = 5;
+
 class Display {
 public:
     // Call with the window's OpenGL context current. Returns false (with a message) if the
@@ -55,10 +59,12 @@ public:
     void draw(const uint32_t* pixels, int width, int height, int logical_width, const CrtSettings& crt,
               int scanlines, int hqx);
 
-    // Draws a layered frame through hqx at scale `hqx` (2-4). Returns false, drawing
-    // nothing, if hqx is not available.
+    // Draws a layered frame through hqx at scale `hqx` (2-4), or cleanEdge (kCleanEdge).
+    // Returns false, drawing nothing, if that upscaler is not available.
     bool draw_layers(const LayeredFrame& frame, int scanlines, int hqx);
     bool hqx_available() const { return hqx_ready; }
+    bool clean_edge_available() const { return clean_edge != 0; }
+    float clean_edge_line_width = 1.0f;     // how wide its diagonal lines are drawn (0.45-1.14)
 
     // Reads back the window's current picture as RGB rows, top first (for testing).
     bool read_window(std::vector<uint8_t>& rgb, int& width, int& height);
@@ -87,6 +93,10 @@ private:
     void hqx_free(HqxTarget& target);
     void hqx_run(HqxTarget& target, unsigned pass1, unsigned source, bool alpha);
     bool hqx_ready = false;
+    int clean_edge_scale(int logical_width, int height) const;
+    void clean_edge_run(unsigned source, int width, int height, int scale, unsigned fbo, bool opaque);
+    unsigned clean_edge = 0, clean_flat = 0, clean_flat_fbo = 0;
+    int clean_flat_width = 0, clean_flat_height = 0;
     unsigned hqx_pass1 = 0, hqx_pass1_layer = 0, hqx_pass2 = 0, composite = 0, layer_merge = 0, hqx_lut[3] = {};
     HqxTarget hqx_flat;
     Layer layers[kLayers];
