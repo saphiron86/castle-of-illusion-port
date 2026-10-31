@@ -210,6 +210,16 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
+App icon: pixel-art apple by divexfre, Pixabay Content License
+https://pixabay.com/users/divexfre
+------------------------------------------------------------------------------
+
+The icon (port/icon/apple.png, and the icons made from it) is a pixel-art apple by divexfre,
+from Pixabay, used under the Pixabay Content License
+(https://pixabay.com/service/license-summary/), which needs no attribution; it is credited
+here anyway. It was reduced to its 32 x 32 pixels, with no other change.
+
+------------------------------------------------------------------------------
 hqx shaders (libretro glsl-shaders, hqx/), GNU LGPL 2.1 or later
 https://github.com/libretro/glsl-shaders/tree/7b9df1a8abd68140ddb28c81c607f5ffab319c25/hqx
 ------------------------------------------------------------------------------

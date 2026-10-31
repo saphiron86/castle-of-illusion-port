@@ -1,0 +1,2 @@
+// coi.exe's icon in Explorer and the taskbar (made by tools/make_icons.py).
+IDI_ICON1 ICON "coi.ico"

@@ -52,6 +52,7 @@
 #include <unistd.h>
 #endif
 #include "touch.h"
+#include "icon_data.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1514,6 +1515,19 @@ int main(int argc, char** argv)
     }
     SDL_GL_MakeCurrent(window, gl);
     SDL_GL_SetSwapInterval(0);                      // set by the main loop (V-Sync)
+#ifndef __ANDROID__
+    // The window's icon: the 32 x 32 pixel-art apple, with whole-number enlargements for
+    // the sizes a taskbar or window switcher may want, so its pixels stay sharp.
+    if (SDL_Surface* icon = SDL_LoadPNG_IO(SDL_IOFromConstMem(kIconPng, sizeof(kIconPng)), true)) {
+        for (int scale : {2, 4, 8})
+            if (SDL_Surface* big = SDL_ScaleSurface(icon, icon->w * scale, icon->h * scale, SDL_SCALEMODE_NEAREST)) {
+                SDL_AddSurfaceAlternateImage(icon, big);
+                SDL_DestroySurface(big);
+            }
+        SDL_SetWindowIcon(window, icon);
+        SDL_DestroySurface(icon);
+    }
+#endif
 #ifdef __ANDROID__
     android_pacing_init(window);
 #endif
@@ -1634,7 +1648,9 @@ int main(int argc, char** argv)
             save_settings(settings);
             break;
         case MenuAction::OpenSettingsFolder:
-            if (const std::string dir = settings_folder(); !dir.empty() && !SDL_OpenURL(("file:///" + dir).c_str()))
+            // file:///C:/... on Windows, file:///home/... elsewhere (the path starts with its own /).
+            if (const std::string dir = settings_folder();
+                !dir.empty() && !SDL_OpenURL(((dir[0] == '/' ? "file://" : "file:///") + dir).c_str()))
                 std::fprintf(stderr, "Could not open %s: %s\n", dir.c_str(), SDL_GetError());
             break;
         case MenuAction::ToggleMdPlus:

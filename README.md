@@ -2,7 +2,7 @@
 
 > **AI disclosure:** This project was made with extensive use of AI. Most of the code, tools and documentation were written by Claude, Anthropic's AI coding assistant, under my direction: I chose the features, play-tested every change and decided what went in. Expect the kinds of mistakes AI-written code can contain, and please report any you find in [Issues](https://github.com/saphiron86/castle-of-illusion-port/issues).
 
-An unofficial PC and Android port of the US Sega Genesis release of *Castle of Illusion Starring Mickey Mouse* (1990), with widescreen, smoother motion and display options, and the tools to disassemble the game from your own ROM.
+An unofficial PC (Windows, Linux and Steam Deck) and Android port of the US Sega Genesis release of *Castle of Illusion Starring Mickey Mouse* (1990), with widescreen, smoother motion and display options, and the tools to disassemble the game from your own ROM.
 
 **No game data is included.** This repository and the release downloads contain no ROM, graphics, sound, level data or disassembled game code. The port runs the game from your own dump of the cartridge, and the disassembly is generated on your computer from that dump. See [rom/README.md](rom/README.md) for the ROM that is expected.
 
@@ -13,6 +13,18 @@ An unofficial PC and Android port of the US Sega Genesis release of *Castle of I
 3. Start `coi.exe`. Press F1 for the menu, F2/F3/F4 for the Quick Settings.
 
 Settings are saved in `%APPDATA%\CastleOfIllusion\Port\settings.ini`. To use an MD+ soundtrack pack, put it in a folder named `mdplus` beside `coi.exe` (see [MD+ soundtrack packs](#md-soundtrack-packs)).
+
+## Playing (Linux and Steam Deck)
+
+64-bit Linux with glibc 2.29 or later (SteamOS, Bazzite, Ubuntu 20.04 and newer, and most other current distributions) and OpenGL 3.3.
+
+1. Download `coi-port-linux.tar.gz` from the [Releases](https://github.com/saphiron86/castle-of-illusion-port/releases) page and unpack it anywhere (on a Steam Deck, in Desktop Mode), for example in your home folder.
+2. Put your own dump of the US release (a 524,288-byte `.bin` file) in the `rom` folder beside `coi`.
+3. Start `coi`. It starts fullscreen; F11 switches to a window. Press F1, or a controller's Back/View button, for the menu.
+
+On a Steam Deck, add it to Steam to play in Game Mode: in Desktop Mode open Steam, choose Games > Add a Non-Steam Game to My Library..., browse to `coi` (set the file type to All files if it isn't listed) and add it. Back in Game Mode it is in the library's Non-Steam section. The Deck's controls work as a controller, and the View button opens the menu.
+
+Settings are saved in `~/.local/share/CastleOfIllusion/Port/settings.ini`. To use an MD+ soundtrack pack, put it in a folder named `mdplus` beside `coi` (see [MD+ soundtrack packs](#md-soundtrack-packs)).
 
 ## Playing (Android)
 
@@ -28,7 +40,7 @@ An MD+ soundtrack pack is imported from the menu: Enhancements > Audio > Import 
 
 This is a fan project. It is not affiliated with, endorsed or sponsored by Disney or Sega. *Castle of Illusion*, Mickey Mouse, Sega and Genesis are trademarks of their respective owners, used here only to name the game this port runs. You must supply your own copy of the game; please do not ask for, or share, ROMs.
 
-The project's own code is under the MIT License ([LICENSE](LICENSE)). The port is built with third-party libraries under their own licenses: SDL (zlib), Musashi and SoftFloat, ymfm (BSD 3-Clause), z80 (MIT), Dear ImGui (MIT), libretro's hqx shaders (LGPL 2.1 or later) and torcado's cleanEdge shader (MIT); the Android app adds Swappy (Apache 2.0) and LLVM's libc++ (Apache 2.0 with LLVM Exceptions). See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+The project's own code is under the MIT License ([LICENSE](LICENSE)). The port is built with third-party libraries under their own licenses: SDL (zlib), Musashi and SoftFloat, ymfm (BSD 3-Clause), z80 (MIT), Dear ImGui (MIT), libretro's hqx shaders (LGPL 2.1 or later) and torcado's cleanEdge shader (MIT); the Android app adds Swappy (Apache 2.0) and LLVM's libc++ (Apache 2.0 with LLVM Exceptions). The app icon is a pixel-art apple by [divexfre](https://pixabay.com/users/divexfre) (Pixabay Content License). See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 
 ## The disassembly
 
@@ -106,7 +118,13 @@ Run `build/port/Release/coi.exe`; it finds your ROM in a `rom` folder beside the
 | C       | C        | B                        |
 | Start   | Enter    | Menu                     |
 
-Controllers go through SDL's gamepad support (XInput, DirectInput and other Windows input APIs), can be connected at any time, and work alongside the keyboard; the console shows when one connects.
+Controllers go through SDL's gamepad support (XInput, DirectInput and other Windows input APIs; on Linux evdev, hidraw and Steam Input), can be connected at any time, and work alongside the keyboard; the console shows when one connects. A controller's Back (View) button opens the menu.
+
+On Linux the same commands build `build/port/coi` with GCC or Clang; SDL needs the X11, Wayland, ALSA, PulseAudio and PipeWire development packages to support them. The release download is built in Valve's Steam Runtime SDK, so it runs on any distribution with glibc 2.29 or later; with podman (or docker):
+
+```bash
+podman run --rm -v "$PWD":/src:Z -w /src registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest sh -c "cmake -S port -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/linux coi"
+```
 
 ### The F1 menu
 

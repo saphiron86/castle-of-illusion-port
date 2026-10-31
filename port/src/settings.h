@@ -1,5 +1,6 @@
 // Menu settings remembered between runs, in settings.ini in the user's app data folder
-// (on Windows %APPDATA%\CastleOfIllusion\Port\settings.ini).
+// (on Windows %APPDATA%\CastleOfIllusion\Port\settings.ini; on Linux
+// ~/.local/share/CastleOfIllusion/Port/settings.ini).
 #pragma once
 
 #include <string>
@@ -29,7 +30,11 @@ Look quick_look(Quick quick);
 
 struct Settings {
     bool widescreen = true;
-    bool fullscreen = false;
+#if defined(__linux__) && !defined(__ANDROID__)
+    bool fullscreen = true;     // Steam Deck and Linux desktops start fullscreen
+#else
+    bool fullscreen = false;    // Windows starts in a window (Android is always fullscreen)
+#endif
     bool easy_bounce = false;
     bool smooth_swing = true;
     bool smooth_scroll = true;
