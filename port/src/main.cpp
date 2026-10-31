@@ -42,6 +42,16 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#ifdef __ANDROID__
+#include "android_pacing.h"
+#include "android_mdplus.h"
+#include "android_rom.h"
+#include <GLES3/gl3.h>
+#include <android/log.h>
+#include <thread>
+#include <unistd.h>
+#endif
+#include "touch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -88,13 +98,16 @@ constexpr int kWideWidth = kWidth + 2 * kWideMargin;
 //        a scripted camera over 512-pixel planes that are drawn once. The castle
 //        exterior before the final boss needs a fill past its brick tower (TowerFill).
 //   $2E  the ending, in the final arena: same walls as the fight, drawn in front of the
-//        sprites so the characters exit behind them.
+//        sprites so the characters exit behind them (and Boss Rush's results screen).
+//   $2C  the ending's setup, under a frame in the game; in a Boss Rush the results load
+//        here for about 50 frames with the display off, showing Mizrabel's white across
+//        the whole width rather than between black bars.
 // Identified by play with --show-state: $06 is the intro after boot and $2A the scene
 // before the hallway; both stay pillarboxed.
 bool is_wide_state(uint16_t state, uint16_t level)
 {
     (void)level;
-    return state == 0x0E || state == 0x22 || state == 0x2E;
+    return state == 0x0E || state == 0x22 || state == 0x2C || state == 0x2E;
 }
 
 bool g_widescreen = true;
@@ -188,11 +201,33 @@ bool parse_press(const std::string& spec, Press& press)
 std::vector<std::filesystem::path> search_dirs(const char* name)
 {
     std::vector<std::filesystem::path> dirs;
+#ifdef __ANDROID__
+    // The app's private storage (where it keeps the ROM it is given), then its folder on
+    // shared storage (Android/data/<app>/files), which a file manager can reach.
+    if (const char* internal = SDL_GetAndroidInternalStoragePath())
+        dirs.push_back(std::filesystem::path(internal) / name);
+    if (const char* external = SDL_GetAndroidExternalStoragePath())
+        dirs.push_back(std::filesystem::path(external) / name);
+#endif
     if (const char* base = SDL_GetBasePath())
         dirs.push_back(std::filesystem::path(base) / name);
     for (const char* up : {"", "../", "../../", "../../../"})
         dirs.push_back(std::filesystem::path(std::string(up) + name));
     return dirs;
+}
+
+// The files in dir with the given extension; none if it can't be read (on Android a folder
+// on shared storage that another app or adb created can be listed but not opened).
+std::vector<std::filesystem::path> files_in(const std::filesystem::path& dir, const char* extension)
+{
+    std::vector<std::filesystem::path> files;
+    std::error_code error;
+    if (!std::filesystem::is_directory(dir, error))
+        return files;
+    for (std::filesystem::directory_iterator it(dir, error), end; !error && it != end; it.increment(error))
+        if (it->path().extension() == extension)
+            files.push_back(it->path());
+    return files;
 }
 
 std::vector<uint8_t> load_rom(const std::string& explicit_path)
@@ -202,10 +237,8 @@ std::vector<uint8_t> load_rom(const std::string& explicit_path)
         candidates.push_back(explicit_path);
     else
         for (const auto& dir : search_dirs("rom"))
-            if (std::filesystem::is_directory(dir))
-                for (const auto& entry : std::filesystem::directory_iterator(dir))
-                    if (entry.path().extension() == ".bin")
-                        candidates.push_back(entry.path());
+            for (const auto& file : files_in(dir, ".bin"))
+                candidates.push_back(file);
     for (const auto& path : candidates) {
         std::ifstream file(path, std::ios::binary);
         std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -215,6 +248,50 @@ std::vector<uint8_t> load_rom(const std::string& explicit_path)
         }
     }
     return {};
+}
+
+// Looks for an MD+ pack in mdplus/ and loads the first that fits: its patched ROM must be this
+// game with the pack's changes only, and take the port's patches as the cartridge's ROM does.
+// Returns why none was loaded (empty when one was).
+std::string find_mdplus_pack()
+{
+    g_mdplus.stop();                                // closes the playing track's file
+    g_mdplus = MdPlus();
+    g_rom_mdplus.clear();
+    std::string why = "no .cue file in mdplus/";
+    for (const auto& dir : search_dirs("mdplus")) {
+        for (const auto& cue : files_in(dir, ".cue")) {
+            std::string error;
+            if (!g_mdplus.load(cue, error)) {
+                why = error;
+                std::fprintf(stderr, "MD+ pack not used: %s\n", error.c_str());
+                continue;
+            }
+            std::ifstream file(g_mdplus.rom_path(), std::ios::binary);
+            g_rom_mdplus.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            size_t differ = 0;
+            for (size_t i = 0x200; i < g_rom_cartridge.size() && i < g_rom_mdplus.size(); i++)
+                differ += g_rom_cartridge[i] != g_rom_mdplus[i];
+            if (g_rom_mdplus.size() < g_rom_cartridge.size() || differ > 4096) {
+                why = g_mdplus.rom_path().filename().string() + " is not a patch of this ROM";
+            } else {
+                std::vector<uint8_t> trial = g_rom_mdplus;
+                const std::string wide = apply_widescreen_patches(trial);
+                trial = g_rom_mdplus;
+                const std::string swing = apply_smooth_swing(trial);
+                if ((g_wide_available && !wide.empty()) || (g_smooth_swing_available && !swing.empty())) {
+                    why = "the port's patches don't fit its ROM";
+                } else {
+                    std::printf("MD+ pack: %s\n", g_mdplus.name().c_str());
+                    return {};
+                }
+            }
+            std::fprintf(stderr, "MD+ pack not used: %s\n", why.c_str());
+            g_mdplus = MdPlus();
+            g_rom_mdplus.clear();
+        }
+    }
+    return why;
 }
 
 // Per-scene fills for the widened strips, where a scene's plane holds the wrong thing past
@@ -599,6 +676,69 @@ void capture_sprites(const std::string& dir, int frame)
 }
 #endif
 
+#ifdef COI_TIMING_LOG
+// Performance check (logged with the frame timings in main; Android builds made with
+// -DCOI_TIMING_LOG=ON only): time spent drawing lines (VDP), running the 68000, and running
+// the Z80 and sound chips.
+Uint64 g_time_video = 0, g_time_cpu = 0, g_time_sound = 0;
+int g_lock_changes = 0;
+int g_audio_min = 1 << 30, g_audio_max = 0, g_audio_clears = 0;   // sound queued, in bytes
+
+// The GPU's own time for each picture's drawing (GL_EXT_disjoint_timer_query), read back a few
+// pictures later so the CPU never waits for it: the total and the longest per log line.
+struct GpuTimer {
+    static constexpr GLenum kTimeElapsed = 0x88BF;  // GL_TIME_ELAPSED_EXT
+    static constexpr int kQueries = 4;
+    GLuint queries[kQueries] = {};
+    bool pending[kQueries] = {};
+    int next = 0;
+    bool available = false;
+    uint64_t total = 0, longest = 0;
+    int count = 0;
+
+    void init()
+    {
+        GLint extensions = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &extensions);
+        for (GLint i = 0; i < extensions; i++)
+            if (std::strcmp((const char*)glGetStringi(GL_EXTENSIONS, i), "GL_EXT_disjoint_timer_query") == 0)
+                available = true;
+        if (available)
+            glGenQueries(kQueries, queries);
+    }
+    void begin()
+    {
+        if (!available)
+            return;
+        if (pending[next]) {                        // the oldest, if done: count it
+            GLuint done = 0;
+            glGetQueryObjectuiv(queries[next], GL_QUERY_RESULT_AVAILABLE, &done);
+            if (done) {
+                GLuint ns = 0;
+                glGetQueryObjectuiv(queries[next], GL_QUERY_RESULT, &ns);
+                total += ns;
+                longest = std::max<uint64_t>(longest, ns);
+                count++;
+            }
+            pending[next] = false;
+        }
+        glBeginQuery(kTimeElapsed, queries[next]);
+    }
+    void end()
+    {
+        if (!available)
+            return;
+        glEndQuery(kTimeElapsed);
+        pending[next] = true;
+        next = (next + 1) % kQueries;
+    }
+};
+GpuTimer g_gpu_timer;
+#define TIMED(total, work) do { const Uint64 t0_ = SDL_GetTicksNS(); work; total += SDL_GetTicksNS() - t0_; } while (0)
+#else
+#define TIMED(total, work) work
+#endif
+
 void run_frame(uint32_t* pixels)
 {
     g_audio.clear();
@@ -675,7 +815,7 @@ void run_frame(uint32_t* pixels)
         {
             if (g_interp_capture)
                 g_interp.capture_line(g_vdp, line);
-            render_line(g_vdp, line, pixels + line * g_out_width * g_scale, wide);
+            TIMED(g_time_video, render_line(g_vdp, line, pixels + line * g_out_width * g_scale, wide));
         }
         if (line == Vdp::kScreenHeight) {
             g_vdp.set_vblank(true);
@@ -687,8 +827,8 @@ void run_frame(uint32_t* pixels)
         }
         if (g_vdp.hint_line() && g_vdp.hint_enabled())
             raise_irq(4);
-        m68k_execute(kCyclesPerLine);
-        g_sound.run(kZ80CyclesPerLine, g_audio);
+        TIMED(g_time_cpu, m68k_execute(kCyclesPerLine));
+        TIMED(g_time_sound, g_sound.run(kZ80CyclesPerLine, g_audio));
     }
 }
 
@@ -972,8 +1112,40 @@ void show_console()
 #endif
 }
 
+#ifdef __ANDROID__
+// Android drops what a program writes to stdout and stderr; this sends it, line by line, to the
+// log instead (adb logcat -s COI), so the port's messages (a shader that won't compile, an MD+
+// pack not used) can be read on a phone too.
+void log_output()
+{
+    int fds[2];
+    if (pipe(fds) != 0)
+        return;
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    std::thread([fd = fds[0]] {
+        std::string line;
+        char buffer[512];
+        for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0;)
+            for (ssize_t i = 0; i < n; i++) {
+                if (buffer[i] != '\n') {
+                    line += buffer[i];
+                    continue;
+                }
+                __android_log_write(ANDROID_LOG_INFO, "COI", line.c_str());
+                line.clear();
+            }
+    }).detach();
+}
+#endif
+
 int main(int argc, char** argv)
 {
+#ifdef __ANDROID__
+    log_output();
+#endif
     for (int i = 1; i < argc; i++)
         if (std::strcmp(argv[i], "--console") == 0)
             show_console();
@@ -1106,6 +1278,12 @@ int main(int argc, char** argv)
     }
 
     g_rom_original = load_rom(rom_path);
+#ifdef __ANDROID__
+    if (g_rom_original.empty())                     // first start: ask for it
+        g_rom_original = android_pick_rom();
+    if (g_rom_original.empty())
+        return 0;
+#endif
     if (g_rom_original.empty()) {
         std::fprintf(stderr, "No 512 KB ROM found (pass a path, or put it in rom/).\n");
         if (headless_frames == 0)
@@ -1115,33 +1293,6 @@ int main(int argc, char** argv)
         return 1;
     }
     g_rom_cartridge = g_rom_original;
-    // An MD+ pack in mdplus/: its patched ROM must be this game with the pack's changes only.
-    for (const auto& dir : search_dirs("mdplus")) {
-        if (!std::filesystem::is_directory(dir))
-            continue;
-        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-            if (entry.path().extension() != ".cue" || g_mdplus.loaded())
-                continue;
-            std::string error;
-            if (!g_mdplus.load(entry.path(), error)) {
-                std::fprintf(stderr, "MD+ pack not used: %s\n", error.c_str());
-                continue;
-            }
-            std::ifstream file(g_mdplus.rom_path(), std::ios::binary);
-            g_rom_mdplus.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-            size_t differ = 0;
-            for (size_t i = 0x200; i < g_rom_cartridge.size() && i < g_rom_mdplus.size(); i++)
-                differ += g_rom_cartridge[i] != g_rom_mdplus[i];
-            if (g_rom_mdplus.size() < g_rom_cartridge.size() || differ > 4096) {
-                std::fprintf(stderr, "MD+ pack not used: %s is not a patch of this ROM\n",
-                             g_mdplus.rom_path().filename().string().c_str());
-                g_mdplus = MdPlus();
-                g_rom_mdplus.clear();
-                continue;
-            }
-            std::printf("MD+ pack: %s\n", g_mdplus.name().c_str());
-        }
-    }
     {
         // Try each patch set on its own copy, to know which the menu can offer.
         std::vector<uint8_t> trial = g_rom_original;
@@ -1154,22 +1305,17 @@ int main(int argc, char** argv)
         g_smooth_swing_available = error.empty();
         if (!g_smooth_swing_available)
             std::fprintf(stderr, "Smooth swinging unavailable: %s\n", error.c_str());
-        // The pack's ROM must take the same patches.
-        if (g_mdplus.loaded()) {
-            trial = g_rom_mdplus;
-            const std::string wide = apply_widescreen_patches(trial);
-            trial = g_rom_mdplus;
-            const std::string swing = apply_smooth_swing(trial);
-            if ((g_wide_available && !wide.empty()) || (g_smooth_swing_available && !swing.empty())) {
-                std::fprintf(stderr, "MD+ pack not used: the port's patches don't fit its ROM\n");
-                g_mdplus = MdPlus();
-                g_rom_mdplus.clear();
-            }
-        }
     }
+    find_mdplus_pack();
     Settings settings;                              // defaults for headless runs, so tests repeat
     if (headless_frames == 0)
         settings = load_settings();
+#ifdef __ANDROID__
+    // A phone's GPU can't keep up with hq3x or hq4x (the menu offers only hq2x there): hq2x.
+    for (int* hqx : {&settings.hqx, &settings.custom.hqx})
+        if (*hqx == 3 || *hqx == 4)
+            *hqx = 2;
+#endif
     g_easy_bounce = settings.easy_bounce || easy_bounce;
     if (vanilla_rock_edges)
         settings.clean_rock_edges = false;
@@ -1335,15 +1481,28 @@ int main(int argc, char** argv)
         return 0;
     }
 
+#ifdef __ANDROID__
+    // Landscape only, either way up, and always fullscreen (the status and navigation bars hidden).
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    // Back (the gesture or button) opens and closes the menu instead of closing the app.
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+    settings.fullscreen = true;
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
     // OpenGL 3.3 core: the display draws the frame (through the CRT shader when it is on)
     // and the menu draws over it at the window's own resolution.
+#ifdef __ANDROID__
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);       // OpenGL ES 3.0
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_Window* window = SDL_CreateWindow("Castle of Illusion", g_out_width * 3, Vdp::kScreenHeight * 3,
                                           SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
@@ -1355,6 +1514,12 @@ int main(int argc, char** argv)
     }
     SDL_GL_MakeCurrent(window, gl);
     SDL_GL_SetSwapInterval(0);                      // set by the main loop (V-Sync)
+#ifdef __ANDROID__
+    android_pacing_init(window);
+#endif
+#ifdef COI_TIMING_LOG
+    g_gpu_timer.init();
+#endif
     Display display;
     if (!display.init(window)) {
         std::fprintf(stderr, "Could not set up the display.\n");
@@ -1377,7 +1542,18 @@ int main(int argc, char** argv)
         return !settings.crt.enabled && (settings.hqx == kCleanEdge ? display.clean_edge_available()
                                          : settings.hqx >= 2 && settings.hqx <= 4 && display.hqx_available());
     };
+    // Smooth scrolling as drawn: the setting, except with cleanEdge on Android, where drawing
+    // the layers through it separately is more than a phone's GPU can do 60 times a second
+    // (the setting is kept for the other upscalers).
+    auto scrolling_smoothly = [&] {
+#ifdef __ANDROID__
+        if (hqx_on() && settings.hqx == kCleanEdge)
+            return false;
+#endif
+        return smooth_scroll_on;
+    };
     menu_init(window, gl);
+    touch_init(window);
 
     SDL_AudioSpec audio_spec = {SDL_AUDIO_S16, 2, g_sound.sample_rate()};
     // The game's sound and the MD+ music (mdplus.cpp) are two streams on one device, which
@@ -1425,6 +1601,22 @@ int main(int argc, char** argv)
         smooth_scroll_on = settings.smooth_scroll;
         save_settings(settings);
     };
+#ifdef __ANDROID__
+    bool importing_pack = false;                    // an MD+ pack import is under way
+#endif
+    // MD+ on or off: a different cartridge (the pack's patched ROM or the original), from a reset.
+    auto switch_mdplus = [&](bool on) {
+        g_mdplus_on = on && g_mdplus.loaded();
+        settings.mdplus = g_mdplus_on;
+        g_rom_original = g_mdplus_on ? g_rom_mdplus : g_rom_cartridge;
+        build_rom();
+        power_on();
+        if (music)
+            SDL_ClearAudioStream(music);
+        if (audio)
+            SDL_ClearAudioStream(audio);
+        save_settings(settings);
+    };
     auto act = [&](MenuChoice choice, bool& running) {
         switch (choice.action) {
         case MenuAction::Reset:
@@ -1446,17 +1638,15 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "Could not open %s: %s\n", dir.c_str(), SDL_GetError());
             break;
         case MenuAction::ToggleMdPlus:
-            // A different cartridge: the pack's patched ROM or the original, from a reset.
-            g_mdplus_on = !g_mdplus_on && g_mdplus.loaded();
-            settings.mdplus = g_mdplus_on;
-            g_rom_original = g_mdplus_on ? g_rom_mdplus : g_rom_cartridge;
-            build_rom();
-            power_on();
-            if (music)
-                SDL_ClearAudioStream(music);
-            if (audio)
-                SDL_ClearAudioStream(audio);
-            save_settings(settings);
+            switch_mdplus(!g_mdplus_on);
+            break;
+        case MenuAction::ImportMdPlus:
+#ifdef __ANDROID__
+            android_import_pack();
+            importing_pack = true;
+            if (menu_open())
+                menu_toggle();
+#endif
             break;
         case MenuAction::ToggleSmoothSwing:
             set_smooth_swing(!g_smooth_swing);
@@ -1510,6 +1700,7 @@ int main(int argc, char** argv)
     float audio_ratio = 1.0f;
     int refreshes_per_frame = 1, refresh_phase = 0;   // locked to a multiple of 60 Hz
     int fixed_rate = 0;                             // pictures per game frame at a chosen frame rate
+    bool was_counted = false;                       // game frames followed the pictures shown
     Uint64 last_tick = SDL_GetTicksNS(), next_frame = last_tick;
     // FPS counter: pictures shown and game frames run over the last half second.
     int fps_shown = 0, fps_run = 0;
@@ -1527,7 +1718,14 @@ int main(int argc, char** argv)
             next_frame = last_tick = SDL_GetTicksNS();
         }
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
-        const double refresh = refresh_override > 0 ? refresh_override : mode ? mode->refresh_rate : 0.0;
+        double refresh = refresh_override > 0 ? refresh_override : mode ? mode->refresh_rate : 0.0;
+#ifdef __ANDROID__
+        // Swappy (android_pacing.cpp) shows every picture for the same number of the panel's
+        // refreshes, about a 60th of a second each: the game is locked to that rate, whatever the
+        // phone reports (Android gives the panel's highest rate, while phones switch by themselves).
+        if (vsync_on && android_pacing_active() && refresh_override <= 0)
+            refresh = android_pacing_rate();
+#endif
         // On a display at a whole multiple of 60 Hz (60, 120, 180, 240) each game frame is
         // shown for exactly that many refreshes, counted by refresh rather than by the clock,
         // so every picture lasts the same time (the game runs a fraction faster or slower than
@@ -1538,8 +1736,19 @@ int main(int argc, char** argv)
         // Nor while pictures can't keep up with it (drawing one takes longer than a refresh,
         // as the CRT shader can at 4K and 120 Hz): every swap then waits two refreshes, and
         // counting them would run the game at half speed. Frames then come due by the clock.
+        // Neither applies under Swappy on Android, which always waits for the refresh: a phone
+        // keeps up with ease, but a slow second (starting up, or Android putting the game on a
+        // slower core for a while) would drop the lock, and frames by the clock then come two to
+        // a picture, which keeps the pictures at 30 a second and the lock from coming back (and
+        // the quick pictures that follow a late one would drop it the other way). Locked, a late
+        // picture just shows its frame late.
+        bool pictures_off = fps > refresh * 1.03 || (fps > 0 && fps < refresh * 0.95);
+#ifdef __ANDROID__
+        if (vsync_on && android_pacing_active())
+            pictures_off = false;
+#endif
         const bool locked = vsync_on && multiple >= 1 && std::fabs(refresh - multiple * native_hz) < multiple
-                            && !(fps > refresh * 1.03) && !(fps > 0 && fps < refresh * 0.95);
+                            && !pictures_off;
         // Or a chosen frame rate (Video > Frame Rate: 60, 120 or 240, for variable-refresh
         // displays such as G-Sync or FreeSync ones): pictures are timed by the port at that
         // multiple of the console's 59.92 a second, whatever the display reports, and the game
@@ -1555,9 +1764,15 @@ int main(int argc, char** argv)
             g_interp_capture = interpolating;
             g_interp.reset();
         }
-        if (per_frame != refreshes_per_frame || fixed != fixed_rate) {
+        // A change of pacing starts the counts afresh (in particular, frames coming due by the
+        // clock again after being counted mustn't catch up on the time spent counting).
+        if (per_frame != refreshes_per_frame || fixed != fixed_rate || counted != was_counted) {
             refreshes_per_frame = per_frame;
             fixed_rate = fixed;
+            was_counted = counted;
+#ifdef COI_TIMING_LOG
+            g_lock_changes++;
+#endif
             next_frame = SDL_GetTicksNS();
             refresh_phase = 0;
             owed = 0;
@@ -1599,18 +1814,41 @@ int main(int argc, char** argv)
                 due = 3, owed = 3;
             owed -= due;
         }
-        const float ratio = locked && !fixed ? (float)(refresh / (per_frame * native_hz)) : 1.0f;
-        if (audio && ratio != audio_ratio) {
+        // The sound plays faster or slower with the game when it is locked to the display, plus
+        // a small correction (at most 2%, too little to hear) that holds the sound waiting to be
+        // played near 50 ms: a display whose real rate differs a little from the one it reports
+        // (a phone's "60 Hz" panel may run at 60.5), or a sound device's own clock, then never
+        // makes it pile up to the limit (and be dropped, a skip) or run out (a gap). The correction
+        // has a part that answers how far the queue is from 50 ms now, and a part that builds up
+        // slowly while it stays off, so a steady difference (a Galaxy S22+'s "60 Hz" panel runs at
+        // 59.77) is taken up in full and the queue settles back at 50 ms, not short of it.
+        float ratio = locked && !fixed ? (float)(refresh / (per_frame * native_hz)) : 1.0f;
+        if (audio) {
+            static double drift = 0;                // the built-up part
+            const double queued_ms = SDL_GetAudioStreamQueued(audio) * 250.0 / g_sound.sample_rate();
+            drift = std::clamp(drift + (queued_ms - 50.0) * 1e-5 / 60.0, -0.015, 0.015);
+            ratio *= (float)(1.0 + std::clamp((queued_ms - 50.0) / 50.0 * 0.01 + drift, -0.02, 0.02));
+        }
+        if (audio && std::fabs(ratio - audio_ratio) > 0.0005f) {
             SDL_SetAudioStreamFrequencyRatio(audio, ratio);
             audio_ratio = ratio;
         }
 
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            const bool finger = event.type >= SDL_EVENT_FINGER_DOWN && event.type <= SDL_EVENT_FINGER_CANCELED;
+            if (!finger || !menu_open())            // the menu takes touches as clicks while open
+                touch_event(event);
             if (menu_event(event))
                 continue;
             if (event.type == SDL_EVENT_QUIT)
                 running = false;
+#ifdef __ANDROID__
+            // While in the background the app waits in SDL_PollEvent with its sound paused;
+            // coming back, its window has a new surface.
+            else if (event.type == SDL_EVENT_DID_ENTER_FOREGROUND)
+                android_pacing_set_window(window);
+#endif
             else if (event.type == SDL_EVENT_GAMEPAD_ADDED)    // also sent for pads present at startup
                 open_gamepad(event.gdevice.which);
             else if (event.type == SDL_EVENT_GAMEPAD_REMOVED)
@@ -1623,7 +1861,7 @@ int main(int argc, char** argv)
             else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
                 const SDL_Keycode key = event.key.key;
                 const bool ctrl = event.key.mod & SDL_KMOD_CTRL, alt = event.key.mod & SDL_KMOD_ALT;
-                if (key == SDLK_F1) {
+                if (key == SDLK_F1 || key == SDLK_AC_BACK) {    // Back on Android
                     menu_toggle();
                     update_cursor();
                 } else if (key == SDLK_F11 || (alt && key == SDLK_RETURN)) {
@@ -1652,6 +1890,54 @@ int main(int argc, char** argv)
                 }
             }
         }
+        if (touch_menu_tapped()) {
+            menu_toggle();
+            update_cursor();
+        }
+        if (menu_open())
+            touch_release();
+#ifdef __ANDROID__
+        // An MD+ pack being imported: its progress over the game, then the pack switched on.
+        std::string busy;
+        float busy_progress = -1;
+        if (importing_pack) {
+            const PackImportStatus status = android_import_status();
+            switch (status.state) {
+            case PackImport::Choosing:
+                busy = "Choose the MD+ pack's folder";
+                break;
+            case PackImport::Copying:
+                busy = "Copying the MD+ pack";
+                busy_progress = (float)status.progress;
+                break;
+            case PackImport::Done: {
+                importing_pack = false;
+                android_import_clear();
+                const std::string why = find_mdplus_pack();
+                switch_mdplus(why.empty());
+                if (why.empty())
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Castle of Illusion",
+                                             ("MD+ pack imported: " + g_mdplus.name()
+                                              + "\n\nIts soundtrack is on, and the game has restarted. "
+                                                "Switch it in Enhancements > Audio.").c_str(), window);
+                else
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Castle of Illusion",
+                                             ("The pack was copied, but it can't be used: " + why + ".").c_str(), window);
+                break;
+            }
+            case PackImport::Failed:
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Castle of Illusion", status.message.c_str(), window);
+                [[fallthrough]];
+            default:                                // cancelled
+                importing_pack = false;
+                android_import_clear();
+                break;
+            }
+        }
+#else
+        const std::string busy;
+        const float busy_progress = -1;
+#endif
         // Alt+Enter must not also press Start; the menu keeps its keys while it has focus.
         const bool* keys = SDL_GetKeyboardState(nullptr);
         const bool keyboard_free = !menu_wants_keyboard() && !keys[SDL_SCANCODE_LALT] && !keys[SDL_SCANCODE_RALT];
@@ -1670,7 +1956,8 @@ int main(int argc, char** argv)
                         &settings.scanlines, &settings.hqx, &settings.clean_edge_line_width, &settings.clean_rock_edges, &settings.smooth_fades,
                         &settings.remove_sprite_limit, &settings.vsync, &settings.show_fps, fps, game_fps,
                         &settings.cheats, &settings.interpolate, refresh, &settings.frame_rate,
-                        g_mdplus_on, g_mdplus.loaded() ? g_mdplus.name().c_str() : nullptr, settings.quick}),
+                        g_mdplus_on, g_mdplus.loaded() ? g_mdplus.name().c_str() : nullptr, settings.quick,
+                        busy.empty() ? nullptr : busy.c_str(), busy_progress}),
             running);
         if ((Quick)settings.quick != Quick::Custom && look_of(settings) != quick_look((Quick)settings.quick)) {
             settings.quick = (int)Quick::Custom;    // one of its settings was changed by hand
@@ -1679,14 +1966,17 @@ int main(int argc, char** argv)
         g_clean_rock_edges = settings.clean_rock_edges;
         g_smooth_fades = settings.smooth_fades;
         g_vdp.sprite_limit = !settings.remove_sprite_limit;
-        if ((smooth_scroll_on && !hqx_on()) != (g_scale > 1))
-            set_smooth_scroll(smooth_scroll_on && !hqx_on());
-        if ((smooth_scroll_on && hqx_on()) != g_layered) {
+        if ((scrolling_smoothly() && !hqx_on()) != (g_scale > 1))
+            set_smooth_scroll(scrolling_smoothly() && !hqx_on());
+        if ((scrolling_smoothly() && hqx_on()) != g_layered) {
             g_layered = !g_layered;
             g_scroll_smoother.reset();
         }
 
-        const uint8_t buttons = (keyboard_free ? keyboard_buttons() : 0) | pad;
+        const uint8_t buttons = (keyboard_free ? keyboard_buttons() : 0) | pad | touch_buttons();
+#ifdef COI_TIMING_LOG
+        const Uint64 timing_start = SDL_GetTicksNS();
+#endif
         for (int i = 0; i < due && running; i++) {
             g_bus.buttons = buttons | easy_bounce_buttons();
             for (const Press& p : presses)          // --press works in a window too
@@ -1709,12 +1999,25 @@ int main(int argc, char** argv)
                 }
             }
             if (audio) {
+#ifdef COI_TIMING_LOG
+                {
+                    const int queued = SDL_GetAudioStreamQueued(audio);
+                    g_audio_min = std::min(g_audio_min, queued);
+                    g_audio_max = std::max(g_audio_max, queued);
+                    if (queued > max_queued)
+                        g_audio_clears++;
+                }
+#endif
                 if (SDL_GetAudioStreamQueued(audio) > max_queued)
                     SDL_ClearAudioStream(audio);
                 SDL_PutAudioStreamData(audio, g_audio.data(), (int)(g_audio.size() * sizeof(int16_t)));
             }
         }
         g_mdplus.feed(music);
+#ifdef COI_TIMING_LOG
+        const Uint64 timing_emulated = SDL_GetTicksNS();
+        g_gpu_timer.begin();
+#endif
         if (interpolating && g_interp.ready())
             render_interpolated(pixels.data(), back);
         display.clean_edge_line_width = settings.clean_edge_line_width;
@@ -1746,7 +2049,62 @@ int main(int argc, char** argv)
             }
             running = false;
         }
+#ifdef COI_TIMING_LOG
+        g_gpu_timer.end();
+        const Uint64 timing_drawn = SDL_GetTicksNS();
+#endif
+#ifdef __ANDROID__
+        if (!android_pacing_swap())
+#endif
         SDL_GL_SwapWindow(window);
+#ifdef COI_TIMING_LOG
+        // Performance check: once every 2 seconds, the frame rates and where a frame's time
+        // goes (emulation per game frame, drawing and the swap per picture) to the log.
+        {
+            static Uint64 since = 0, emulate = 0, draw = 0, swap = 0, last_swap = 0, longest_gap = 0;
+            static int pictures = 0, games = 0, late = 0;
+            const Uint64 swapped = SDL_GetTicksNS();
+            // Pictures that missed their refresh: more than one and a half refreshes since the last.
+            if (last_swap) {
+                const Uint64 gap = swapped - last_swap;
+                longest_gap = std::max(longest_gap, gap);
+                if (gap > 25000000)
+                    late++;
+            }
+            last_swap = swapped;
+            emulate += timing_emulated - timing_start;
+            draw += timing_drawn - timing_emulated;
+            swap += swapped - timing_drawn;
+            pictures++;
+            games += due;
+            if (since == 0)
+                since = swapped;
+            if (swapped - since >= 2000000000) {
+                const double seconds = (swapped - since) / 1e9;
+                const double per_game = 1e6 * (games ? games : 1);
+                SDL_Log("timing: %.1f pictures/s, %.1f game frames/s; emulation %.2f ms/game frame "
+                        "(video %.2f, 68000 %.2f, Z80+sound %.2f), drawing %.2f ms, swap %.2f ms/picture; "
+                        "refresh %.2f Hz, locked %d, lock changes %d; audio queued %.0f-%.0f ms, cleared %d; "
+                        "GPU %.2f ms/picture (longest %.2f); late pictures %d, longest gap %.1f ms",
+                        pictures / seconds, games / seconds, emulate / per_game,
+                        g_time_video / per_game, g_time_cpu / per_game, g_time_sound / per_game,
+                        draw / 1e6 / pictures, swap / 1e6 / pictures, refresh, (int)was_counted, g_lock_changes,
+                        g_audio_min * 250.0 / g_sound.sample_rate(), g_audio_max * 250.0 / g_sound.sample_rate(),
+                        g_audio_clears, g_gpu_timer.count ? g_gpu_timer.total / 1e6 / g_gpu_timer.count : 0.0,
+                        g_gpu_timer.longest / 1e6, late, longest_gap / 1e6);
+                g_gpu_timer.total = g_gpu_timer.longest = 0;
+                g_gpu_timer.count = 0;
+                late = 0;
+                longest_gap = 0;
+                g_lock_changes = 0;
+                g_audio_min = 1 << 30, g_audio_max = 0, g_audio_clears = 0;
+                g_time_video = g_time_cpu = g_time_sound = 0;
+                since = swapped;
+                emulate = draw = swap = 0;
+                pictures = games = 0;
+            }
+        }
+#endif
 
         fps_shown++;
         const Uint64 now = SDL_GetTicksNS();

@@ -46,7 +46,15 @@ ResultsStart:
 	move.w	#$9100,(VDP_Ctrl).l		; no window
 	move.w	#$9200,(VDP_Ctrl).l
 	jsr	(ClearObjects).l
-	jsr	(ClearVRAM).l
+	jsr	(ClearVRAM).l			; (this clears the palette buffer to black too, and
+	lea	(Palette).w,a1			; turns off VInt, which copies it to CRAM), so
+	move.l	#$C0000000,(VDP_Ctrl).l		; white again in both, as her fade left it: the
+	moveq	#63,d7				; screen shows CRAM's backdrop colour while the
+.white:						; display is off
+	move.w	#$0EEE,(a1)+
+	move.w	#$0EEE,(VDP_Data).l
+	dbra	d7,.white
+	move.b	#1,(PaletteDirty).w
 	jsr	(LoadSolidTiles).l
 	move.l	#$2726250A,d0			; the level-complete screen's graphics
 	jsr	(LoadGraphics).l
@@ -54,11 +62,11 @@ ResultsStart:
 	jsr	(LoadGraphics).l
 	moveq	#$22,d0				; and the tally's font (blue digits) over set $0A's
 	jsr	(LoadGraphics).l
-	lea	($68D04).l,a1
-	jsr	(LoadPalette).l
+	lea	($68D04).l,a1			; the palettes go straight to the fade's target, so
+	jsr	(LoadTarget).l			; the screen stays white from Mizrabel's fade on
 	lea	($68D24).l,a1
-	jsr	(LoadPalette).l
-	lea	(Palette).w,a1			; as the tally: line 0 to line 3, line 1 to 2
+	jsr	(LoadTarget).l
+	lea	(PaletteTarget).w,a1		; as the tally: line 0 to line 3, line 1 to 2
 	lea	$60(a1),a2
 	moveq	#15,d7
 .line3:
@@ -95,14 +103,6 @@ ResultsStart:
 	lea	HardText(pc),a1
 .difficulty:
 	bsr.w	DrawStrings
-	lea	(Palette).w,a1			; fade in from white
-	lea	(PaletteTarget).w,a2
-	moveq	#63,d7
-.palette:
-	move.w	(a1),(a2)+
-	move.w	#$0EEE,(a1)+
-	dbra	d7,.palette
-	move.b	#1,(PaletteDirty).w
 	clr.b	(ResultPhase).w
 	clr.b	(ResultLine).w
 	clr.w	(ResultTimer).w

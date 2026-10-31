@@ -1,0 +1,94 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The release signing key: android/keystore.properties (not in the repo) gives its file,
+// alias and passwords. Without it a release build is signed with the debug key, so anyone
+// can still build and install one.
+def keystoreFile = rootProject.file('keystore.properties')
+def keystore = new Properties()
+if (keystoreFile.exists())
+    keystoreFile.withInputStream { keystore.load(it) }
+
+android {
+    namespace = "io.github.saphiron86.coiport"
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 2
+        }
+    }
+    ndkVersion = "28.2.13676358"   // r28c: 16 KB-aligned native libraries by default (Android 15+)
+
+    defaultConfig {
+        applicationId = "io.github.saphiron86.coiport"
+        minSdk = 24             // Android 7.0
+        targetSdk = 37
+        versionCode = 2
+        versionName = "0.2.0-beta"
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared",  // shared: Swappy's package requires it
+                          "-DCOI_TIMING_LOG=${project.findProperty('timingLog') == 'true' ? 'ON' : 'OFF'}"
+                abiFilters 'arm64-v8a', 'x86_64'    // phones; the emulator
+            }
+        }
+    }
+
+    signingConfigs {
+        if (keystoreFile.exists()) {
+            release {
+                storeFile = file(keystore['storeFile'])
+                storePassword = keystore['storePassword']
+                keyAlias = keystore['keyAlias']
+                keyPassword = keystore['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        // Release: the native code optimised (the debug build's isn't, and plays far too slowly
+        // on a phone). Gradle -Pdebuggable=true makes one that adb run-as can reach, for testing.
+        release {
+            minifyEnabled = false
+            signingConfig = keystoreFile.exists() ? signingConfigs.release : signingConfigs.debug
+            debuggable = project.findProperty('debuggable') == 'true'
+        }
+    }
+
+    // SDL's Java side (the activity, input, audio) is used straight from third_party/; the
+    // licence and the third-party notices go into the APK's assets.
+    sourceSets {
+        main {
+            java.srcDirs += ['../../third_party/SDL/android-project/app/src/main/java']
+            assets.srcDirs += [layout.buildDirectory.dir('generated/notices')]
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file('../../port/CMakeLists.txt')
+            version = "3.22.1"
+        }
+    }
+
+    buildFeatures {
+        prefab = true           // native libraries from Gradle dependencies (Swappy)
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
+
+dependencies {
+    // Swappy: frame pacing from the Android Games SDK (port/src/android_pacing.cpp).
+    implementation "androidx.games:games-frame-pacing:2.1.3"
+}
+
+// LICENSE and THIRD_PARTY_NOTICES.txt from the project's root, as assets.
+def copyNotices = tasks.register('copyNotices', Copy) {
+    from('../../LICENSE') { rename { 'LICENSE.txt' } }
+    from '../../THIRD_PARTY_NOTICES.txt'
+    into layout.buildDirectory.dir('generated/notices')
+}
+tasks.named('preBuild') { dependsOn copyNotices }

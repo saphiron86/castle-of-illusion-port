@@ -1,0 +1,5 @@
+// The Android app: SDL's Java activity (third_party/SDL/android-project) running the port,
+// built from port/CMakeLists.txt as libmain.so. See android/README.md.
+plugins {
+    id 'com.android.application' version '9.4.0' apply false
+}

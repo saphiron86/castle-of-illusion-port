@@ -2,7 +2,7 @@
 
 > **AI disclosure:** This project was made with extensive use of AI. Most of the code, tools and documentation were written by Claude, Anthropic's AI coding assistant, under my direction: I chose the features, play-tested every change and decided what went in. Expect the kinds of mistakes AI-written code can contain, and please report any you find in [Issues](https://github.com/saphiron86/castle-of-illusion-port/issues).
 
-An unofficial PC port of the US Sega Genesis release of *Castle of Illusion Starring Mickey Mouse* (1990), with widescreen, smoother motion and display options, and the tools to disassemble the game from your own ROM.
+An unofficial PC and Android port of the US Sega Genesis release of *Castle of Illusion Starring Mickey Mouse* (1990), with widescreen, smoother motion and display options, and the tools to disassemble the game from your own ROM.
 
 **No game data is included.** This repository and the release downloads contain no ROM, graphics, sound, level data or disassembled game code. The port runs the game from your own dump of the cartridge, and the disassembly is generated on your computer from that dump. See [rom/README.md](rom/README.md) for the ROM that is expected.
 
@@ -14,11 +14,21 @@ An unofficial PC port of the US Sega Genesis release of *Castle of Illusion Star
 
 Settings are saved in `%APPDATA%\CastleOfIllusion\Port\settings.ini`. To use an MD+ soundtrack pack, put it in a folder named `mdplus` beside `coi.exe` (see [MD+ soundtrack packs](#md-soundtrack-packs)).
 
+## Playing (Android)
+
+Android 7.0 or later, on a 64-bit phone with OpenGL ES 3.0.
+
+1. Download `coi-port-android.apk` from the [Releases](https://github.com/saphiron86/castle-of-illusion-port/releases) page on the phone and open it. Android asks you to allow installs from your browser or file manager first.
+2. On first start the app asks for the ROM: pick your own dump of the US release (a 512 KB `.bin` file) with the file picker. It is copied into the app's storage, so it is asked for only once.
+3. Play with the on-screen controls or a USB or Bluetooth controller (a controller hides the touch controls until the screen is touched again). Tap the menu button, or press Back, for the menu.
+
+An MD+ soundtrack pack is imported from the menu: Enhancements > Audio > Import MD+ Pack..., then choose the pack's folder (see [android/README.md](android/README.md)). A phone's GPU can't do everything a PC's can, so the Android menu offers HQ2x but not HQ3x or HQ4x, cleanEdge turns smooth scrolling off, and the CRT shader draws at half resolution with its phosphor mask at full resolution. It is tuned on a OnePlus 9.
+
 ## Legal
 
 This is a fan project. It is not affiliated with, endorsed or sponsored by Disney or Sega. *Castle of Illusion*, Mickey Mouse, Sega and Genesis are trademarks of their respective owners, used here only to name the game this port runs. You must supply your own copy of the game; please do not ask for, or share, ROMs.
 
-The project's own code is under the MIT License ([LICENSE](LICENSE)). The port is built with third-party libraries under their own licenses: SDL (zlib), Musashi and SoftFloat, ymfm (BSD 3-Clause), z80 (MIT), Dear ImGui (MIT), libretro's hqx shaders (LGPL 2.1 or later) and torcado's cleanEdge shader (MIT); see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+The project's own code is under the MIT License ([LICENSE](LICENSE)). The port is built with third-party libraries under their own licenses: SDL (zlib), Musashi and SoftFloat, ymfm (BSD 3-Clause), z80 (MIT), Dear ImGui (MIT), libretro's hqx shaders (LGPL 2.1 or later) and torcado's cleanEdge shader (MIT); the Android app adds Swappy (Apache 2.0) and LLVM's libc++ (Apache 2.0 with LLVM Exceptions). See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 
 ## The disassembly
 

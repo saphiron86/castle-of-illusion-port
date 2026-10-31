@@ -424,8 +424,17 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
             break;
     }
 
+    if (!column_vscroll) {
+        render_pixels(line, out, width, left, scale, layers, backdrop, sprite_pixel, sprite_priority, sprite_on_b,
+                      sub_a, sub_b, hs_a, hs_b, window_line, window_hp, window_right, window_w, native_width,
+                      window_period, base_a, base_b, base_window, plane_w, plane_h);
+        return;
+    }
+
     // Each output pixel is 1/scale of a game pixel; x is the unshifted position in the
     // original view (the window and HUD), xa and xb the positions in planes A and B.
+    // (Per-column vertical scroll: plane B's row depends on plane A's column, so this draws
+    // pixel by pixel; render_pixels does the rest.)
     for (int ox = 0; ox < width * scale; ox++) {
         const int x = floor_div(ox, scale) - left;
         const int xa = floor_div(ox - sub_a, scale) - left;
@@ -482,5 +491,119 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
         else if (b) pixel = b;
         else pixel = -1;
         out[ox] = pixel < 0 ? backdrop : color(pixel);
+    }
+}
+
+// The planes of one line, fetched once per game pixel. With sub-pixel scrolling (scale > 1)
+// several output pixels show the same plane pixel, each plane at its own offset, so plane A,
+// plane B and the window are looked up once for each game pixel they show (with their colours
+// from a 64-entry table) and the output pixels then only pick from those. Draws exactly what
+// the per-pixel loop in render_line does.
+void Vdp::render_pixels(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers,
+                        uint32_t backdrop, const uint8_t* sprite_pixel, const bool* sprite_priority,
+                        const bool* sprite_on_b, int sub_a, int sub_b, int hs_a, int hs_b, bool window_line,
+                        int window_hp, bool window_right, int window_w, int native_width, int window_period,
+                        int base_a, int base_b, int base_window, int plane_w, int plane_h)
+{
+    auto floor_div = [](int v, int d) { return v >= 0 ? v / d : -((-v + d - 1) / d); };
+    const int out_width = width * scale;
+
+    uint32_t colors[64];
+    for (int i = 0; i < 64; i++)
+        colors[i] = color(i);
+
+    // Plane pixels: the palette index (0 = transparent) and priority; for plane A also
+    // whether it is a strip fill drawn in front of everything.
+    struct Pixel { uint8_t index; bool priority; bool front; };
+    constexpr int kSpan = kMaxWidth + 8;
+    Pixel window_px[kSpan], a_px[kSpan], b_px[kSpan];
+    bool window_used[kSpan];
+
+    // The window (the HUD), by unshifted position x.
+    const int x_lo = -left, x_hi = floor_div(out_width - 1, scale) - left;
+    for (int x = x_lo; x <= x_hi; x++) {
+        Pixel& p = window_px[x - x_lo];
+        bool pri = false;
+        const bool in_native = x >= 0 && x < native_width;
+        const bool in_window = in_native && (window_line || (window_right ? x >= window_hp : x < window_hp));
+        window_used[x - x_lo] = in_window || (window_line && !in_native);
+        if (in_window) {
+            p.index = (uint8_t)plane_pixel(base_window, x, line, window_w, 32, pri);
+        } else if (window_line && !in_native) {
+            int wx = window_period ? ((x % window_period) + window_period) % window_period
+                                   : (x < 0 ? 0 : native_width - 8) + (((x % 8) + 8) % 8);
+            p.index = (uint8_t)plane_pixel(base_window, wx, line, window_w, 32, pri);
+        } else {
+            p.index = 0;
+        }
+        p.priority = pri;
+        p.front = false;
+    }
+
+    // Plane A, by its position xa.
+    const int vs_a = vsram[0], vs_b = vsram[1];
+    const int a_lo = floor_div(-sub_a, scale) - left, a_hi = floor_div(out_width - 1 - sub_a, scale) - left;
+    for (int xa = a_lo; xa <= a_hi; xa++) {
+        Pixel& p = a_px[xa - a_lo];
+        bool pri = false;
+        int px = xa - hs_a, py = line + vs_a;
+        const bool remapped = (extend_plane_a_inside || xa < 0 || xa >= native_width) && extend_plane_a
+                              && extend_plane_a(xa, line, px, py);
+        int a = remapped ? strip_pixel(base_a, px, py, plane_w, plane_h, pri)
+                         : plane_pixel(base_a, px, py, plane_w, plane_h, pri);
+        if (clean_black_edges && a && (cram[a] & 0xEEE) == 0 && (edge_palette[a] & 0xEEE) == 0)
+            a = clean_black_edge(a, base_a, px, py, plane_w, plane_h);
+        p.index = (uint8_t)a;
+        p.priority = pri;
+        p.front = remapped && (strip_fill_in_front || (strip_fill_in_front_left && xa < 0)) && a;
+    }
+
+    // Plane B, by its position xb.
+    const int b_lo = floor_div(-sub_b, scale) - left, b_hi = floor_div(out_width - 1 - sub_b, scale) - left;
+    for (int xb = b_lo; xb <= b_hi; xb++) {
+        Pixel& p = b_px[xb - b_lo];
+        bool pri = false;
+        p.index = (uint8_t)plane_pixel(base_b, xb - hs_b, line + vs_b, plane_w, plane_h, pri);
+        p.priority = pri;
+        p.front = false;
+    }
+
+    // Each output pixel: step the three positions (x, xa, xb) along without dividing.
+    int x_i = 0, x_r = 0;
+    int a_i = 0, a_r = -sub_a - floor_div(-sub_a, scale) * scale;
+    int b_i = 0, b_r = -sub_b - floor_div(-sub_b, scale) * scale;
+    for (int ox = 0; ox < out_width; ox++) {
+        const Pixel& pa = window_used[x_i] ? window_px[x_i] : a_px[a_i];
+        const Pixel& pb = b_px[b_i];
+        if (++x_r == scale) x_r = 0, x_i++;
+        if (++a_r == scale) a_r = 0, a_i++;
+        if (++b_r == scale) b_r = 0, b_i++;
+        const int a = pa.index, b = pb.index;
+        const bool pri_a = pa.priority, pri_b = pb.priority;
+        if (pa.front) {
+            if (layers)                             // in front of everything
+                layers->layer[LineLayers::SpritesHigh][ox] = colors[a];
+            else
+                out[ox] = colors[a];
+            continue;
+        }
+        const int s = sprite_pixel[ox];
+        const bool pri_s = s && sprite_priority[ox];
+        if (layers) {
+            if (b) layers->layer[pri_b ? LineLayers::BHigh : LineLayers::BLow][ox] = colors[b];
+            if (a) layers->layer[pri_a ? LineLayers::AHigh : LineLayers::ALow][ox] = colors[a];
+            if (s && sprite_on_b[ox]) layers->layer[LineLayers::SpritesB][ox] = colors[s];
+            else if (s) layers->layer[pri_s ? LineLayers::SpritesHigh : LineLayers::SpritesLow][ox] = colors[s];
+            continue;
+        }
+        int pixel;
+        if (s && pri_s) pixel = s;
+        else if (a && pri_a) pixel = a;
+        else if (b && pri_b) pixel = b;
+        else if (s) pixel = s;
+        else if (a) pixel = a;
+        else if (b) pixel = b;
+        else pixel = -1;
+        out[ox] = pixel < 0 ? backdrop : colors[pixel];
     }
 }

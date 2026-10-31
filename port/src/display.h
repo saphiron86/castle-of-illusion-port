@@ -73,6 +73,9 @@ private:
     SDL_Window* window = nullptr;
     unsigned texture = 0, program = 0, vao = 0;
     int tex_width = 0, tex_height = 0;
+    // The CRT shader at half size and the pass enlarging it (Android only; see draw()).
+    unsigned crt_finish = 0, crt_half = 0, crt_half_fbo = 0;
+    int crt_half_width = 0, crt_half_height = 0;
 
     // One hqx run's textures: the pattern index, the enlarged colour and (for layers) alpha.
     struct HqxTarget {
@@ -85,6 +88,7 @@ private:
         HqxTarget hqx;
         unsigned merged = 0, merged_fbo = 0;    // colour and alpha in one, own pixels opaque
         int merged_width = 0, merged_height = 0;
+        bool cleared = false;                   // empty, and merged cleared to match
     };
     static constexpr int kLayers = LayeredFrame::kLayers;
 
@@ -94,9 +98,20 @@ private:
     void hqx_run(HqxTarget& target, unsigned pass1, unsigned source, bool alpha);
     bool hqx_ready = false;
     int clean_edge_scale(int logical_width, int height) const;
-    void clean_edge_run(unsigned source, int width, int height, int scale, unsigned fbo, bool opaque);
-    unsigned clean_edge = 0, clean_flat = 0, clean_flat_fbo = 0;
+    // cleanEdge's first pass's output, per source pixel: one for each layer and one for a whole
+    // frame, so no pass has to wait for the one before to finish reading it (a phone's GPU
+    // would otherwise run the layers one after another).
+    struct CleanCodes {
+        unsigned texture = 0, fbo = 0;
+        int width = 0, height = 0;
+    };
+    // `area` (left, top, right, bottom, in source texels; nullptr: all of it) limits the work
+    // to where the source has pixels; the rest of the output is left transparent.
+    void clean_edge_run(unsigned source, int width, int height, int scale, unsigned fbo, bool opaque, CleanCodes& codes,
+                        const int* area = nullptr);
+    unsigned clean_edge = 0, clean_edge_draw = 0, clean_flat = 0, clean_flat_fbo = 0;
     int clean_flat_width = 0, clean_flat_height = 0;
+    CleanCodes clean_codes[kLayers + 1];        // the layers', then a whole frame's
     unsigned hqx_pass1 = 0, hqx_pass1_layer = 0, hqx_pass2 = 0, composite = 0, layer_merge = 0, hqx_lut[3] = {};
     HqxTarget hqx_flat;
     Layer layers[kLayers];

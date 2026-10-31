@@ -32,9 +32,11 @@ struct MenuState {
     bool mdplus;                // an MD+ soundtrack pack is playing
     const char* mdplus_pack;    // the pack found in mdplus/ (nullptr: none)
     int quick;                  // the Quick Settings in use (Quick in settings.h)
+    const char* busy;           // a task under way, shown over the game (nullptr: none)
+    float busy_progress;        // its progress, 0-1 (below 0: none to show)
 };
 
-enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, OpenSettingsFolder, GoToStage, QuickSettings };
+enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, ImportMdPlus, OpenSettingsFolder, GoToStage, QuickSettings };
 
 struct MenuChoice {
     MenuAction action = MenuAction::None;

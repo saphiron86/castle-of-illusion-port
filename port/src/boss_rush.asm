@@ -69,7 +69,7 @@ VIntMode	equ	$FFFFF302
 ClearVRAM	equ	$00AD0A		; clears VRAM and the scroll buffers
 LoadSolidTiles	equ	$00ADB4		; LoadSolidColorTiles
 LoadGraphics	equ	$00A78E		; LoadGraphicsSets: Nemesis sets, one index per byte of d0
-LoadPalette	equ	$00CF3E		; palette (a1) into PaletteTarget
+LoadTarget	equ	$00CF44		; palette (a1) into PaletteTarget (sub_00CF3E: into Palette)
 DrawFrame	equ	$07C162		; the level-complete screen's border
 Decompress	equ	$07FCEE		; Enigma: (a0) into (a1), tile base d0
 RunObjects	equ	$00187C		; also rebuilds the sprite list

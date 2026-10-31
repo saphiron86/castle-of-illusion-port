@@ -51,6 +51,7 @@ using GLuint = unsigned;
 using GLint = int;
 using GLsizei = int;
 using GLfloat = float;
+using GLboolean = unsigned char;
 using GLchar = char;
 using GLbitfield = unsigned;
 
@@ -67,6 +68,15 @@ constexpr GLenum GL_TEXTURE_SWIZZLE_R = 0x8E42, GL_TEXTURE_SWIZZLE_G = 0x8E43, G
 constexpr GLenum GL_RED = 0x1903, GL_GREEN = 0x1904, GL_BLUE = 0x1905, GL_ALPHA = 0x1906;
 constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_FRAMEBUFFER_COMPLETE = 0x8CD5;
 
+// The frame's pixels are 0xAARRGGBB words, B, G, R, A in memory. OpenGL ES has no GL_BGRA
+// uploads, so there they go up as RGBA and the textures holding them swap red and blue back
+// when sampled (kSwizzleRed/Blue, set by pixel_texture).
+#ifdef __ANDROID__
+constexpr GLenum kPixelFormat = GL_RGBA, kSwizzleRed = GL_BLUE, kSwizzleBlue = GL_RED;
+#else
+constexpr GLenum kPixelFormat = GL_BGRA, kSwizzleRed = GL_RED, kSwizzleBlue = GL_BLUE;
+#endif
+
 #define GL_FUNCTIONS(X) \
     X(void, glGenTextures, (GLsizei, GLuint*)) \
     X(void, glDeleteTextures, (GLsizei, const GLuint*)) \
@@ -80,6 +90,8 @@ constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_FRAM
     X(void, glClearColor, (GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glClear, (GLbitfield)) \
     X(void, glDisable, (GLenum)) \
+    X(void, glEnable, (GLenum)) \
+    X(void, glScissor, (GLint, GLint, GLsizei, GLsizei)) \
     X(GLuint, glCreateShader, (GLenum)) \
     X(void, glShaderSource, (GLuint, GLsizei, const GLchar* const*, const GLint*)) \
     X(void, glCompileShader, (GLuint)) \
@@ -98,6 +110,8 @@ constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_FRAM
     X(void, glUniform1f, (GLint, GLfloat)) \
     X(void, glUniform2f, (GLint, GLfloat, GLfloat)) \
     X(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
+    X(void, glUniform2i, (GLint, GLint, GLint)) \
+    X(void, glColorMask, (GLboolean, GLboolean, GLboolean, GLboolean)) \
     X(void, glGenVertexArrays, (GLsizei, GLuint*)) \
     X(void, glDeleteVertexArrays, (GLsizei, const GLuint*)) \
     X(void, glBindVertexArray, (GLuint)) \
@@ -157,6 +171,39 @@ float scanline_shade(float y, float strength)
 }
 )";
 
+// The CRT shader's phosphor mask: how much of each colour a screen pixel at `pos` lets through.
+const char* kCrtMask = R"(
+uniform float mask_dark, mask_light, mask_size;
+uniform int mask_type;
+
+vec3 mask(vec2 pos)
+{
+    pos = floor(pos / mask_size);
+    vec3 m = vec3(mask_dark);
+    if (mask_type == 1) {                                     // slot mask
+        float line = mask_light;
+        float odd = fract(pos.x / 6.0) < 0.5 ? 1.0 : 0.0;
+        if (fract((pos.y + odd) / 2.0) < 0.5) line = mask_dark;
+        float x = fract(pos.x / 3.0);
+        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
+        m *= line;
+    } else if (mask_type == 2) {                              // aperture grille
+        float x = fract(pos.x / 3.0);
+        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
+    } else if (mask_type == 3) {                              // stretched VGA
+        float x = fract((pos.x + pos.y * 3.0) / 6.0);
+        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
+    } else if (mask_type == 4) {                              // VGA
+        vec2 p = floor(pos * vec2(1.0, 0.5));
+        float x = fract((p.x + p.y * 3.0) / 6.0);
+        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
+    } else {
+        m = vec3(1.0);
+    }
+    return m;
+}
+)";
+
 const char* kFragmentShader = R"(
 in vec2 uv;
 out vec4 frag;
@@ -168,8 +215,7 @@ uniform int crt;
 uniform float scanlines;      // simple scanline strength, 0-1 (sharp-pixel mode)
 uniform float rows;           // game lines in the picture (for the scanlines)
 uniform int smooth_sample;    // 1: bilinear (the hqx picture), 0: nearest
-uniform float hard_scan, hard_pix, mask_dark, mask_light, glow, brightness, mask_size;
-uniform int mask_type;
+uniform float hard_scan, hard_pix, glow, brightness;
 uniform vec2 warp;
 
 vec3 fetch(float x, float row)
@@ -198,32 +244,6 @@ vec3 horizontal(float x, float row, int radius, float step, float scale)
 
 float scanline(float dy, float scale) { return exp2(scale * dy * dy); }
 
-vec3 mask(vec2 pos)
-{
-    pos = floor(pos / mask_size);
-    vec3 m = vec3(mask_dark);
-    if (mask_type == 1) {                                     // slot mask
-        float line = mask_light;
-        float odd = fract(pos.x / 6.0) < 0.5 ? 1.0 : 0.0;
-        if (fract((pos.y + odd) / 2.0) < 0.5) line = mask_dark;
-        float x = fract(pos.x / 3.0);
-        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
-        m *= line;
-    } else if (mask_type == 2) {                              // aperture grille
-        float x = fract(pos.x / 3.0);
-        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
-    } else if (mask_type == 3) {                              // stretched VGA
-        float x = fract((pos.x + pos.y * 3.0) / 6.0);
-        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
-    } else if (mask_type == 4) {                              // VGA
-        vec2 p = floor(pos * vec2(1.0, 0.5));
-        float x = fract((p.x + p.y * 3.0) / 6.0);
-        if (x < 0.333) m.r = mask_light; else if (x < 0.666) m.g = mask_light; else m.b = mask_light;
-    } else {
-        m = vec3(1.0);
-    }
-    return m;
-}
 
 void main()
 {
@@ -258,6 +278,20 @@ void main()
     }
     color *= mask(gl_FragCoord.xy) * brightness;
     frag = vec4(pow(max(color, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+}
+)";
+
+// The CRT picture drawn at half size (on a phone: kFragmentShader without the mask), enlarged
+// to the screen with the mask and brightness laid over it there, in screen pixels.
+const char* kCrtFinishShader = R"(
+in vec2 uv;
+out vec4 frag;
+uniform sampler2D image;
+uniform float brightness;
+void main()
+{
+    vec3 c = texture(image, vec2(uv.x, 1.0 - uv.y)).rgb;     // drawn bottom row first
+    frag = vec4(c * pow(mask(gl_FragCoord.xy) * brightness, vec3(1.0 / 2.2)), 1.0);
 }
 )";
 
@@ -362,23 +396,29 @@ void main()
 // 5x5 pixels around it and, where an edge or a 45 or 2:1 slope runs through that corner,
 // takes the colour of the neighbour across it. Every output pixel is one source colour,
 // so a layer's edges stay hard (opaque or transparent) and nothing needs a separate alpha
-// pass. Draws into a framebuffer `scale` times the source's size; the output is
-// premultiplied.
-const char* kCleanEdgeShader = R"(#version 330 core
+// pass.
+//
+// It runs in two passes, for speed (a phone's GPU couldn't keep up with the original, run
+// whole for every output pixel). All the looking at neighbours depends only on the source
+// pixel and the direction a slice looks in: each of a pixel's four quarters has three
+// slices, but those twelve look along only four diagonals, the neighbours turned to match.
+// So the first pass (kCleanEdgeDecide) runs once per source pixel and diagonal, a draw for
+// each diagonal into its own channel, and works out a code: which slant cuts it (if any), whether it is flipped, which extra lines trim
+// it and which neighbour's colour it takes. The second (kCleanEdgeDraw) runs for every output
+// pixel, `scale` times the source's size: it reads the codes of its quarter's three slices,
+// measures its distance from their lines and takes the colour of the last slice it falls
+// inside, or its own. The output is premultiplied.
+const char* kCleanEdgeDecide = R"(#version 330 core
 out vec4 frag;
 uniform sampler2D source;
 uniform vec2 size;            // source texels
-uniform float scale;          // output pixels per source texel
 uniform vec3 highestColor;    // the colour that wins where shapes overlap
-uniform float similarThreshold;
-uniform float lineWidth;
 uniform int opaque;           // 1: ignore the source's alpha (a whole frame)
 
-#define SLOPE
-#define CLEANUP
-
+// cleanEdge compares distance(col1, col2) with a threshold; the port always uses 0, where
+// that means the colours are equal, which is far cheaper to test.
 bool similar(vec4 col1, vec4 col2){
-	return (col1.a == 0. && col2.a == 0.) || distance(col1, col2) <= similarThreshold;
+	return (col1.a == 0. && col2.a == 0.) || col1 == col2;
 }
 bool similar3(vec4 col1, vec4 col2, vec4 col3){
 	return similar(col1, col2) && similar(col2, col3);
@@ -397,19 +437,12 @@ bool higher(vec4 thisCol, vec4 otherCol){
 float cd(vec4 col1, vec4 col2){
 	return distance(col1.rgba, col2.rgba);
 }
-float distToLine(vec2 testPt, vec2 pt1, vec2 pt2, vec2 dir){
-  vec2 lineDir = pt2 - pt1;
-  vec2 perpDir = vec2(lineDir.y, -lineDir.x);
-  vec2 dirToPt1 = pt1 - testPt;
-  return (dot(perpDir, dir) > 0.0 ? 1.0 : -1.0) * (dot(normalize(perpDir), dirToPt1));
-}
 
-vec4 sliceDist(vec2 point, vec2 mainDir, vec2 pointDir, vec4 ub, vec4 u, vec4 uf, vec4 uff, vec4 b, vec4 c, vec4 f, vec4 ff, vec4 db, vec4 d, vec4 df, vec4 dff, vec4 ddb, vec4 dd, vec4 ddf){
-	float minWidth = 0.45;
-	float maxWidth = 1.142;
-	float _lineWidth = max(minWidth, min(maxWidth, lineWidth));
-	point = mainDir * (point - 0.5) + 0.5;
-
+// cleanEdge's sliceDist without the distances: 0 for no slice, else the slant (1 lower
+// shallow 2:1, 2 forward steep 2:1, 3 45 degrees, 4 far corner of a shallow slant, 5 far
+// corner of a steep one) + 8 if flipped + 16 and 32 for the extra lines that trim it + 64
+// for the second of its two colours.
+int sliceCode(vec4 ub, vec4 u, vec4 uf, vec4 uff, vec4 b, vec4 c, vec4 f, vec4 ff, vec4 db, vec4 d, vec4 df, vec4 dff, vec4 ddb, vec4 dd, vec4 ddf){
 	float distAgainst = 4.0*cd(f,d) + cd(uf,c) + cd(c,db) + cd(ff,df) + cd(df,dd);
 	float distTowards = 4.0*cd(c,df) + cd(u,f) + cd(f,dff) + cd(b,d) + cd(d,ddf);
 	bool shouldSlice =
@@ -418,46 +451,25 @@ vec4 sliceDist(vec2 point, vec2 mainDir, vec2 pointDir, vec4 ub, vec4 u, vec4 uf
 	if(similar4(f, d, b, u) && similar4(uf, df, db, ub) && !similar(c, f)){
 		shouldSlice = false;
 	}
-	if(!shouldSlice) return vec4(-1.0);
+	if(!shouldSlice) return 0;
 
-	float dist = 1.0;
 	bool flip = false;
-	vec2 center = vec2(0.5,0.5);
-
 	if(similar3(f, d, db) && !similar3(f, d, b) && !similar(uf, db)){ //lower shallow 2:1 slant
 		if(similar(c, df) && higher(c, f)){
 		} else {
 			if(higher(c, f)) flip = true;
 			if(similar(u, f) && !similar(c, df) && !higher(c, u)) flip = true;
 		}
-		if(flip){
-			dist = _lineWidth-distToLine(point, center+vec2(1.5, -1.0)*pointDir, center+vec2(-0.5, 0.0)*pointDir, -pointDir);
-		} else {
-			dist = distToLine(point, center+vec2(1.5, 0.0)*pointDir, center+vec2(-0.5, 1.0)*pointDir, pointDir);
-		}
-		if(!flip && similar(c, uf) && !(similar3(c, uf, uff) && !similar3(c, uf, ff) && !similar(d, uff))){
-			float dist2 = distToLine(point, center+vec2(2.0, -1.0)*pointDir, center+vec2(-0.0, 1.0)*pointDir, pointDir);
-			dist = min(dist, dist2);
-		}
-		dist -= (_lineWidth/2.0);
-		return dist <= 0.0 ? ((cd(c,f) <= cd(c,d)) ? f : d) : vec4(-1.0);
+		bool extra = !flip && similar(c, uf) && !(similar3(c, uf, uff) && !similar3(c, uf, ff) && !similar(d, uff));
+		return 1 + (flip ? 8 : 0) + (extra ? 16 : 0) + (cd(c,f) <= cd(c,d) ? 0 : 64);
 	} else if(similar3(uf, f, d) && !similar3(u, f, d) && !similar(uf, db)){ //forward steep 2:1 slant
 		if(similar(c, df) && higher(c, d)){
 		} else {
 			if(higher(c, d)) flip = true;
 			if(similar(b, d) && !similar(c, df) && !higher(c, d)) flip = true;
 		}
-		if(flip){
-			dist = _lineWidth-distToLine(point, center+vec2(0.0, -0.5)*pointDir, center+vec2(-1.0, 1.5)*pointDir, -pointDir);
-		} else {
-			dist = distToLine(point, center+vec2(1.0, -0.5)*pointDir, center+vec2(0.0, 1.5)*pointDir, pointDir);
-		}
-		if(!flip && similar(c, db) && !(similar3(c, db, ddb) && !similar3(c, db, dd) && !similar(f, ddb))){
-			float dist2 = distToLine(point, center+vec2(1.0, 0.0)*pointDir, center+vec2(-1.0, 2.0)*pointDir, pointDir);
-			dist = min(dist, dist2);
-		}
-		dist -= (_lineWidth/2.0);
-		return dist <= 0.0 ? ((cd(c,f) <= cd(c,d)) ? f : d) : vec4(-1.0);
+		bool extra = !flip && similar(c, db) && !(similar3(c, db, ddb) && !similar3(c, db, dd) && !similar(f, ddb));
+		return 2 + (flip ? 8 : 0) + (extra ? 16 : 0) + (cd(c,f) <= cd(c,d) ? 0 : 64);
 	} else if(similar(f, d)) { //45 diagonal
 		if(similar(c, df) && higher(c, f)){
 			if(!similar(c, dd) && !similar(c, ff)) flip = true;
@@ -468,49 +480,25 @@ vec4 sliceDist(vec2 point, vec2 mainDir, vec2 pointDir, vec4 ub, vec4 u, vec4 uf
 		if((( (similar(f, db) && similar3(u, f, df)) || (similar(uf, d) && similar3(b, d, df)) ) && !similar(c, df))){
 			flip = true;
 		}
-		if(flip){
-			dist = _lineWidth-distToLine(point, center+vec2(1.0, -1.0)*pointDir, center+vec2(-1.0, 1.0)*pointDir, -pointDir);
-		} else {
-			dist = distToLine(point, center+vec2(1.0, 0.0)*pointDir, center+vec2(0.0, 1.0)*pointDir, pointDir);
-		}
-		if(!flip && similar3(c, uf, uff) && !similar3(c, uf, ff) && !similar(d, uff)){
-			float dist2 = distToLine(point, center+vec2(1.5, 0.0)*pointDir, center+vec2(-0.5, 1.0)*pointDir, pointDir);
-			dist = max(dist, dist2);
-		}
-		if(!flip && similar3(ddb, db, c) && !similar3(dd, db, c) && !similar(ddb, f)){
-			float dist2 = distToLine(point, center+vec2(1.0, -0.5)*pointDir, center+vec2(0.0, 1.5)*pointDir, pointDir);
-			dist = max(dist, dist2);
-		}
-		dist -= (_lineWidth/2.0);
-		return dist <= 0.0 ? ((cd(c,f) <= cd(c,d)) ? f : d) : vec4(-1.0);
+		bool extra1 = !flip && similar3(c, uf, uff) && !similar3(c, uf, ff) && !similar(d, uff);
+		bool extra2 = !flip && similar3(ddb, db, c) && !similar3(dd, db, c) && !similar(ddb, f);
+		return 3 + (flip ? 8 : 0) + (extra1 ? 16 : 0) + (extra2 ? 32 : 0) + (cd(c,f) <= cd(c,d) ? 0 : 64);
 	} else if(similar3(ff, df, d) && !similar3(ff, df, c) && !similar(uff, d)){ //far corner of shallow slant
 		if(similar(f, dff) && higher(f, ff)){
 		} else {
 			if(higher(f, ff)) flip = true;
 			if(similar(uf, ff) && !similar(f, dff) && !higher(f, uf)) flip = true;
 		}
-		if(flip){
-			dist = _lineWidth-distToLine(point, center+vec2(1.5+1.0, -1.0)*pointDir, center+vec2(-0.5+1.0, 0.0)*pointDir, -pointDir);
-		} else {
-			dist = distToLine(point, center+vec2(1.5+1.0, 0.0)*pointDir, center+vec2(-0.5+1.0, 1.0)*pointDir, pointDir);
-		}
-		dist -= (_lineWidth/2.0);
-		return dist <= 0.0 ? ((cd(f,ff) <= cd(f,df)) ? ff : df) : vec4(-1.0);
+		return 4 + (flip ? 8 : 0) + (cd(f,ff) <= cd(f,df) ? 0 : 64);
 	} else if(similar3(f, df, dd) && !similar3(c, df, dd) && !similar(f, ddb)){ //far corner of steep slant
 		if(similar(d, ddf) && higher(d, dd)){
 		} else {
 			if(higher(d, dd)) flip = true;
 			if(similar(db, dd) && !similar(d, ddf) && !higher(d, dd)) flip = true;
 		}
-		if(flip){
-			dist = _lineWidth-distToLine(point, center+vec2(0.0, -0.5+1.0)*pointDir, center+vec2(-1.0, 1.5+1.0)*pointDir, -pointDir);
-		} else {
-			dist = distToLine(point, center+vec2(1.0, -0.5+1.0)*pointDir, center+vec2(0.0, 1.5+1.0)*pointDir, pointDir);
-		}
-		dist -= (_lineWidth/2.0);
-		return dist <= 0.0 ? ((cd(d,df) <= cd(d,dd)) ? df : dd) : vec4(-1.0);
+		return 5 + (flip ? 8 : 0) + (cd(d,df) <= cd(d,dd) ? 0 : 64);
 	}
-	return vec4(-1.0);
+	return 0;
 }
 
 // A 2x2 cell (p q / r s) whose diagonal pairs match but differ from each other.
@@ -527,13 +515,115 @@ bool dither(vec4 c, vec4 f, vec4 d, vec4 df, vec4 p1, vec4 q1, vec4 r1, vec4 s1,
 	    && ((crossed(p1, q1, r1, s1) && samePair(p1, q1, c, f)) || (crossed(p2, q2, r2, s2) && samePair(p2, q2, c, f)));
 }
 
+uniform ivec2 dir;            // the diagonal this draw works out
+ivec2 px;
+// The pixel (x, y) away along dir: x runs towards dir.x, y towards dir.y.
+vec4 at(int x, int y)
+{
+	vec4 t = texelFetch(source, clamp(px + ivec2(x, y) * dir, ivec2(0), ivec2(size) - 1), 0);
+	return opaque == 1 ? vec4(t.rgb, 1.0) : t;
+}
+
+void main()
+{
+	px = ivec2(gl_FragCoord.xy);              // row 0 is the top in source and target alike
+	vec4 uub = at(-1,-2), uu = at(0,-2), uuf = at(1,-2);
+	vec4 ub = at(-1,-1), u = at(0,-1), uf = at(1,-1), uff = at(2,-1);
+	vec4 bb = at(-2,0), b = at(-1,0), c = at(0,0), f = at(1,0), ff = at(2,0);
+	vec4 dbb = at(-2,1), db = at(-1,1), d = at(0,1), df = at(1,1), dff = at(2,1);
+	vec4 ddb = at(-1,2), dd = at(0,2), ddf = at(1,2);
+	// A neighbourhood all of one colour, or all transparent (most of most layers), can only
+	// be sliced into its own colour: no slice, without the work of finding it.
+	if((uub == c && uu == c && uuf == c && ub == c && u == c && uf == c && uff == c && bb == c && b == c
+	    && f == c && ff == c && dbb == c && db == c && d == c && df == c && dff == c && ddb == c && dd == c && ddf == c)
+	   || (uub.a == 0.0 && uu.a == 0.0 && uuf.a == 0.0 && ub.a == 0.0 && u.a == 0.0 && uf.a == 0.0 && uff.a == 0.0
+	       && bb.a == 0.0 && b.a == 0.0 && c.a == 0.0 && f.a == 0.0 && ff.a == 0.0 && dbb.a == 0.0 && db.a == 0.0
+	       && d.a == 0.0 && df.a == 0.0 && dff.a == 0.0 && ddb.a == 0.0 && dd.a == 0.0 && ddf.a == 0.0)){
+		frag = vec4(0.0);
+		return;
+	}
+	// Not part of cleanEdge: leave dithering alone. A corner where the 2x2 cell's diagonal
+	// pairs match (an X) is cut by a slice; when the same X of the same two colours repeats
+	// two pixels across or down, it is a checkerboard or hatching rather than a line, so
+	// that slice is dropped.
+	int code = dither(c, f, d, df, bb, b, dbb, db, uu, uuf, u, uf) ? 0
+	         : sliceCode(ub, u, uf, uff, b, c, f, ff, db, d, df, dff, ddb, dd, ddf);
+	frag = vec4(float(code) / 255.0);           // the colour mask picks the channel
+}
+)";
+
+const char* kCleanEdgeDraw = R"(#version 330 core
+out vec4 frag;
+uniform sampler2D source;
+uniform sampler2D codes;      // kCleanEdgeDecide's, the source's size
+uniform vec2 size;            // source texels
+uniform float scale;          // output pixels per source texel
+uniform float lineWidth;
+uniform int opaque;           // 1: ignore the source's alpha (a whole frame)
+
 vec2 px;
 vec2 pointDir;
-vec4 at(float x, float y)
+vec4 at(vec2 offset)
 {
-	ivec2 p = ivec2(clamp(px + vec2(x, y) * pointDir, vec2(0.0), size - 1.0));
+	ivec2 p = ivec2(clamp(px + offset * pointDir, vec2(0.0), size - 1.0));
 	vec4 t = texelFetch(source, p, 0);
 	return opaque == 1 ? vec4(t.rgb, 1.0) : t;
+}
+
+float distToLine(vec2 testPt, vec2 pt1, vec2 pt2, vec2 dir){
+  vec2 lineDir = pt2 - pt1;
+  vec2 perpDir = vec2(lineDir.y, -lineDir.x);
+  vec2 dirToPt1 = pt1 - testPt;
+  return (dot(perpDir, dir) > 0.0 ? 1.0 : -1.0) * (dot(normalize(perpDir), dirToPt1));
+}
+// One of cleanEdge's lines, its points given as offsets from the pixel's centre.
+float line(vec2 point, vec2 a, vec2 b, float side){
+	vec2 center = vec2(0.5, 0.5);
+	return distToLine(point, center + a * pointDir, center + b * pointDir, side * pointDir);
+}
+
+// The colour a slice (its code from kCleanEdgeDecide) gives this output pixel, or -1 if the
+// pixel lies outside it: cleanEdge's sliceDist from the distances on.
+vec4 slice(int code, vec2 local, vec2 mainDir){
+	int slant = code & 7;
+	if(slant == 0) return vec4(-1.0);
+	bool flip = (code & 8) != 0, extra1 = (code & 16) != 0, extra2 = (code & 32) != 0;
+	float lw = max(0.45, min(1.142, lineWidth));
+	vec2 point = mainDir * (local - 0.5) + 0.5;
+	float dist;
+	vec2 colorAt;                 // the neighbour whose colour the slice takes
+	if(slant == 1){
+		dist = flip ? lw - line(point, vec2(1.5, -1.0), vec2(-0.5, 0.0), -1.0)
+		            : line(point, vec2(1.5, 0.0), vec2(-0.5, 1.0), 1.0);
+		if(extra1) dist = min(dist, line(point, vec2(2.0, -1.0), vec2(-0.0, 1.0), 1.0));
+		colorAt = (code & 64) == 0 ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+	} else if(slant == 2){
+		dist = flip ? lw - line(point, vec2(0.0, -0.5), vec2(-1.0, 1.5), -1.0)
+		            : line(point, vec2(1.0, -0.5), vec2(0.0, 1.5), 1.0);
+		if(extra1) dist = min(dist, line(point, vec2(1.0, 0.0), vec2(-1.0, 2.0), 1.0));
+		colorAt = (code & 64) == 0 ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+	} else if(slant == 3){
+		dist = flip ? lw - line(point, vec2(1.0, -1.0), vec2(-1.0, 1.0), -1.0)
+		            : line(point, vec2(1.0, 0.0), vec2(0.0, 1.0), 1.0);
+		if(extra1) dist = max(dist, line(point, vec2(1.5, 0.0), vec2(-0.5, 1.0), 1.0));
+		if(extra2) dist = max(dist, line(point, vec2(1.0, -0.5), vec2(0.0, 1.5), 1.0));
+		colorAt = (code & 64) == 0 ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+	} else if(slant == 4){
+		dist = flip ? lw - line(point, vec2(1.5+1.0, -1.0), vec2(-0.5+1.0, 0.0), -1.0)
+		            : line(point, vec2(1.5+1.0, 0.0), vec2(-0.5+1.0, 1.0), 1.0);
+		colorAt = (code & 64) == 0 ? vec2(2.0, 0.0) : vec2(1.0, 1.0);
+	} else {
+		dist = flip ? lw - line(point, vec2(0.0, -0.5+1.0), vec2(-1.0, 1.5+1.0), -1.0)
+		            : line(point, vec2(1.0, -0.5+1.0), vec2(0.0, 1.5+1.0), 1.0);
+		colorAt = (code & 64) == 0 ? vec2(1.0, 1.0) : vec2(0.0, 2.0);
+	}
+	dist -= lw / 2.0;
+	return dist <= 0.0 ? at(colorAt * mainDir) : vec4(-1.0);
+}
+
+// The code for the diagonal a slice looks along: its direction turned by the quarter's.
+int codeFor(ivec4 code, vec2 dir){
+	return dir.y > 0.0 ? (dir.x > 0.0 ? code.r : code.g) : (dir.x > 0.0 ? code.b : code.a);
 }
 
 void main()
@@ -541,25 +631,13 @@ void main()
 	vec2 pos = gl_FragCoord.xy / scale;       // row 0 is the top in source and target alike
 	vec2 local = fract(pos);
 	px = floor(pos);
-	pointDir = round(local)*2.0-1.0;
+	pointDir = round(local) * 2.0 - 1.0;
+	ivec4 code = ivec4(texelFetch(codes, ivec2(px), 0) * 255.0 + 0.5);
 
-	vec4 uub = at(-1.0,-2.0), uu = at(0.0,-2.0), uuf = at(1.0,-2.0);
-	vec4 ubb = at(-2.0,-2.0), ub = at(-1.0,-1.0), u = at(0.0,-1.0), uf = at(1.0,-1.0), uff = at(2.0,-1.0);
-	vec4 bb = at(-2.0, 0.0), b = at(-1.0, 0.0), c = at(0.0, 0.0), f = at(1.0, 0.0), ff = at(2.0, 0.0);
-	vec4 dbb = at(-2.0, 1.0), db = at(-1.0, 1.0), d = at(0.0, 1.0), df = at(1.0, 1.0), dff = at(2.0, 1.0);
-	vec4 ddb = at(-1.0, 2.0), dd = at(0.0, 2.0), ddf = at(1.0, 2.0);
-
-	vec4 col = c;
-	vec4 c_col = sliceDist(local, vec2( 1.0, 1.0), pointDir, ub, u, uf, uff, b, c, f, ff, db, d, df, dff, ddb, dd, ddf);
-	vec4 b_col = sliceDist(local, vec2(-1.0, 1.0), pointDir, uf, u, ub, ubb, f, c, b, bb, df, d, db, dbb, ddf, dd, ddb);
-	vec4 u_col = sliceDist(local, vec2( 1.0,-1.0), pointDir, db, d, df, dff, b, c, f, ff, ub, u, uf, uff, uub, uu, uuf);
-	// Not part of cleanEdge: leave dithering alone. A corner where the 2x2 cell's diagonal
-	// pairs match (an X) is cut by a slice; when the same X of the same two colours repeats
-	// two pixels across or down, it is a checkerboard or hatching rather than a line, so
-	// that slice is dropped.
-	if(dither(c, f, d, df, bb, b, at(-2.0, 1.0), db, uu, uuf, u, uf)) c_col = vec4(-1.0);
-	if(dither(c, b, d, db, ff, f, dff, df, uu, uub, u, ub)) b_col = vec4(-1.0);
-	if(dither(c, f, u, uf, bb, b, at(-2.0, -1.0), ub, dd, ddf, d, df)) u_col = vec4(-1.0);
+	vec4 col = at(vec2(0.0));
+	vec4 c_col = slice(codeFor(code, pointDir * vec2( 1.0, 1.0)), local, vec2( 1.0, 1.0));
+	vec4 b_col = slice(codeFor(code, pointDir * vec2(-1.0, 1.0)), local, vec2(-1.0, 1.0));
+	vec4 u_col = slice(codeFor(code, pointDir * vec2( 1.0,-1.0)), local, vec2( 1.0,-1.0));
 	if(c_col.r >= 0.0) col = c_col;
 	if(b_col.r >= 0.0) col = b_col;
 	if(u_col.r >= 0.0) col = u_col;
@@ -567,8 +645,17 @@ void main()
 }
 )";
 
-GLuint compile(GLenum type, const char* source)
+GLuint compile(GLenum type, const char* text)
 {
+    std::string code = text;
+#ifdef __ANDROID__
+    // The shaders are GLSL 3.30; OpenGL ES 3.0 takes them as GLSL ES 3.00, with precisions.
+    const std::string desktop = "#version 330 core";
+    if (code.compare(0, desktop.size(), desktop) == 0)
+        code.replace(0, desktop.size(), "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+                                        "precision highp sampler2D;");
+#endif
+    const char* source = code.c_str();
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
     glCompileShader(shader);
@@ -619,6 +706,15 @@ GLuint new_texture(GLenum filter)
     return t;
 }
 
+// A texture for the frame's pixels (see kPixelFormat).
+GLuint pixel_texture(GLenum filter)
+{
+    GLuint t = new_texture(filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, kSwizzleRed);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, kSwizzleBlue);
+    return t;
+}
+
 // A texture of the given size that a framebuffer draws into.
 bool render_target(GLuint fbo, GLuint tex, int width, int height)
 {
@@ -634,9 +730,18 @@ bool render_target(GLuint fbo, GLuint tex, int width, int height)
 bool Display::init_hqx()
 {
     const std::string fragment = "#version 330 core\n#define FRAGMENT\n";
-    hqx_pass1 = link(kHqxVertexShader, (fragment + kHqxPass1).c_str());
-    hqx_pass1_layer = link(kHqxVertexShader, (std::string(kHqxLayerKey) + kHqxPass1).c_str());
-    hqx_pass2 = link(kHqxVertexShader, (fragment + "#define PARAMETER_UNIFORM\n" + kHqxPass2).c_str());
+    std::string pass1 = kHqxPass1, pass2 = kHqxPass2;
+#ifdef __ANDROID__
+    // On OpenGL ES libretro's passes declare their uniforms and floats mediump, which won't
+    // link with the vertex shader's (highp) TextureSize, and mediump texture coordinates are
+    // too coarse at hq4x sizes: everything highp instead.
+    for (std::string* pass : {&pass1, &pass2})
+        for (size_t at; (at = pass->find("mediump")) != std::string::npos;)
+            pass->replace(at, 7, "highp");
+#endif
+    hqx_pass1 = link(kHqxVertexShader, (fragment + pass1).c_str());
+    hqx_pass1_layer = link(kHqxVertexShader, (std::string(kHqxLayerKey) + pass1).c_str());
+    hqx_pass2 = link(kHqxVertexShader, (fragment + "#define PARAMETER_UNIFORM\n" + pass2).c_str());
     composite = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kCompositeShader).c_str());
     layer_merge = link(kVertexShader, kLayerMergeShader);
     if (!hqx_pass1 || !hqx_pass1_layer || !hqx_pass2 || !composite || !layer_merge)
@@ -736,9 +841,9 @@ void Display::hqx_run(HqxTarget& t, GLuint pass1, GLuint source, bool alpha)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ALPHA);
         glBindFramebuffer(GL_FRAMEBUFFER, t.alpha_fbo);
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, kSwizzleRed);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, kSwizzleBlue);
     }
     glBindVertexArray(0);
     glActiveTexture(GL_TEXTURE0);
@@ -750,15 +855,23 @@ bool Display::init(SDL_Window* w)
     window = w;
     if (!load_gl())
         return false;
-    program = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kFragmentShader).c_str());
+    program = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kCrtMask + kFragmentShader).c_str());
     if (!program)
         return false;
+#ifdef __ANDROID__
+    crt_finish = link(kVertexShader, (std::string("#version 330 core\n") + kCrtMask + kCrtFinishShader).c_str());
+#endif
     glGenVertexArrays(1, &vao);
-    texture = new_texture(GL_NEAREST);
+    texture = pixel_texture(GL_NEAREST);
     hqx_ready = init_hqx();
     if (!hqx_ready)
         std::fprintf(stderr, "hqx is not available.\n");
-    clean_edge = link(kVertexShader, kCleanEdgeShader);
+    clean_edge = link(kVertexShader, kCleanEdgeDecide);
+    clean_edge_draw = link(kVertexShader, kCleanEdgeDraw);
+    if (!clean_edge || !clean_edge_draw) {
+        glDeleteProgram(clean_edge);
+        clean_edge = 0;
+    }
     if (!clean_edge)
         std::fprintf(stderr, "cleanEdge is not available.\n");
     return true;
@@ -774,24 +887,68 @@ int Display::clean_edge_scale(int logical_width, int height) const
     return std::clamp((int)std::ceil(s - 0.01f), 2, 6);
 }
 
-// Draws `source` (width x height) through cleanEdge into `fbo`, `scale` times the size.
-void Display::clean_edge_run(GLuint source, int width, int height, int scale, GLuint fbo, bool opaque)
+// Draws `source` (width x height) through cleanEdge into `fbo`, `scale` times the size: its
+// codes for each pixel's four diagonals, then the picture from them.
+void Display::clean_edge_run(GLuint source, int width, int height, int scale, GLuint fbo, bool opaque,
+                             CleanCodes& codes, const int* area)
 {
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glViewport(0, 0, width * scale, height * scale);
+    if (codes.width != width || codes.height != height) {
+        if (!codes.texture) {
+            codes.texture = new_texture(GL_NEAREST);
+            glGenFramebuffers(1, &codes.fbo);
+        }
+        codes.width = width;
+        codes.height = height;
+        render_target(codes.fbo, codes.texture, width, height);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source);
+    glBindVertexArray(vao);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, codes.fbo);
+    glViewport(0, 0, width, height);
     glUseProgram(clean_edge);
     auto loc = [this](const char* name) { return glGetUniformLocation(clean_edge, name); };
     glUniform1i(loc("source"), 0);
     glUniform2f(loc("size"), (float)width, (float)height);
-    glUniform1f(loc("scale"), (float)scale);
     glUniform3f(loc("highestColor"), 1.0f, 1.0f, 1.0f);
-    glUniform1f(loc("similarThreshold"), 0.0f);
-    glUniform1f(loc("lineWidth"), clean_edge_line_width);
     glUniform1i(loc("opaque"), opaque ? 1 : 0);
+    if (area) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(area[0], area[1], area[2] - area[0], area[3] - area[1]);
+    }
+    // One draw per diagonal, each into its own channel: four small programs' worth of work
+    // run far faster on a phone's GPU than one program four times the size.
+    static constexpr int kDirs[4][2] = {{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+    for (int i = 0; i < 4; i++) {
+        glColorMask(i == 0, i == 1, i == 2, i == 3);
+        glUniform2i(loc("dir"), kDirs[i][0], kDirs[i][1]);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    glColorMask(true, true, true, true);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, width * scale, height * scale);
+    if (area) {
+        glDisable(GL_SCISSOR_TEST);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(area[0] * scale, area[1] * scale, (area[2] - area[0]) * scale, (area[3] - area[1]) * scale);
+    }
+    glUseProgram(clean_edge_draw);
+    auto draw_loc = [this](const char* name) { return glGetUniformLocation(clean_edge_draw, name); };
+    glUniform1i(draw_loc("source"), 0);
+    glUniform1i(draw_loc("codes"), 1);
+    glUniform2f(draw_loc("size"), (float)width, (float)height);
+    glUniform1f(draw_loc("scale"), (float)scale);
+    glUniform1f(draw_loc("lineWidth"), clean_edge_line_width);
+    glUniform1i(draw_loc("opaque"), opaque ? 1 : 0);
+    glActiveTexture(GL_TEXTURE0 + 1);
+    glBindTexture(GL_TEXTURE_2D, codes.texture);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, source);
-    glBindVertexArray(vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_SCISSOR_TEST);
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
@@ -801,7 +958,11 @@ void Display::shutdown()
     if (texture) glDeleteTextures(1, &texture);
     if (vao) glDeleteVertexArrays(1, &vao);
     if (program) glDeleteProgram(program);
-    texture = vao = program = 0;
+    if (crt_finish) glDeleteProgram(crt_finish);
+    texture = vao = program = crt_finish = 0;
+    if (crt_half) glDeleteTextures(1, &crt_half), crt_half = 0;
+    if (crt_half_fbo) glDeleteFramebuffers(1, &crt_half_fbo), crt_half_fbo = 0;
+    crt_half_width = crt_half_height = 0;
     hqx_free(hqx_flat);
     for (Layer& l : layers) {
         hqx_free(l.hqx);
@@ -814,7 +975,12 @@ void Display::shutdown()
     if (clean_flat) glDeleteTextures(1, &clean_flat), clean_flat = 0;
     if (clean_flat_fbo) glDeleteFramebuffers(1, &clean_flat_fbo), clean_flat_fbo = 0;
     clean_flat_width = clean_flat_height = 0;
-    for (GLuint* p : {&hqx_pass1, &hqx_pass1_layer, &hqx_pass2, &composite, &layer_merge, &clean_edge})
+    for (CleanCodes& c : clean_codes) {
+        if (c.texture) glDeleteTextures(1, &c.texture);
+        if (c.fbo) glDeleteFramebuffers(1, &c.fbo);
+        c = CleanCodes();
+    }
+    for (GLuint* p : {&hqx_pass1, &hqx_pass1_layer, &hqx_pass2, &composite, &layer_merge, &clean_edge, &clean_edge_draw})
         if (*p) glDeleteProgram(*p), *p = 0;
     hqx_ready = false;
 }
@@ -832,11 +998,11 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
     if (width != tex_width || height != tex_height) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, kPixelFormat, GL_UNSIGNED_BYTE, pixels);
         tex_width = width;
         tex_height = height;
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, kPixelFormat, GL_UNSIGNED_BYTE, pixels);
     }
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
@@ -858,7 +1024,7 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
         clean_flat_height = use_clean ? height * clean_scale : 0;
     }
     if (use_clean)
-        clean_edge_run(texture, width, height, clean_scale, clean_flat_fbo, true);
+        clean_edge_run(texture, width, height, clean_scale, clean_flat_fbo, true, clean_codes[kLayers]);
     glViewport(0, 0, out_w, out_h);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -867,6 +1033,28 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     const float scale = std::min((float)out_w / logical_width, (float)out_h / height);
     const int vw = (int)(logical_width * scale + 0.5f), vh = (int)(height * scale + 0.5f);
     glViewport((out_w - vw) / 2, (out_h - vh) / 2, vw, vh);
+
+    // On a phone the CRT shader's beams cost too much at every screen pixel: they are drawn at
+    // half size and enlarged, with the mask (which costs little) added at full size.
+    bool half = false;
+#ifdef __ANDROID__
+    if (crt.enabled && crt_finish) {
+        const int hw = (vw + 1) / 2, hh = (vh + 1) / 2;
+        half = true;
+        if (crt_half_width != hw || crt_half_height != hh) {
+            if (!crt_half) {
+                crt_half = new_texture(GL_LINEAR);
+                glGenFramebuffers(1, &crt_half_fbo);
+            }
+            half = render_target(crt_half_fbo, crt_half, hw, hh);
+            crt_half_width = half ? hw : 0;
+            crt_half_height = half ? hh : 0;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, half ? crt_half_fbo : 0);
+        if (half)
+            glViewport(0, 0, hw, hh);
+    }
+#endif
 
     glUseProgram(program);
     auto loc = [this](const char* name) { return glGetUniformLocation(program, name); };
@@ -887,15 +1075,29 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     glUniform1f(loc("scanlines"), std::clamp(scanlines, 0, 100) / 100.0f);
     glUniform1f(loc("hard_scan"), crt.scanline_sharpness);
     glUniform1f(loc("hard_pix"), crt.pixel_sharpness);
-    glUniform1i(loc("mask_type"), crt.mask_type);
+    glUniform1i(loc("mask_type"), half ? 0 : crt.mask_type);
     glUniform1f(loc("mask_dark"), crt.mask_dark);
     glUniform1f(loc("mask_light"), crt.mask_light);
     glUniform1f(loc("mask_size"), (float)(crt.mask_size < 1 ? 1 : crt.mask_size));
     glUniform2f(loc("warp"), crt.curvature_x, crt.curvature_y);
     glUniform1f(loc("glow"), crt.glow);
-    glUniform1f(loc("brightness"), crt.brightness);
+    glUniform1f(loc("brightness"), half ? 1.0f : crt.brightness);
     glBindVertexArray(vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (half) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport((out_w - vw) / 2, (out_h - vh) / 2, vw, vh);
+        glUseProgram(crt_finish);
+        auto finish_loc = [this](const char* name) { return glGetUniformLocation(crt_finish, name); };
+        glBindTexture(GL_TEXTURE_2D, crt_half);
+        glUniform1i(finish_loc("image"), 0);
+        glUniform1i(finish_loc("mask_type"), crt.mask_type);
+        glUniform1f(finish_loc("mask_dark"), crt.mask_dark);
+        glUniform1f(finish_loc("mask_light"), crt.mask_light);
+        glUniform1f(finish_loc("mask_size"), (float)(crt.mask_size < 1 ? 1 : crt.mask_size));
+        glUniform1f(finish_loc("brightness"), crt.brightness);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
     glBindVertexArray(0);
     glUseProgram(0);
     glViewport(0, 0, out_w, out_h);
@@ -906,23 +1108,52 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     const bool clean = hqx == kCleanEdge;
     if (clean ? !clean_edge : (!hqx_ready || hqx < 2 || hqx > 4))
         return false;
-    const int scale = clean ? clean_edge_scale(f.width - 2 * f.margin, f.height) : hqx;
+    int scale = clean ? clean_edge_scale(f.width - 2 * f.margin, f.height) : hqx;
+#ifdef __ANDROID__
+    // A phone's GPU can't draw seven layers through cleanEdge at its full scale (5 on a
+    // 1080-line screen) 60 times a second; at 4, as hq4x, it can, and the final pass enlarges
+    // the picture the rest of the way.
+    if (clean)
+        scale = std::min(scale, 4);
+#endif
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     for (int i = 0; i < kLayers; i++) {
         Layer& l = layers[i];
+        // Where the layer has pixels: an empty layer (often several: high sprites, plane B
+        // high...) needs no upscaling, only a clear picture, once, and cleanEdge works only
+        // around a layer's pixels (as far as its slices reach, two texels) when they don't
+        // fill it (sprites, a strip of ground).
+        int area[4] = {f.width, f.height, 0, 0};    // left, top, right, bottom (exclusive)
+        for (int y = 0; y < f.height; y++) {
+            const uint32_t* row = f.layers[i] + (size_t)y * f.width;
+            int x0 = 0, x1 = f.width;
+            while (x0 < x1 && row[x0] == 0)
+                x0++;
+            if (x0 == x1)
+                continue;
+            while (row[x1 - 1] == 0)
+                x1--;
+            area[0] = std::min(area[0], x0), area[2] = std::max(area[2], x1);
+            area[1] = std::min(area[1], y), area[3] = y + 1;
+        }
+        const bool empty = area[2] == 0;
+        area[0] = std::max(area[0] - 2, 0), area[1] = std::max(area[1] - 2, 0);
+        area[2] = std::min(area[2] + 2, f.width), area[3] = std::min(area[3] + 2, f.height);
+        if (empty && l.cleared && l.merged_width == f.width * scale && l.merged_height == f.height * scale)
+            continue;
         if (!l.source)
-            l.source = new_texture(GL_NEAREST);
+            l.source = pixel_texture(GL_NEAREST);
         glBindTexture(GL_TEXTURE_2D, l.source);
         if (l.width != f.width || l.height != f.height) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.width, f.height, 0, GL_BGRA, GL_UNSIGNED_BYTE, f.layers[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.width, f.height, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.layers[i]);
             l.width = f.width;
             l.height = f.height;
         } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f.width, f.height, GL_BGRA, GL_UNSIGNED_BYTE, f.layers[i]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f.width, f.height, kPixelFormat, GL_UNSIGNED_BYTE, f.layers[i]);
         }
-        if (!clean) {
+        if (!clean && !empty) {
             if (!hqx_resize(l.hqx, f.width, f.height, hqx, true))
                 return false;
             hqx_run(l.hqx, hqx_pass1_layer, l.source, true);
@@ -942,9 +1173,18 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
             l.merged_width = f.width * scale;
             l.merged_height = f.height * scale;
         }
+        l.cleared = empty;
+        if (empty) {
+            glBindFramebuffer(GL_FRAMEBUFFER, l.merged_fbo);
+            glViewport(0, 0, l.merged_width, l.merged_height);
+            glClearColor(0, 0, 0, 0);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            continue;
+        }
         if (clean) {
             // cleanEdge keeps edges hard, so its picture is already the merged one.
-            clean_edge_run(l.source, f.width, f.height, scale, l.merged_fbo, false);
+            clean_edge_run(l.source, f.width, f.height, scale, l.merged_fbo, false, clean_codes[i], area);
             continue;
         }
         glBindFramebuffer(GL_FRAMEBUFFER, l.merged_fbo);
@@ -968,12 +1208,12 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     }
     if (!line_shifts) {
         line_shifts = new_texture(GL_NEAREST);
-        line_backdrop = new_texture(GL_NEAREST);
+        line_backdrop = pixel_texture(GL_NEAREST);
     }
     glBindTexture(GL_TEXTURE_2D, line_shifts);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, f.height, 1, 0, GL_RGBA, GL_FLOAT, f.shifts);
     glBindTexture(GL_TEXTURE_2D, line_backdrop);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.height, 1, 0, GL_BGRA, GL_UNSIGNED_BYTE, f.backdrop);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.height, 1, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.backdrop);
 
     int out_w = 0, out_h = 0;
     SDL_GetWindowSizeInPixels(window, &out_w, &out_h);

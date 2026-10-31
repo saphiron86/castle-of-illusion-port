@@ -12,24 +12,44 @@ if(NOT EXISTS ${THIRD_PARTY}/SDL/CMakeLists.txt)
     message(FATAL_ERROR "third_party/ is missing: run python tools/fetch_deps.py first")
 endif()
 
-# --- SDL3, built as a static library ---------------------------------------
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC ON CACHE BOOL "" FORCE)
+# --- SDL3: a static library, or on Android the shared libSDL3.so -------------
+# On Android the app is SDL's Java activity (android/), which loads libSDL3.so and then the
+# port as libmain.so.
+if(ANDROID)
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_LIBRARY SDL3::SDL3-shared)
+else()
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_LIBRARY SDL3::SDL3-static)
+endif()
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${THIRD_PARTY}/SDL ${CMAKE_BINARY_DIR}/SDL EXCLUDE_FROM_ALL)
 
 # --- Musashi 68000 core ------------------------------------------------------
-# m68kmake generates the opcode handlers from m68k_in.c at build time.
+# m68kmake generates the opcode handlers from m68k_in.c at build time. Cross-compiling (the
+# Android build) it can't run what it builds, so it uses the m68kmake of the desktop build
+# (build/port), which has to be built first.
 set(MUSASHI ${THIRD_PARTY}/Musashi)
 set(MUSASHI_GEN ${CMAKE_BINARY_DIR}/musashi)
-add_executable(m68kmake ${MUSASHI}/m68kmake.c)
-target_compile_definitions(m68kmake PRIVATE _CRT_SECURE_NO_WARNINGS)
+if(CMAKE_CROSSCOMPILING)
+    find_program(M68KMAKE m68kmake NO_DEFAULT_PATH PATHS
+        ${CMAKE_CURRENT_SOURCE_DIR}/../build/port/Release ${CMAKE_CURRENT_SOURCE_DIR}/../build/port/Debug)
+    if(NOT M68KMAKE)
+        message(FATAL_ERROR "Build the desktop port first (build/port): the Android build runs its m68kmake.")
+    endif()
+else()
+    add_executable(m68kmake ${MUSASHI}/m68kmake.c)
+    target_compile_definitions(m68kmake PRIVATE _CRT_SECURE_NO_WARNINGS)
+    set(M68KMAKE m68kmake)
+endif()
 add_custom_command(
     OUTPUT ${MUSASHI_GEN}/m68kops.c ${MUSASHI_GEN}/m68kops.h
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MUSASHI_GEN}
-    COMMAND m68kmake ${MUSASHI_GEN} ${MUSASHI}/m68k_in.c
-    DEPENDS m68kmake ${MUSASHI}/m68k_in.c
+    COMMAND ${M68KMAKE} ${MUSASHI_GEN} ${MUSASHI}/m68k_in.c
+    DEPENDS ${M68KMAKE} ${MUSASHI}/m68k_in.c
     COMMENT "Generating Musashi opcode handlers")
 
 add_library(musashi STATIC
@@ -61,7 +81,10 @@ add_library(imgui STATIC
     ${IMGUI}/backends/imgui_impl_opengl3.cpp)
 target_include_directories(imgui PUBLIC ${IMGUI} ${IMGUI}/backends)
 target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_DEMO_WINDOWS)
-target_link_libraries(imgui PUBLIC SDL3::SDL3-static)
+target_link_libraries(imgui PUBLIC ${SDL_LIBRARY})
+if(ANDROID)
+    target_link_libraries(imgui PUBLIC GLESv3)    # its OpenGL backend calls ES 3 directly there
+endif()
 
 # --- hqx (libretro glsl-shaders, LGPL 2.1 or later) -------------------------
 # The two shader passes and the lookup tables are built into the program as a generated
@@ -85,7 +108,8 @@ file(WRITE ${HQX_HEADER}.new "${HQX_TEXT}")
 configure_file(${HQX_HEADER}.new ${HQX_HEADER} COPYONLY)    # rewritten only when it changes
 
 # --- The port ----------------------------------------------------------------
-add_executable(coi
+# coi.exe on the desktop; on Android, libmain.so for SDL's activity to load.
+set(PORT_SOURCES
     src/main.cpp
     src/bus.cpp
     src/cheats.cpp
@@ -100,8 +124,24 @@ add_executable(coi
     src/smooth_swing.cpp
     src/boss_rush.cpp
     src/sound.cpp
+    src/touch.cpp
     src/vdp.cpp)
-target_link_libraries(coi PRIVATE musashi ymfm z80 imgui SDL3::SDL3-static)
-set_target_properties(coi PROPERTIES WIN32_EXECUTABLE TRUE)    # no terminal window; --console shows one
+if(ANDROID)
+    add_library(coi SHARED ${PORT_SOURCES} src/android_mdplus.cpp src/android_pacing.cpp src/android_rom.cpp)
+    set_target_properties(coi PROPERTIES OUTPUT_NAME main)
+    # Swappy, the Android Games SDK's frame pacing (a Gradle dependency, through Prefab).
+    find_package(games-frame-pacing REQUIRED CONFIG)
+    target_link_libraries(coi PRIVATE log android EGL games-frame-pacing::swappy_static)
+    # The performance log (frame rates, CPU and GPU time, every 2 s to adb logcat -s COI): off
+    # in releases.
+    option(COI_TIMING_LOG "Log Android performance figures" OFF)
+    if(COI_TIMING_LOG)
+        target_compile_definitions(coi PRIVATE COI_TIMING_LOG)
+    endif()
+else()
+    add_executable(coi ${PORT_SOURCES})
+    set_target_properties(coi PROPERTIES WIN32_EXECUTABLE TRUE)    # no terminal window; --console shows one
+endif()
+target_link_libraries(coi PRIVATE musashi ymfm z80 imgui ${SDL_LIBRARY})
 target_compile_definitions(coi PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_include_directories(coi PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)

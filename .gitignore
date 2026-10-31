@@ -20,3 +20,14 @@ third_party/
 tools/bin/
 __pycache__/
 *.lst
+
+# Android build output and machine-specific settings
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+
+# The release signing key's location and passwords (the key itself lives outside the repo)
+android/keystore.properties
+*.jks

@@ -121,6 +121,12 @@ private:
     int entry_pixel(uint16_t entry, int x, int y, bool& priority) const;
     int strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority) const;
     int clean_black_edge(int a, int base, int x, int y, int width_cells, int height_cells) const;
+    // render_line's planes and compositing, without per-column vertical scroll.
+    void render_pixels(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers, uint32_t backdrop,
+                       const uint8_t* sprite_pixel, const bool* sprite_priority, const bool* sprite_on_b, int sub_a,
+                       int sub_b, int hs_a, int hs_b, bool window_line, int window_hp, bool window_right, int window_w,
+                       int native_width, int window_period, int base_a, int base_b, int base_window, int plane_w,
+                       int plane_h);
 
     Bus& bus;
     uint32_t address = 0;

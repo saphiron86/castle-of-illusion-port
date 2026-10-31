@@ -1,10 +1,12 @@
 #include "menu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 #include "stages.h"
+#include "touch.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -14,6 +16,7 @@
 namespace {
 
 bool g_open = false;
+SDL_Window* g_menu_window = nullptr;
 bool g_focus_bar = false;                           // put the nav cursor on the first menu next frame
 int g_last_menu = 0;                                // index of the top-level menu last opened
 bool g_crt_window = false;                          // the CRT settings window is open
@@ -93,6 +96,7 @@ bool crt_settings_window(CrtSettings& c)
 
 void menu_init(SDL_Window* window, SDL_GLContext gl_context)
 {
+    g_menu_window = window;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -107,7 +111,11 @@ void menu_init(SDL_Window* window, SDL_GLContext gl_context)
     style.FontScaleDpi = scale > 0 ? scale : 1.0f;
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
+#ifdef __ANDROID__
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+#else
     ImGui_ImplOpenGL3_Init("#version 330 core");
+#endif
     ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode_AutoAll);   // any connected pad
 }
 
@@ -142,7 +150,7 @@ bool menu_event(const SDL_Event& event)
     case SDL_EVENT_KEY_UP:
         // The port's own hotkeys always reach it: once a menu has been opened and closed, the
         // bar keeps the keyboard, and F1 couldn't close the menu until a click elsewhere.
-        if (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3
+        if (event.key.key == SDLK_F1 || event.key.key == SDLK_AC_BACK || event.key.key == SDLK_F2 || event.key.key == SDLK_F3
             || event.key.key == SDLK_F4 || event.key.key == SDLK_F11 || event.key.key == SDLK_F12
             || (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)))
             return false;
@@ -237,8 +245,10 @@ MenuChoice menu_frame(const MenuState& state)
                 choice.action = MenuAction::ToggleWidescreen;
             if (!state.widescreen_available)
                 ImGui::SetItemTooltip("The widescreen patches do not match this ROM.");
+#ifndef __ANDROID__                                 // always fullscreen on Android
             if (ImGui::MenuItem("Fullscreen", "F11", state.fullscreen))
                 choice.action = MenuAction::ToggleFullscreen;
+#endif
             if (ImGui::MenuItem("V-Sync", nullptr, *state.vsync)) {
                 *state.vsync = !*state.vsync;
                 choice.save_settings = true;
@@ -289,9 +299,16 @@ MenuChoice menu_frame(const MenuState& state)
                 if (state.mdplus_pack)
                     ImGui::SetItemTooltip("Plays the music from the MD+ pack in mdplus/:\n%s\n"
                                           "Switching restarts the game.", state.mdplus_pack);
+#ifdef __ANDROID__
+                if (ImGui::MenuItem("Import MD+ Pack..."))
+                    choice.action = MenuAction::ImportMdPlus;
+                ImGui::SetItemTooltip("Choose the folder that holds an MD+ pack (its .cue, .md and WAV files):\n"
+                                      "the app keeps a copy and plays its soundtrack instead of the game's music.");
+#else
                 else
                     ImGui::SetItemTooltip("Put an MD+ pack (its .cue, .md and WAV files) in a folder named mdplus\n"
                                           "beside rom/ to play its soundtrack instead of the game's music.");
+#endif
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Graphics")) {
@@ -300,10 +317,18 @@ MenuChoice menu_frame(const MenuState& state)
                 ImGui::SetItemTooltip(state.smooth_swing_available
                     ? "Vines and ropes swing at 60 frames a second instead of 10."
                     : "The swing patches do not match this ROM.");
-                if (ImGui::MenuItem("Smooth Scrolling", nullptr, state.smooth_scroll))
+#ifdef __ANDROID__
+                // Off with cleanEdge on a phone (main.cpp): shown unticked and greyed out.
+                const bool scroll_blocked = *state.hqx == kCleanEdge && !state.crt->enabled;
+#else
+                const bool scroll_blocked = false;
+#endif
+                if (ImGui::MenuItem("Smooth Scrolling", nullptr, state.smooth_scroll && !scroll_blocked, !scroll_blocked))
                     choice.action = MenuAction::ToggleSmoothScroll;
-                ImGui::SetItemTooltip("Scrolling moves in even steps, using fractions of a pixel, instead of the\n"
-                                      "game's uneven whole-pixel steps.");
+                ImGui::SetItemTooltip(scroll_blocked
+                    ? "Not available with cleanEdge on a phone: it would be too much for the GPU."
+                    : "Scrolling moves in even steps, using fractions of a pixel, instead of the\n"
+                      "game's uneven whole-pixel steps.");
                 if (ImGui::MenuItem("Clean Rock Edges", nullptr, *state.clean_rock_edges)) {
                     *state.clean_rock_edges = !*state.clean_rock_edges;
                     choice.save_settings = true;
@@ -324,7 +349,11 @@ MenuChoice menu_frame(const MenuState& state)
                                       "lines lose parts of sprites. With this on, every sprite is drawn.");
                 ImGui::Separator();
                 if (ImGui::BeginMenu("Upscaler", !state.crt->enabled)) {
+#ifdef __ANDROID__
+                    for (int scale : {1, 2}) {              // a phone's GPU can't keep up with hq3x or hq4x
+#else
                     for (int scale : {1, 2, 3, 4}) {
+#endif
                         char label[8];
                         std::snprintf(label, sizeof(label), scale > 1 ? "HQ%dx" : "Off", scale);
                         if (ImGui::MenuItem(label, nullptr, *state.hqx == scale)) {
@@ -351,8 +380,12 @@ MenuChoice menu_frame(const MenuState& state)
                     ImGui::EndDisabled();
                     ImGui::EndMenu();
                 }
-                ImGui::SetItemTooltip(state.crt->enabled ? "Turn the CRT shader off to use hqx."
-                                                         : "hqx: smooths the pixel art's edges and diagonals at 2, 3 or 4 times the size.");
+#ifdef __ANDROID__
+                const char* upscaler_tip = "hqx: smooths the pixel art's edges and diagonals at twice the size.";
+#else
+                const char* upscaler_tip = "hqx: smooths the pixel art's edges and diagonals at 2, 3 or 4 times the size.";
+#endif
+                ImGui::SetItemTooltip("%s", state.crt->enabled ? "Turn the CRT shader off to use hqx." : upscaler_tip);
                 if (ImGui::BeginMenu("Scanlines", !state.crt->enabled)) {
                     for (int percent : {0, 25, 50, 75, 100}) {
                         char label[8];
@@ -430,15 +463,35 @@ MenuChoice menu_frame(const MenuState& state)
                 }
                 ImGui::EndMenu();
             }
+#ifndef __ANDROID__                                 // the app's storage can't be opened on Android
             ImGui::Separator();
             if (ImGui::MenuItem("Open Settings Folder"))
                 choice.action = MenuAction::OpenSettingsFolder;
             ImGui::SetItemTooltip("Opens the folder that holds settings.ini.");
+#endif
             ImGui::EndMenu();
         }
-        const char* hint = "F1 to close";
-        ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(hint).x - ImGui::GetStyle().ItemSpacing.x * 2);
-        ImGui::TextDisabled("%s", hint);
+        // At the right, inside the safe area (clear of a phone's camera cutout): with the touch
+        // controls showing, an X to tap (Back is an edge swipe away); otherwise how to close.
+        float right = ImGui::GetWindowWidth();
+        SDL_Rect safe;
+        if (SDL_GetWindowSafeArea(g_menu_window, &safe) && safe.w > 0)
+            right = std::min(right, (float)(safe.x + safe.w));
+        const float spacing = ImGui::GetStyle().ItemSpacing.x * 2;
+        if (touch_shown()) {
+            const ImVec2 size(ImGui::GetFrameHeight() * 2.5f, ImGui::GetFrameHeight());
+            ImGui::SameLine(right - size.x - spacing);
+            if (ImGui::Button("X##close", size))
+                menu_toggle();
+        } else {
+#ifdef __ANDROID__
+            const char* hint = "Back to close";
+#else
+            const char* hint = "F1 to close";
+#endif
+            ImGui::SameLine(right - ImGui::CalcTextSize(hint).x - spacing);
+            ImGui::TextDisabled("%s", hint);
+        }
         ImGui::EndMainMenuBar();
     }
     if (g_open && g_crt_window && crt_settings_window(*state.crt))
@@ -459,6 +512,23 @@ MenuChoice menu_frame(const MenuState& state)
         }
         ImGui::End();
     }
+    if (state.busy) {
+        // Centred over the game, with a progress bar when there is progress to show.
+        const ImGuiViewport* view = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x / 2, view->Pos.y + view->Size.y / 2),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                                     | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
+                                     | ImGuiWindowFlags_NoSavedSettings;
+        if (ImGui::Begin("##busy", nullptr, flags)) {
+            ImGui::TextUnformatted(state.busy);
+            if (state.busy_progress >= 0)
+                ImGui::ProgressBar(state.busy_progress, ImVec2(ImGui::GetFontSize() * 16, 0));
+        }
+        ImGui::End();
+    }
+    if (!g_open)
+        touch_draw();
     ImGui::Render();
     return choice;
 }
