@@ -2,7 +2,8 @@
 //
 // Sized from the screen's height so they sit under the thumbs on any phone: the D-pad at the
 // bottom left, A, B and C rising to the right like the Genesis pad's row, Start at the bottom
-// in the middle and the menu button in the top right corner. A finger that lands on the D-pad
+// in the middle and the menu button in the top right corner. During the game's story scenes
+// a fast forward button (>>) shows under A, B and C, shaped like Start. A finger that lands on the D-pad
 // steers it wherever it slides; any other finger presses whichever button it is over, so a
 // thumb can roll from one button to the next. They show on Android while no controller is in
 // use: a controller's buttons hide them, a touch brings them back.
@@ -27,6 +28,7 @@ struct Finger {
 SDL_Window* g_window = nullptr;
 std::vector<Finger> g_fingers;
 bool g_menu_tapped = false;
+bool g_fast_forward_shown = false;
 #ifdef __ANDROID__
 bool g_shown = true;
 #else
@@ -38,6 +40,7 @@ struct Layout {
     ImVec2 dpad; float dpad_radius;
     ImVec2 face[3]; float face_radius;              // A, B, C
     ImVec2 start, start_half;                       // centre and half size
+    ImVec2 forward, forward_half;                   // fast forward: centre and half size
     ImVec2 menu; float menu_radius;
 };
 
@@ -54,6 +57,10 @@ Layout layout()
     l.face[2] = ImVec2(w - 12 * u, h - 33 * u);
     l.start = ImVec2(w / 2, h - 6 * u);
     l.start_half = ImVec2(8 * u, 3 * u);
+    // Fast forward: Start's size, under the row of A, B and C (below B and C, right of A),
+    // its touch area (as large as Start's) clear of theirs.
+    l.forward = ImVec2(w - 22 * u, h - 7 * u);
+    l.forward_half = l.start_half;
     // The menu button keeps inside the safe area: phones draw into the camera's cutout, which
     // sits in a corner in landscape. There is room beside a 16:9 picture on wider screens.
     float right = w, top = 0;
@@ -98,6 +105,12 @@ uint8_t finger_buttons(const Layout& l, const Finger& f)
     if (std::fabs(f.x - l.start.x) < l.start_half.x + 2 * l.u && std::fabs(f.y - l.start.y) < l.start_half.y + 3 * l.u)
         b |= BTN_START;
     return b;
+}
+
+bool finger_on_forward(const Layout& l, const Finger& f)
+{
+    return !f.dpad && std::fabs(f.x - l.forward.x) < l.forward_half.x + 2 * l.u
+           && std::fabs(f.y - l.forward.y) < l.forward_half.y + 3 * l.u;
 }
 
 }  // namespace
@@ -181,6 +194,27 @@ void touch_release()
     g_fingers.clear();
 }
 
+void touch_show_fast_forward(bool shown)
+{
+    g_fast_forward_shown = shown;
+}
+
+bool touch_fast_forward()
+{
+    if (!g_shown || !g_fast_forward_shown)
+        return false;
+    const Layout l = layout();
+    for (const Finger& f : g_fingers)
+        if (finger_on_forward(l, f))
+            return true;
+    return false;
+}
+
+void touch_force_shown()
+{
+    g_shown = true;
+}
+
 void touch_draw()
 {
     if (!g_shown)
@@ -221,6 +255,21 @@ void touch_draw()
     draw->AddRectFilled(s0, s1, held & BTN_START ? pressed : fill, l.start_half.y);
     draw->AddRect(s0, s1, line, l.start_half.y, 0, thick);
     label(l.start, "START", 3.5f * l.u);
+
+    // Fast forward: Start's shape with a >> of two triangles, during the story scenes only.
+    if (g_fast_forward_shown) {
+        const bool forward_held = touch_fast_forward();
+        const ImVec2 f0(l.forward.x - l.forward_half.x, l.forward.y - l.forward_half.y);
+        const ImVec2 f1(l.forward.x + l.forward_half.x, l.forward.y + l.forward_half.y);
+        draw->AddRectFilled(f0, f1, forward_held ? pressed : fill, l.forward_half.y);
+        draw->AddRect(f0, f1, line, l.forward_half.y, 0, thick);
+        const float half = 1.6f * l.u, width = 2.4f * l.u;
+        for (int i = 0; i < 2; i++) {
+            const float left = l.forward.x - width + i * width;
+            draw->AddTriangleFilled(ImVec2(left, l.forward.y - half), ImVec2(left + width, l.forward.y),
+                                    ImVec2(left, l.forward.y + half), text);
+        }
+    }
 
     // Menu: three bars in a circle.
     draw->AddCircleFilled(l.menu, l.menu_radius, fill, 24);

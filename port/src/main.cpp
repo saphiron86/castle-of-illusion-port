@@ -26,7 +26,8 @@
 // Menu settings are remembered between runs (settings.cpp); the options above apply to
 // this run only. Headless runs ignore the saved settings.
 // While running: F1 opens the menu, F11 or Alt+Enter toggles fullscreen, F12 the CRT shader,
-// Ctrl+R resets, F2/F3/F4 pick the Quick Settings (Enhanced, Vanilla, Custom).
+// Ctrl+R resets, F2/F3/F4 pick the Quick Settings (Enhanced, Vanilla, Custom); holding
+// Backspace (or a controller's Y) fast-forwards the story scenes 4x (kFastForward).
 // Testing (headless): --poke FRAME:ADDR=VALUE, --poke-file FILE, --peek ADDR, --watch ADDR, --ram FILE,
 //   --vram FILE, --cram FILE (CRAM, registers, VSRAM), --wav FILE, --log-state, --log-ram ADDR, --trace-vdp, --no-sprite-masking,
 //   --capture FRAME FILE (windowed: save the window's picture after FRAME frames, then quit)
@@ -35,7 +36,11 @@
 //   VRAM and CRAM behind each sprite set the run shows (see capture_sprites)
 //   --switch-widescreen FRAME, --switch-smooth-swing FRAME, --reset FRAME, --go-to-stage FRAME:STAGE (the menu's
 //   actions, at the start of a frame)
-//   --frames N   run N frames without a window, then exit (with --dump: save the last frame)
+//   --frames N   run N frames without a window, then exit (with --dump: save the last frame);
+//                strictly N pictures, which are more game frames with --fast-forward
+//   --fast-forward FIRST-LAST  hold fast forward over pictures FIRST-LAST (also windowed)
+//   --state-hash FILE  (headless) write each game frame's number, picture and machine hash
+//   --show-touch show the touch controls on a desktop too (windowed)
 //   --interp-back X  with --dump: draw the last frame as interpolation would X frames earlier (0-1)
 //   --refresh HZ treat the display as running at HZ (windowed; for testing the pacing)
 //   --press      hold a button (up/down/left/right/a/b/c/start) for a range of frames (also windowed)
@@ -103,12 +108,75 @@ constexpr int kWideWidth = kWidth + 2 * kWideMargin;
 //   $2C  the ending's setup, under a frame in the game; in a Boss Rush the results load
 //        here for about 50 frames with the display off, showing Mizrabel's white across
 //        the whole width rather than between black bars.
-// Identified by play with --show-state: $06 is the intro after boot and $2A the scene
-// before the hallway; both stay pillarboxed.
-bool is_wide_state(uint16_t state, uint16_t level)
+//   $16  the scenes after the ending (the flight past the castle at night, the cliff,
+//        the forest credits): pictures drawn across the planes' full 512 pixels,
+//        scrolled through the line scroll table with the cameras at 0, so the strips
+//        show more of the same picture. "The End" (on black, framed for 320 pixels)
+//        stays pillarboxed while its objects are loaded (after_ending_scene); the switches
+//        fall on black frames. The theatre at the end repeats its own columns into the
+//        strips (TheatreFill).
+//   $2A  the story before the hallway (Mizrabel takes Minnie): its wall, trees and ground
+//        repeat into the strips (StoryFill), the soldiers staying behind the right one.
+// Identified by play with --show-state: $06 is the intro after boot (pillarboxed: framed
+// pictures on black).
+enum class AfterEnding { Other, TheEnd, Theatre };
+
+AfterEnding after_ending_scene(const uint8_t* ram)
+{
+    // Objects (ID in the word at +0 of each $40-byte slot from $FFD000), seen with
+    // --log-ram over the whole state: "The End" is drawn by $80 and then $81, the theatre
+    // by $B8 and $BB (its setup) and $BC and $BD (to the end of the state). Nearby IDs
+    // belong to the other scenes ($B3, $B6 and $B7 are the night flight's fireworks).
+    for (uint32_t slot = 0xD000; slot < 0xE000; slot += 0x40) {
+        const int id = ram[slot] << 8 | ram[slot + 1];
+        if (id == 0x80 || id == 0x81)
+            return AfterEnding::TheEnd;
+        if (id == 0xB8 || id == 0xBB || id == 0xBC || id == 0xBD)
+            return AfterEnding::Theatre;
+    }
+    return AfterEnding::Other;
+}
+
+bool is_wide_state(uint16_t state, uint16_t level, const uint8_t* ram)
 {
     (void)level;
-    return state == 0x0E || state == 0x22 || state == 0x2C || state == 0x2E;
+    if (state == 0x16)
+        return after_ending_scene(ram) != AfterEnding::TheEnd;
+    return state == 0x0E || state == 0x22 || state == 0x2A || state == 0x2C || state == 0x2E;
+}
+
+// Fast forward (Backspace, a controller's Y, or the touch controls' >> button, held): while
+// one of the game's story scenes plays, each picture runs kFastForward game frames instead
+// of one. The game's own frames are unchanged, just shown faster; its sound is muted while
+// fast-forwarding (four frames of sound in one frame's time would only play as a squeal or
+// pile up), and the MD+ music is silenced with it.
+//   $2A  the story before the hallway (Mizrabel takes Minnie), after Start on the title
+//   $22  the scenes between worlds: the hallway walks, the castle exterior, the Practice ending
+//   $2C  the ending's setup, and $2E the ending in the final arena (after Mizrabel's last
+//        hit); in a Boss Rush these two show the results screen instead, which isn't a scene
+//   $16  the scenes after the ending: the night flight, the cliff, the forest credits,
+//        "The End" and the theatre
+//   $06  the story pictures after boot ("Welcome to Vera City..."), up to the title: the
+//        state runs on into the title screen, whose logo comes in when its step counter
+//        $FFF40C reaches $1E (Start there opens the title menu from $1F on)
+// Not the title screen and its menu, the options, the gem and score screens, level play or
+// boss fights.
+constexpr int kFastForward = 4;
+
+bool is_cutscene_state(const uint8_t* ram)
+{
+    const int state = ram[0xF300] << 8 | ram[0xF301];
+    const bool boss_rush = ram[0xFF1E] != 0;        // RushActive (boss_rush.asm)
+    switch (state) {
+    case 0x06:
+        return ram[0xF40C] < 0x1E;
+    case 0x2A: case 0x22: case 0x16:
+        return true;
+    case 0x2C: case 0x2E:
+        return !boss_rush;
+    default:
+        return false;
+    }
 }
 
 bool g_widescreen = true;
@@ -297,7 +365,7 @@ std::string find_mdplus_pack()
 
 // Per-scene fills for the widened strips, where a scene's plane holds the wrong thing past
 // the original view (see docs/widescreen.md). Chosen once per frame in run_frame.
-enum class StripRule { None, TowerFill, ArenaWalls };
+enum class StripRule { None, TowerFill, ArenaWalls, TheatreFill, StoryFill };
 StripRule g_strip_rule = StripRule::None;
 
 // Floor block to repeat as walls in an arena's strips, in plane A pixels, and the tiles it
@@ -400,9 +468,83 @@ bool extend_plane_a(int view_x, int line, int& plane_x, int& plane_y)
         plane_x = g_wall.x + wrap(plane_x - g_wall.x, g_wall.w);
         plane_y = g_wall.y + wrap(plane_y - g_wall.y, g_wall.h);
         return true;
+    case StripRule::TheatreFill:
+        // The theatre after the credits ($16; planes 128 cells wide, no scrolling but plane
+        // B's vertical one, which lowers the curtain): plane A holds the stage's front edge,
+        // the footlights and the seats in rows 16-31, columns 0-39, and is empty past them.
+        // The seats repeat every 4 columns and the footlights every 8 (columns 2, 10, 28
+        // and 36, as if the middle ones were missing), so the strips take the columns 8 in
+        // from each edge: a footlight is cut by each screen edge. Rows 0-15 (the cinema
+        // screen) are transparent outside its frame and need nothing.
+        if (wrap(plane_y, 256) < 128)
+            return false;
+        plane_x += view_x < 0 ? 64 : -64;
+        return true;
+    case StripRule::StoryFill: {
+        // The story before the hallway ($2A; planes 128 cells wide, no scrolling): plane A
+        // holds the trees, the canopy and the ground in rows 0-17 of columns 0-39 (all high
+        // priority, transparent between the trees), then the text box. The trees repeat
+        // every 26 columns (at 2-6 and 28-32), so the left strip takes the columns 26 in
+        // (the top two canopy rows, which do not, 18 in), joining column 0 without a seam.
+        // On the right the picture ends with pieces of its own (columns 34-39: the
+        // canopy's edge, the ground before the door), so each row takes the columns that
+        // best follow them. Below row 17 (the text box) the strips stay empty.
+        const int row = wrap(plane_y, 256) / 8;
+        if (row >= 18) {
+            plane_x = wrap(plane_x, 8);             // column 0: transparent
+            return true;
+        }
+        if (view_x < 0) {
+            plane_x += (row < 2 ? 18 : 26) * 8;
+            return true;
+        }
+        static const int8_t kRight[18] = {16, 34, 28, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 22, 22, 22, 22, 22};
+        plane_x += (kRight[row] - 40) * 8;
+        return true;
+    }
     default:
         return false;
     }
+}
+
+// Plane B's strips (Vdp::extend_plane_b), for the rules that need them.
+bool extend_plane_b(int view_x, int line, int& plane_x, int& plane_y)
+{
+    (void)line;
+    if (g_strip_rule == StripRule::StoryFill) {
+        // The story's brick wall (plane B rows 0-16, columns 0-39; the arch at 28-39): the
+        // bricks repeat every 2 columns, so the strips take columns 10 in (left) and 30 in
+        // (right). Row 2 is offset by a column above the arch, as the game draws it, and
+        // continues so. The right strip's bricks take the high priority (see main), so the
+        // toy soldiers, who start past the right edge, stay hidden until they reach the
+        // arch's pillar (which hides them in the game) and come out of the door.
+        if (view_x < 0) {
+            plane_x += 80;
+            return true;
+        }
+        plane_x -= wrap(plane_y, 256) / 8 == 2 ? 232 : 240;
+        return true;
+    }
+    if (g_strip_rule != StripRule::TheatreFill)
+        return false;
+    // The theatre's curtain: plane B rows 0-15, columns 0-39, lowered by plane B's vertical
+    // scroll (112 to 0). Past column 39 the plane holds other graphics. Every row repeats
+    // every 12 columns (96 pixels), so the strips take the columns 12 in from each edge,
+    // except the fringe (rows 3 and 4), which ends with an end piece of its own at the
+    // right (columns 35-39). There the fringe keeps repeating instead, over columns 35-39
+    // and on to the edge of the widened view, which cuts it as the left edge does. (Moving
+    // the end piece out to the edge put it under the top of a different swag.) Rows 16-31
+    // are blank in columns 0-39.
+    const int row = wrap(plane_y, 256) / 8;
+    if (view_x < 0) {
+        plane_x += 96;
+        return true;
+    }
+    if (view_x >= ((row == 3 || row == 4) ? 280 : 320)) {
+        plane_x -= 96;
+        return true;
+    }
+    return false;
 }
 
 // Draws one line as layers (g_layered), with the shifts that move them when drawn.
@@ -485,6 +627,9 @@ void render_interpolated(uint32_t* pixels, double back)
     std::memcpy(v.vram, now.vram.data(), sizeof(v.vram));
     v.extend_plane_a = g_vdp.extend_plane_a;
     v.extend_plane_a_inside = g_vdp.extend_plane_a_inside;
+    v.extend_plane_b = g_vdp.extend_plane_b;
+    v.extend_plane_b_inside = g_vdp.extend_plane_b_inside;
+    v.strip_b_priority_right = g_vdp.strip_b_priority_right;
     v.strip_fill_in_front = g_vdp.strip_fill_in_front;
     v.strip_fill_in_front_left = g_vdp.strip_fill_in_front_left;
     v.strip_cells = g_vdp.strip_cells;
@@ -740,8 +885,91 @@ GpuTimer g_gpu_timer;
 #define TIMED(total, work) work
 #endif
 
+// Refilling the planes after widescreen is switched on during level play. The game streams
+// one block column (16 pixels) whenever a camera's X crosses a multiple of 16, keeping each
+// plane loaded with the 32 block columns from X/16 - 7 to X/16 + 24 (block b in plane
+// columns 2(b mod 32) and the one after). The switch raises the camera limits, and the next
+// UpdateCamera moves the camera onto them (0 to 40 at a stage's start) in one step, which
+// streams at most one column: blocks of the new range were never loaded, and showed stale
+// tiles once the view reached them. So once the camera has moved, the blocks of the new
+// range that were not in the old one are written as the game's own streaming writes them
+// (StreamColumn, $00F9B4: map bytes from +$8, 8-byte blocks from +$10, 32 rows from
+// (Y - 112)/16), straight into VRAM.
+struct PlaneRefill {
+    bool pending = false;
+    int16_t old_x[2] = {};                          // CameraA and CameraB X at the switch
+};
+PlaneRefill g_plane_refill;
+
+void write_block_column(uint32_t camera, uint32_t plane, int block)
+{
+    auto word = [](uint32_t a) { return (int16_t)(g_bus.ram[a] << 8 | g_bus.ram[a + 1]); };
+    auto ptr = [](uint32_t a) {
+        return (uint32_t)(g_bus.ram[a] << 24 | g_bus.ram[a + 1] << 16 | g_bus.ram[a + 2] << 8 | g_bus.ram[a + 3]);
+    };
+    const uint32_t map = ptr(camera + 0x08), table = ptr(camera + 0x10);
+    const int width = (uint16_t)word(camera + 0x0E);
+    const int row = (int16_t)(word(camera) - 0x70) >> 4;
+    // a1 = map + block + row * width, the product added as a word (adda.w), as the game does.
+    uint32_t a1 = map + (int16_t)block + (int16_t)(uint16_t)((uint16_t)row * width);
+    // Plane A upside down ($FFFF9801 set): rows read from 25 below upwards, the block's
+    // halves swapped and flipped vertically ($00FA52).
+    const bool flipped = camera == 0xFA80 && g_bus.ram[0x9801];
+    if (flipped)
+        a1 += (uint32_t)(width * 0x19);
+    const int column = (block & 0x1F) * 2;
+    for (int i = 0; i < 32; i++) {
+        const int slot = (row + i) & 0x1F;
+        const uint32_t b = table + g_bus.read8(a1) * 8;
+        uint16_t w[4];
+        for (int k = 0; k < 4; k++)
+            w[k] = g_bus.read16(b + k * 2);
+        // Left column top and bottom, right column top and bottom; upside down the top and
+        // bottom swap and each cell is flipped.
+        uint16_t cells[4] = {w[0], w[2], w[1], w[3]};
+        if (flipped) {
+            const uint16_t f[4] = {w[2], w[0], w[3], w[1]};
+            for (int k = 0; k < 4; k++)
+                cells[k] = f[k] ^ 0x1000;
+        }
+        for (int k = 0; k < 4; k++) {
+            const uint32_t a = plane + ((slot * 2 + (k & 1)) * 64 + column + (k >> 1)) * 2;
+            g_vdp.vram[a] = (uint8_t)(cells[k] >> 8);
+            g_vdp.vram[a + 1] = (uint8_t)cells[k];
+        }
+        a1 += flipped ? (uint32_t)-width : (uint32_t)width;
+    }
+}
+
+void refill_planes_if_due()
+{
+    if (!g_plane_refill.pending)
+        return;
+    auto word = [](int a) { return (int16_t)(g_bus.ram[a] << 8 | g_bus.ram[a + 1]); };
+    if ((g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) != 0x0E || !g_widescreen) {
+        g_plane_refill.pending = false;             // the level has gone (the next one fills itself) or narrow again
+        return;
+    }
+    // Wait until CameraA is inside its new limits: UpdateCamera does not run in every frame
+    // (at a stage's start it moves the camera about 18 frames after the level appears).
+    const int x = word(0xFA84);
+    if (x < word(0xFAA2) || x > word(0xFAA6))
+        return;
+    g_plane_refill.pending = false;
+    for (int i = 0; i < 2; i++) {
+        const uint32_t camera = i ? 0xFAC0 : 0xFA80;
+        if (i && (g_bus.ram[0x9800] & 1))
+            continue;                               // plane B holds a fixed picture, never streamed
+        const int now = word(camera + 4) >> 4, then = g_plane_refill.old_x[i] >> 4;
+        for (int block = now - 7; block <= now + 24; block++)
+            if (block < then - 7 || block > then + 23)
+                write_block_column(camera, i ? 0xE000 : 0xC000, block);
+    }
+}
+
 void run_frame(uint32_t* pixels)
 {
+    refill_planes_if_due();
     g_audio.clear();
     g_vdp.start_frame();
     if (g_smooth_fades) {                           // CRAM holds this frame's colours by now
@@ -755,7 +983,7 @@ void run_frame(uint32_t* pixels)
     const uint16_t state = g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301];
     const uint16_t level = g_bus.ram[0xFF44] << 8 | g_bus.ram[0xFF45];
     const uint16_t act = g_bus.ram[0xFF46] << 8 | g_bus.ram[0xFF47];
-    const bool wide = g_widescreen && is_wide_state(state, level);
+    const bool wide = g_widescreen && is_wide_state(state, level, g_bus.ram);
     if (g_widescreen)
         fix_spawn_grid(level, act);
     // $20/$22 pick the castle exterior for level 5, or for level 3 when $FFFF0D is 2
@@ -771,6 +999,10 @@ void run_frame(uint32_t* pixels)
     } else if ((state == 0x0E || state == 0x2E) && level == 5 && act == 0) {
         g_strip_rule = StripRule::ArenaWalls;
         g_wall = kFinalBossWalls;
+    } else if (state == 0x16 && after_ending_scene(g_bus.ram) == AfterEnding::Theatre) {
+        g_strip_rule = StripRule::TheatreFill;
+    } else if (state == 0x2A) {
+        g_strip_rule = StripRule::StoryFill;
     } else {
         g_strip_rule = StripRule::None;
     }
@@ -791,6 +1023,8 @@ void run_frame(uint32_t* pixels)
     // keeps there) before he comes out of the door.
     g_vdp.strip_fill_in_front_left = g_strip_rule == StripRule::TowerFill;
     g_vdp.extend_plane_a_inside = wide && g_strip_rule == StripRule::TowerFill;
+    g_vdp.extend_plane_b_inside = wide && g_strip_rule == StripRule::TheatreFill;
+    g_vdp.strip_b_priority_right = g_strip_rule == StripRule::StoryFill;
     g_vdp.clean_black_edges = g_clean_rock_edges && state == 0x0E && level == 0;   // forest stages
     for (int i = 0; i < 64; i++)
         g_vdp.edge_palette[i] = g_bus.ram[0xF800 + i * 2] << 8 | g_bus.ram[0xF801 + i * 2];
@@ -907,8 +1141,8 @@ void retune_camera_limits(bool wide)
 }
 
 // Switches widescreen: the ROM code (only the patched bytes differ, so the running code
-// carries on), the camera limits and the frame width. Planes are streamed as the camera
-// moves, so the new strips can show stale columns until the view has scrolled past them.
+// carries on), the camera limits and the frame width. Turned on during level play, the
+// blocks the moved cameras need are refilled once they have moved (refill_planes_if_due).
 void build_rom()
 {
     std::vector<uint8_t> rom = g_rom_original;
@@ -930,10 +1164,20 @@ void set_widescreen(bool wide)
 {
     if (wide && !g_wide_available)
         return;
+    const bool was_wide = g_widescreen;
     g_widescreen = wide;
     build_rom();
     g_out_width = wide ? kWideWidth : kWidth;
     retune_camera_limits(wide);
+    // Turned on during level play: refill the blocks the moved cameras need once they have
+    // moved, see refill_planes_if_due.
+    if (wide && !was_wide && (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E) {
+        g_plane_refill.pending = true;
+        for (int i = 0; i < 2; i++) {
+            const int a = i ? 0xFAC4 : 0xFA84;
+            g_plane_refill.old_x[i] = (int16_t)(g_bus.ram[a] << 8 | g_bus.ram[a + 1]);
+        }
+    }
 }
 
 // Switches smooth swinging; vines already in RAM are moved to the matching step of the other
@@ -1005,6 +1249,22 @@ void save_state(const std::string& ram_path, const std::string& vram_path, const
         }
 }
 
+// --state-hash: FNV-1a over what save_state saves (RAM, VRAM, CRAM, registers, VSRAM).
+uint64_t machine_hash()
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto add = [&h](const void* data, size_t size) {
+        for (size_t i = 0; i < size; i++)
+            h = (h ^ static_cast<const uint8_t*>(data)[i]) * 0x100000001B3ull;
+    };
+    add(g_bus.ram, sizeof(g_bus.ram));
+    add(g_vdp.vram, sizeof(g_vdp.vram));
+    add(g_vdp.cram, sizeof(g_vdp.cram));
+    add(g_vdp.reg, sizeof(g_vdp.reg));
+    add(g_vdp.vsram, sizeof(g_vdp.vsram));
+    return h;
+}
+
 // Game controllers, through SDL's gamepad API (XInput, DirectInput and the newer Windows
 // input APIs are all handled by SDL). Buttons are named by position: on an Xbox pad
 // South is A, East is B, West is X, and Start is the menu button.
@@ -1062,6 +1322,21 @@ uint8_t keyboard_buttons()
     if (keys[SDL_SCANCODE_C]) b |= BTN_C;
     if (keys[SDL_SCANCODE_RETURN]) b |= BTN_START;
     return b;
+}
+
+// The fast forward button (see kFastForward): Y on a controller (North), Backspace on the
+// keyboard. Neither is one of the game's buttons.
+bool gamepad_fast_forward()
+{
+    for (SDL_Gamepad* pad : g_gamepads)
+        if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_NORTH))
+            return true;
+    return false;
+}
+
+bool keyboard_fast_forward()
+{
+    return SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE];
 }
 
 }  // namespace
@@ -1153,7 +1428,9 @@ int main(int argc, char** argv)
     std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path, snapshot_dir, sprite_capture_dir;
     int headless_frames = 0;
     std::vector<Press> presses;
-    std::vector<uint32_t> peeks;                    // RAM words to print after a headless run
+    std::vector<std::pair<int, int>> fast_forwards; // --fast-forward FIRST-LAST, in pictures
+    std::string state_hash_path;                    // --state-hash: one line per game frame
+    std::vector<uint32_t> peeks;                   // RAM words to print after a headless run
     bool log_state = false;                         // print each GameState change with its frame number
     bool show_state = false;                        // show the GameState in the window title
     bool log_scroll = false;                        // print each frame's plane A/B scroll (line 0)
@@ -1219,6 +1496,7 @@ int main(int argc, char** argv)
         else if (arg == "--cram" && i + 1 < argc) cram_path = argv[++i];
         else if (arg == "--log-state") log_state = true;
         else if (arg == "--show-state") show_state = true;
+        else if (arg == "--show-touch") touch_force_shown();
         else if (arg == "--log-scroll") log_scroll = true;
         else if (arg == "--log-ram" && i + 1 < argc) logged_bytes.push_back(std::strtoul(argv[++i], nullptr, 16) & 0xFFFF);
         else if (arg == "--watch" && i + 1 < argc) g_bus.watches.push_back(std::strtoul(argv[++i], nullptr, 16) & 0xFFFF);
@@ -1275,6 +1553,16 @@ int main(int argc, char** argv)
                 return 1;
             }
             presses.push_back(p);
+        } else if (arg == "--fast-forward" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const size_t dash = spec.find('-');
+            if (dash == std::string::npos) {
+                std::fprintf(stderr, "bad --fast-forward value (FIRST-LAST): %s\n", spec.c_str());
+                return 1;
+            }
+            fast_forwards.push_back({std::atoi(spec.c_str()), std::atoi(spec.c_str() + dash + 1)});
+        } else if (arg == "--state-hash" && i + 1 < argc) {
+            state_hash_path = argv[++i];
         } else rom_path = arg;
     }
 
@@ -1371,6 +1659,7 @@ int main(int argc, char** argv)
     g_bus.vdp = &g_vdp;
     g_bus.sound = &g_sound;
     g_vdp.extend_plane_a = extend_plane_a;
+    g_vdp.extend_plane_b = extend_plane_b;
     g_vdp.edge_tiles = {0x123, 0x124, 0x125, 0x12A, 0x12B, 0x130, 0x1B7};   // the forest's rock edge tiles (Clean Rock Edges)
     // Frame interpolation notes who writes each sprite and when the list reaches the VDP.
     g_bus.on_sprite_list_write = [](uint16_t address) {
@@ -1400,7 +1689,19 @@ int main(int argc, char** argv)
     if (headless_frames > 0) {
         std::vector<int16_t> all_audio;
         g_interp_capture = interp_back >= 0;
-        for (int frame = 0; frame < headless_frames; frame++) {
+        // --frames counts pictures. Each runs one game frame, or with --fast-forward held over
+        // it during a story scene up to kFastForward (as the windowed loop does). --press,
+        // --poke and the other per-frame options count game frames, as before.
+        FILE* state_hash = state_hash_path.empty() ? nullptr : std::fopen(state_hash_path.c_str(), "w");
+        int frame = 0;
+        for (int picture = 0; picture < headless_frames; picture++) {
+          bool held = false;
+          for (const auto& [first, last] : fast_forwards)
+              held |= picture >= first && picture <= last;
+          const int steps = held && is_cutscene_state(g_bus.ram) ? kFastForward : 1;
+          for (int step = 0; step < steps; step++, frame++) {
+            if (step > 0 && !is_cutscene_state(g_bus.ram))
+                break;                              // the scene ended within the picture
             g_bus.buttons = easy_bounce_buttons();
             for (const Press& p : presses)
                 if (frame >= p.first && frame <= p.last)
@@ -1423,6 +1724,8 @@ int main(int argc, char** argv)
             if (g_vdp.trace)
                 std::printf("[frame %d]\n", frame);
             run_frame(pixels.data());
+            if (state_hash)                         // game frame, picture, FNV-1a of RAM, VRAM, CRAM, registers, VSRAM
+                std::fprintf(state_hash, "%d %d %016llx\n", frame, picture, (unsigned long long)machine_hash());
 #ifndef NDEBUG
             if (!sprite_capture_dir.empty())
                 capture_sprites(sprite_capture_dir, frame);
@@ -1446,17 +1749,20 @@ int main(int argc, char** argv)
                 static int last = -1;
                 int state = g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301];
                 if (state != last)
-                    std::printf("frame %5d: GameState $%02X\n", frame, state);
+                    std::printf("frame %5d (picture %5d): GameState $%02X\n", frame, picture, state);
                 last = state;
             }
-            if (!wav_path.empty())
+            if (!wav_path.empty() && steps == 1)    // muted while fast-forwarding
                 all_audio.insert(all_audio.end(), g_audio.begin(), g_audio.end());
+          }
         }
+        if (state_hash)
+            std::fclose(state_hash);
         if (!wav_path.empty())
             write_wav(wav_path.c_str(), all_audio, g_sound.sample_rate());
         std::printf("YM2612 timer expirations: A=%u B=%u\n", g_sound.timer_expirations[0],
                     g_sound.timer_expirations[1]);
-        std::printf("Ran %d frames; PC=%06X GameState=$%02X VIntMode=$%02X\n", headless_frames,
+        std::printf("Ran %d pictures, %d game frames; PC=%06X GameState=$%02X VIntMode=$%02X\n", headless_frames, frame,
                     m68k_get_reg(nullptr, M68K_REG_PC), g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
                     g_bus.ram[0xF302] << 8 | g_bus.ram[0xF303]);
         save_state(ram_path, vram_path, cram_path);
@@ -1704,6 +2010,8 @@ int main(int argc, char** argv)
         update_cursor();
     };
     int frames_run = 0;                             // game frames since start (--press, --capture)
+    int pictures_shown = 0;                         // pictures since start (--fast-forward)
+    bool fast_forwarding = false;                   // this picture runs kFastForward game frames
 
     // Pacing. Without V-Sync a timer runs one game frame per 1/59.92 s. With V-Sync each
     // swap waits for the display's refresh: on a display at about 60 Hz the game runs one frame
@@ -1842,7 +2150,8 @@ int main(int argc, char** argv)
         if (audio) {
             static double drift = 0;                // the built-up part
             const double queued_ms = SDL_GetAudioStreamQueued(audio) * 250.0 / g_sound.sample_rate();
-            drift = std::clamp(drift + (queued_ms - 50.0) * 1e-5 / 60.0, -0.015, 0.015);
+            if (!fast_forwarding)                   // the queue runs dry while muted: not a drift
+                drift = std::clamp(drift + (queued_ms - 50.0) * 1e-5 / 60.0, -0.015, 0.015);
             ratio *= (float)(1.0 + std::clamp((queued_ms - 50.0) / 50.0 * 0.01 + drift, -0.02, 0.02));
         }
         if (audio && std::fabs(ratio - audio_ratio) > 0.0005f) {
@@ -1990,10 +2299,26 @@ int main(int argc, char** argv)
         }
 
         const uint8_t buttons = (keyboard_free ? keyboard_buttons() : 0) | pad | touch_buttons();
+        // Fast forward: held, with the menu closed, while a story scene plays (is_cutscene_state).
+        // The touch controls show their >> button only then.
+        const bool in_scene = is_cutscene_state(g_bus.ram);
+        touch_show_fast_forward(in_scene);
+        bool fast_forward_held = (keyboard_free && keyboard_fast_forward()) || (!pad_held_over && gamepad_fast_forward())
+                                 || touch_fast_forward();
+        for (const auto& [first, last] : fast_forwards)  // --fast-forward works in a window too
+            fast_forward_held |= pictures_shown >= first && pictures_shown <= last;
+        const bool was_fast_forwarding = fast_forwarding;
+        fast_forwarding = fast_forward_held && !menu_open() && in_scene;
+        if (music && fast_forwarding != was_fast_forwarding)
+            SDL_SetAudioStreamGain(music, fast_forwarding ? 0.0f : 1.0f);
 #ifdef COI_TIMING_LOG
         const Uint64 timing_start = SDL_GetTicksNS();
 #endif
         for (int i = 0; i < due && running; i++) {
+          const int steps = fast_forwarding && is_cutscene_state(g_bus.ram) ? kFastForward : 1;
+          for (int step = 0; step < steps && running; step++) {
+            if (step > 0 && !is_cutscene_state(g_bus.ram))
+                break;                              // the scene ended within the picture
             g_bus.buttons = buttons | easy_bounce_buttons();
             for (const Press& p : presses)          // --press works in a window too
                 if (frames_run >= p.first && frames_run <= p.last)
@@ -2014,7 +2339,7 @@ int main(int argc, char** argv)
                     shown = state;
                 }
             }
-            if (audio) {
+            if (audio && !fast_forwarding) {        // muted while fast-forwarding
 #ifdef COI_TIMING_LOG
                 {
                     const int queued = SDL_GetAudioStreamQueued(audio);
@@ -2028,7 +2353,9 @@ int main(int argc, char** argv)
                     SDL_ClearAudioStream(audio);
                 SDL_PutAudioStreamData(audio, g_audio.data(), (int)(g_audio.size() * sizeof(int16_t)));
             }
+          }
         }
+        pictures_shown++;
         g_mdplus.feed(music);
 #ifdef COI_TIMING_LOG
         const Uint64 timing_emulated = SDL_GetTicksNS();

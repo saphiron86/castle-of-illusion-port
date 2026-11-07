@@ -32,7 +32,7 @@ Android 7.0 or later, on a 64-bit phone with OpenGL ES 3.0.
 
 1. Download `coi-port-android.apk` from the [Releases](https://github.com/saphiron86/castle-of-illusion-port/releases) page on the phone and open it. Android asks you to allow installs from your browser or file manager first.
 2. On first start the app asks for the ROM: pick your own dump of the US release (a 512 KB `.bin` file) with the file picker. It is copied into the app's storage, so it is asked for only once.
-3. Play with the on-screen controls or a USB or Bluetooth controller (a controller hides the touch controls until the screen is touched again). Tap the menu button, or press Back, for the menu.
+3. Play with the on-screen controls or a USB or Bluetooth controller (a controller hides the touch controls until the screen is touched again). Tap the menu button, or press Back, for the menu. During the story scenes a fast forward button (>>) shows under A, B and C: hold it to run the scene at four times its speed (Y on a controller does the same).
 
 An MD+ soundtrack pack is imported from the menu: Enhancements > Audio > Import MD+ Pack..., then choose the pack's folder (see [android/README.md](android/README.md)). A phone's GPU can't do everything a PC's can, so the Android menu offers HQ2x but not HQ3x or HQ4x, cleanEdge turns smooth scrolling off, and the CRT shader draws at half resolution with its phosphor mask at full resolution. It is tuned on a OnePlus 9.
 
@@ -117,8 +117,11 @@ Run `build/port/Release/coi.exe`; it finds your ROM in a `rom` folder beside the
 | B       | X        | A                        |
 | C       | C        | B                        |
 | Start   | Enter    | Menu                     |
+| Fast forward (story scenes) | Backspace (hold) | Y (hold) |
 
 Controllers go through SDL's gamepad support (XInput, DirectInput and other Windows input APIs; on Linux evdev, hidraw and Steam Input), can be connected at any time, and work alongside the keyboard; the console shows when one connects. A controller's Back (View) button opens the menu.
+
+Holding Backspace, or Y on a controller, runs the game's story scenes at four times their speed: the story pictures after boot (up to the title), the story after Start (Mizrabel takes Minnie), the scenes between worlds, and the ending and the scenes after it. The game's own frames are the same as without it, just shown faster, and its sound is muted while it is held. It does nothing in the title screen and menus, in level play or in boss fights, nor on a Boss Rush's results screen.
 
 On Linux the same commands build `build/port/coi` with GCC or Clang; SDL needs the X11, Wayland, ALSA, PulseAudio and PipeWire development packages to support them. The release download is built in Valve's Steam Runtime SDK, so it runs on any distribution with glibc 2.29 or later; with podman (or docker):
 

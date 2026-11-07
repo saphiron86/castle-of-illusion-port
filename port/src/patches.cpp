@@ -12,6 +12,8 @@ struct Patch {
 };
 
 // Helper routines go in the $FF padding at the end of the ROM.
+constexpr uint32_t kCreditTrunks = 0x7FE6C;
+constexpr uint32_t kFlightWait = 0x7FEC4;
 constexpr uint32_t kSpawnRowStart = 0x7FED6;
 constexpr uint32_t kRectVisibleA = 0x7FEE4;
 constexpr uint32_t kRectVisibleB = 0x7FEF2;
@@ -26,8 +28,10 @@ constexpr uint32_t kSpawnLeft = 0x7FFA0;
 const std::vector<Patch>& patches()
 {
     static const std::vector<Patch> list = {
-        // ClipSpriteX: keep sprite pieces from screen X -64 to 383 instead of -32 to 351.
-        {0x001C3E, {0x00, 0x60}, {0x00, 0x40}, "ClipSpriteX lower bound"},
+        // ClipSpriteX: keep sprite pieces from screen X -72 to 383 instead of -32 to 351. A
+        // piece is up to 32 pixels wide, so one starting at -72 just reaches the widened
+        // view's left edge (-40); with -64 the credits' tree trunks popped in 6 pixels deep.
+        {0x001C3E, {0x00, 0x60}, {0x00, 0x38}, "ClipSpriteX lower bound"},
         {0x001C44, {0x01, 0xE0}, {0x02, 0x00}, "ClipSpriteX upper bound"},
 
         // InitCamera: minimum X 40 instead of 0 (arenas still override it with their
@@ -145,16 +149,25 @@ const std::vector<Patch>& patches()
         // original timing relative to the visible edges: moving left, test the crossing on
         // X - 40 (cells spawn 40-167 pixels left), moving right on X + 40 (424-551 right),
         // and delete past 168 left or from 552 right.
+        // Except moving right in stage 25 (index 24), which keeps the console's timing: its
+        // skeleton fish are filed in a column well right of where they sit, so the camera
+        // reaching that column sends them after Mickey from the left, and 40 pixels early they
+        // catch him in the two swims he only just escapes on the console. Columns moving right
+        // still spawn at least 24 pixels beyond the widened view's edge.
         {0x06D53C, {0x30, 0x2E, 0x00, 0x04, 0x36, 0x2E},
                    {0x4E, 0xF9, 0x00, 0x07, 0xFF, 0xA0}, "UpdateSpawns column test (jmp)"},
-        {kSpawnLeft, std::vector<uint8_t>(38, 0xFF),
+        {kSpawnLeft, std::vector<uint8_t>(50, 0xFF),
                    {0x30, 0x2E, 0x00, 0x04,                     // move.w  4(a6),d0           X
                     0x36, 0x2E, 0x00, 0x18,                     // move.w  $18(a6),d3         X at the last update
                     0x72, kWideMargin,                          // moveq   #40,d1
                     0x4A, 0x6E, 0x00, 0x1E,                     // tst.w   $1E(a6)            X velocity
-                    0x6A, 0x02,                                 // bpl.s   +2                 moving right: +40,
+                    0x6A, 0x04,                                 // bpl.s   right              moving right: +40,
                     0x44, 0x41,                                 // neg.w   d1                 moving left: -40
-                    0xD0, 0x41,                                 // add.w   d1,d0
+                    0x60, 0x0A,                                 // bra.s   apply
+                    0x0C, 0x78, 0x00, 0x18, 0xFF, 0x42,         // right: cmpi.w #24,($FFFF42).w   stage 25
+                    0x66, 0x02,                                 // bne.s   apply
+                    0x72, 0x00,                                 // moveq   #0,d1              there: as the console
+                    0xD0, 0x41,                                 // apply: add.w d1,d0
                     0xD6, 0x41,                                 // add.w   d1,d3
                     0xB1, 0x43,                                 // eor.w   d0,d3
                     0x08, 0x03, 0x00, 0x07,                     // btst    #7,d3
@@ -186,6 +199,62 @@ const std::vector<Patch>& patches()
                     0x58, 0x8F,                                 // delete: addq.l #4,a7       drop the return
                     0x4E, 0xF9, 0x00, 0x00, 0x1C, 0x94},        // jmp     DeleteObject ($001C94)
                    "off-screen deletion, X (routine)"},
+
+        // Night flight after the ending (GameState $16): the small witch with Mickey and
+        // Minnie (object $6F) flies right 4 pixels a frame, then waits 100 frames at X 348,
+        // just off the original right edge, before turning into the big sprite at X 320. In
+        // the widened view it sat at the right edge for those frames. Keep it flying while it
+        // waits: 4 pixels right a frame, X only, so it leaves the view. The next step sets X
+        // afresh, and Y (with its fraction) is left as the console has it.
+        {0x007DA8, {0x53, 0x28, 0x00, 0x34, 0x67, 0x02, 0x4E, 0x75},
+                   {0x4E, 0xB9, 0x00, 0x07, 0xFE, 0xC4, 0x4E, 0x71}, "night flight small sprite (jsr)"},
+        {kFlightWait, std::vector<uint8_t>(16, 0xFF),
+                   {0x53, 0x28, 0x00, 0x34,                     // subq.b  #1,$34(a0)         the wait
+                    0x67, 0x08,                                 // beq.s   go
+                    0x58, 0x68, 0x00, 0x10,                     // addq.w  #4,$10(a0)         X + 4
+                    0x58, 0x8F,                                 // addq.l  #4,a7              return from the object
+                    0x4E, 0x75,                                 // rts
+                    0x4E, 0x75},                                // go: rts                    to its next step
+                   "night flight small sprite (routine)"},
+
+        // Credits after the ending (GameState $16): the tree trunks are sprites (object $2D,
+        // tiles $4372) that a spawner ($008AA4) creates every 250 frames at X 0 (sprite
+        // pixels -33 to -2, just off the original left edge) moving right a pixel a frame,
+        // and deletes after 380 frames (X 380, just off the right edge). In the widened view
+        // both ends were inside the strips, so trunks popped in and out. Here each trunk
+        // lives 400 frames (to X 400, past the right strip), and every firing also creates
+        // the next trunk now, at X -250 with 650 frames to live, so it follows exactly the
+        // path the console's next trunk will (X 0 when that one would be created) and is
+        // already moving when it reaches the left strip. The first firing (while the screen
+        // is still black) keeps its trunk at X 0 as well; later firings reuse their slot for
+        // the next trunk, or free it when the spawner ($22, its remaining life) will not
+        // fire again, so no trunk appears that the console would not have shown.
+        {0x008AFE, {0x33, 0x7C, 0x01, 0x7C, 0x00, 0x22, 0x13, 0x7C, 0x00, 0x01, 0x00, 0x35},
+                   {0x4E, 0xF9, 0x00, 0x07, 0xFE, 0x6C, 0x4E, 0x71, 0x4E, 0x71, 0x4E, 0x71},
+                   "credits tree trunks (jmp)"},
+        {kCreditTrunks, std::vector<uint8_t>(88, 0xFF),
+                   {0x13, 0x7C, 0x00, 0x01, 0x00, 0x35,         // move.b  #1,$35(a1)         trunk tiles
+                    0x4A, 0x28, 0x00, 0x37,                     // tst.b   $37(a0)            fired before?
+                    0x66, 0x38,                                 // bne.s   later
+                    0x50, 0xE8, 0x00, 0x37,                     // st      $37(a0)
+                    0x33, 0x7C, 0x01, 0x90, 0x00, 0x22,         // move.w  #400,$22(a1)       this trunk, at X 0
+                    0x0C, 0x68, 0x00, 0xFA, 0x00, 0x22,         // cmpi.w  #250,$22(a0)
+                    0x63, 0x24,                                 // bls.s   done               no further firing
+                    0x70, 0x02,                                 // moveq   #2,d0
+                    0x4E, 0xB9, 0x00, 0x00, 0xA5, 0xC0,         // jsr     $00A5C0            a free slot
+                    0x32, 0xBC, 0x00, 0x2D,                     // move.w  #$2D,(a1)
+                    0x33, 0x7C, 0x00, 0x01, 0x00, 0x18,         // move.w  #1,$18(a1)
+                    0x13, 0x7C, 0x00, 0x01, 0x00, 0x35,         // move.b  #1,$35(a1)
+                    0x33, 0x7C, 0xFF, 0x06, 0x00, 0x10,         // ahead: move.w #-250,$10(a1) the next trunk
+                    0x33, 0x7C, 0x02, 0x8A, 0x00, 0x22,         // move.w  #650,$22(a1)
+                    0x4E, 0x75,                                 // done: rts
+                    0x0C, 0x68, 0x00, 0xFA, 0x00, 0x22,         // later: cmpi.w #250,$22(a0)
+                    0x62, 0xEA,                                 // bhi.s   ahead
+                    0x42, 0x91,                                 // clr.l   (a1)               not needed: free it
+                    0x42, 0x69, 0x00, 0x18,                     // clr.w   $18(a1)
+                    0x42, 0x29, 0x00, 0x35,                     // clr.b   $35(a1)
+                    0x4E, 0x75},                                // rts
+                   "credits tree trunks (routine)"},
     };
     return list;
 }

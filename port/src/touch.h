@@ -25,5 +25,15 @@ bool touch_menu_tapped();
 // Lets go of every finger (the menu opened over them).
 void touch_release();
 
+// Shows the fast forward button (>>, under A, B and C) or hides it: shown only during the
+// game's story scenes. It is not a game button.
+void touch_show_fast_forward(bool shown);
+
+// A finger holds the fast forward button (while it is shown).
+bool touch_fast_forward();
+
+// Shows the controls on a desktop too (testing: --show-touch).
+void touch_force_shown();
+
 // Draws the controls, if they are showing, into the current ImGui frame (behind the menu).
 void touch_draw();

@@ -63,6 +63,12 @@ public:
     // When set, extend_plane_a is asked about pixels inside the original columns too (for a
     // rule that moves part of the scene, such as the castle exterior's widened tower).
     bool extend_plane_a_inside = false;
+    // The same for plane B (view_x is plane B's position in the view), and its "inside" flag.
+    std::function<bool(int view_x, int line, int& plane_x, int& plane_y)> extend_plane_b;
+    bool extend_plane_b_inside = false;
+    // When set, plane B pixels remapped by extend_plane_b in the right strip take the high
+    // priority, so low-priority sprites pass behind them.
+    bool strip_b_priority_right = false;
     // When set, opaque pixels remapped by extend_plane_a are drawn in front of everything,
     // sprites included, so sprites pass behind the fill (used for the ending's walls).
     bool strip_fill_in_front = false;

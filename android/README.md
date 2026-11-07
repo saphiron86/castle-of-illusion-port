@@ -6,7 +6,9 @@ running the port, built from `port/CMakeLists.txt` as `libmain.so` next to SDL's
 Games SDK's frame pacing library (`port/src/android_pacing.cpp`).
 
 It plays with on-screen touch controls or a USB or Bluetooth controller (which hides the touch
-controls until the screen is touched again); Back opens and closes the menu. MD+ soundtrack
+controls until the screen is touched again); Back opens and closes the menu. During the game's
+story scenes a fast forward button (>>) shows under A, B and C; holding it (or a controller's
+Y) runs the scene at four times its speed, with the sound muted. MD+ soundtrack
 packs are imported from the menu (below). The port's messages go to the log
 (`adb logcat -s COI`).
 

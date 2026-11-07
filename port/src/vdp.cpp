@@ -446,7 +446,12 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
         const int vs_b = column_vscroll ? vsram[column * 2 + 1] : vsram[1];
 
         bool pri_a, pri_b;
-        int b = plane_pixel(base_b, xb - hs_b, line + vs_b, plane_w, plane_h, pri_b);
+        int bx = xb - hs_b, by = line + vs_b;
+        const bool b_remapped = (extend_plane_b_inside || xb < 0 || xb >= native_width) && extend_plane_b
+                                && extend_plane_b(xb, line, bx, by);
+        int b = plane_pixel(base_b, bx, by, plane_w, plane_h, pri_b);
+        if (b_remapped && strip_b_priority_right && xb >= native_width)
+            pri_b = true;
         int a;
         bool in_native = x >= 0 && x < native_width;
         bool in_window = in_native && (window_line || (window_right ? x >= window_hp : x < window_hp));
@@ -563,7 +568,12 @@ void Vdp::render_pixels(int line, uint32_t* out, int width, int left, int scale,
     for (int xb = b_lo; xb <= b_hi; xb++) {
         Pixel& p = b_px[xb - b_lo];
         bool pri = false;
-        p.index = (uint8_t)plane_pixel(base_b, xb - hs_b, line + vs_b, plane_w, plane_h, pri);
+        int bx = xb - hs_b, by = line + vs_b;
+        const bool b_remapped = (extend_plane_b_inside || xb < 0 || xb >= native_width) && extend_plane_b
+                                && extend_plane_b(xb, line, bx, by);
+        p.index = (uint8_t)plane_pixel(base_b, bx, by, plane_w, plane_h, pri);
+        if (b_remapped && strip_b_priority_right && xb >= native_width)
+            pri = true;
         p.priority = pri;
         p.front = false;
     }
