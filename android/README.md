@@ -17,7 +17,7 @@ packs are imported from the menu (below). The port's messages go to the log
 - Android Studio (its bundled Java 17 is enough), with the Android SDK: NDK 28.2.13676358 (r28c) and
   CMake 3.22.1. The first build fetches Gradle 9.8.2, the Android Gradle plugin 9.4, SDK Build
   Tools 36, SDK Platform 37.2 and Swappy (`androidx.games:games-frame-pacing`).
-- The desktop build in `build/port` first (`tools/build.py`, or CMake as in the main README):
+- The desktop build in `build/port` first (`tools/build.py`, or CMake as in docs/building.md):
   the Android build runs its `m68kmake` to generate Musashi's opcode handlers.
 - `android/local.properties` with the SDK's location (not committed), for example
   `sdk.dir=C:/Users/you/AppData/Local/Android/Sdk`.

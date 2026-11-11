@@ -1,3 +1,9 @@
+---
+title: Readable C
+parent: Technical notes
+nav_order: 2
+---
+
 # Decompiling into readable C
 
 The step after the translator (docs/native.md): the game's 68000 code as C a person can read
@@ -5,7 +11,7 @@ and change, generated on the player's own machine from their own ROM, that still
 exactly as the console does: every frame the same as the interpreter, interrupts on the same
 instruction, the same cycles.
 
-## Decisions (agreed 2026-11-03)
+## Decisions
 
 - **Generated locally.** The C is game code, so it is never committed or shipped. The repository
   holds the tool that writes it (`coi_recomp --readable`, from the same front end as the
@@ -50,8 +56,7 @@ code (lower.cpp), so they can't disagree about what an instruction does.
 5. **The port's patches as source.** Widescreen, Boss Rush, cheats and smooth swinging are ROM
    patches now; in decompiled code they become C changes behind settings: first as variants
    generated from each setting's image (below, "One build for every setting"), then, where it
-   reads better, hand-written C in their place, each checked against its variant (agreed
-   2026-11-04; the cheats are by hand now, below, "Patches by hand").
+   reads better, hand-written C in their place, each checked against its variant (the cheats are by hand now, below, "Patches by hand").
 
 ## Building and checking it
 
@@ -120,7 +125,7 @@ image ran only with those settings, and the sweep needed a build per image. Now:
 Each variant is the exact translation of its own image, so exactness holds as it does for one
 image; the checks are the same, per setting.
 
-Checked (2026-11-04), all in the one build: the 15-stage run with no setting on, each setting
+Checked, all in the one build: the 15-stage run with no setting on, each setting
 alone and all of them (moon jump aside, which midair jump switches off), each identical to the
 interpreter on all 13,530 frames, strict, 100.0% translated; the sweep, strict, 4:3 and with
 widescreen on: 90 of 90 identical each, 100.0%, the scenarios without cheats included (one
@@ -182,7 +187,7 @@ instruction is a point where every flag and register is exact (no comparison fol
 no register kept in a local across it), since the C may leave flags as they were where the
 game's instruction would have set them.
 
-What is by hand (2026-11-04): invincibility (the three `rts`s, the hazard's `nop`s), infinite
+What is by hand: invincibility (the three `rts`s, the hazard's `nop`s), infinite
 power, tries, items and continues (each a `tst` or a `bra.s` over the subtraction), full power
 (`StartPower`, `HardStartPower`) and walk faster (`WalkLimit`, `WalkSlowAbove`). What stays a
 variant: widescreen (22 functions) and smooth swinging (8), whose changes are routines and data
@@ -191,7 +196,7 @@ structured code is built on those branches; a variant reads better than a branch
 branch); and midair jump, which replaces two instructions with a call to its own helper and
 changes where the instructions after start. 33 variants in all (from 92).
 
-Then (2026-11-05) widescreen and smooth swinging. Their bounds and sizes are named values:
+Then widescreen and smooth swinging. Their bounds and sizes are named values:
 `ClipLeft`/`ClipRight` (ClipSpriteX), `ViewBlocks` (IsRectVisibleA and B), stage 15's building
 tops (`TopsHideLeft`/`Right`, `TopsFromLeft`, `TopsToRight`), `SpawnRowCells`, and smooth
 swinging's `SwingScript`. Their calls to their own routines are instruction patches of the kind
@@ -209,7 +214,7 @@ of the `nop`s starting where the game's `tst` and `bmi.w` do (as moon jump's: th
 code is built on those branches, and a resume at `$001B1A` would have to tell the `tst` from the
 `nop` by the setting); moon jump; and midair jump's one function. 3 variants in all (from 33).
 
-Checked (2026-11-05), in the one build: the 15-stage run with no setting on, each setting alone
+Checked, in the one build: the 15-stage run with no setting on, each setting alone
 and all of them, identical to the interpreter on all 13,530 frames, strict, 100.0% translated;
 replays with none, widescreen, smooth swinging, both, and both with seven cheats: 527, 529, 527,
 529 and 525 of each, plain and stopped partway; the sweep, strict, 4:3 and with widescreen on:
@@ -223,9 +228,9 @@ interpreter with no setting, widescreen, smooth swinging and both (strict, 100.0
 too, plain and stopped partway. That run is now one of the sweep's scenarios, twice
 (`stage01_vine` with smooth swinging, `stage01_vine_classic` without), so `tools/native_sweep.py`
 checks it every time: through the readable C, strict, 4:3 and `--wide`, all four identical,
-100.0% translated, Mickey in his swing state (`$FFDC03` = 37/38) in each (2026-11-05).
+100.0% translated, Mickey in his swing state (`$FFDC03` = 37/38) in each.
 
-Checked (2026-11-04), in the one build: the 15-stage run with no setting on, each setting alone
+Checked, in the one build: the 15-stage run with no setting on, each setting alone
 and all of them together, identical to the interpreter on all 13,530 frames, strict, 100.0%
 translated; replays (with invincibility, with every cheat, with none) 524, 525 and 527 of each,
 plain and stopped partway; the sweep, strict, 4:3 and with widescreen on: 90 of 90 identical
@@ -239,18 +244,18 @@ invincibility on (stage 24's route does without it, but only after a knock back 
 invincibility prevents), so that one is checked by its cycles against the image and in play:
 on stage 24 with invincibility, `--native`, Mickey standing in the deadly block ran the patch
 1,264 times (the write to `$F44A` from `$00BFFE` right after it, seen with `--watch`), nothing
-marked him dead and he played on as normal (2026-11-04). The named values were seen in effect
+marked him dead and he played on as normal. The named values were seen in effect
 (power 5 on Hard with full power).
 
 On ARM64 (the family build cross-compiled for ARM64 Linux, run in `qemu-aarch64`, against the
-Windows interpreter), 2026-11-04, with no setting on, with invincibility and widescreen, and
+Windows interpreter), with no setting on, with invincibility and widescreen, and
 with widescreen, smooth swinging and seven cheats (all but moon jump and infinite continues): the 15-stage run
 identical on all 13,530 frames each, strict, 100.0% translated; replays 527, 524 and 525 of
 each, plain and stopped partway.
 
 ## Status
 
-Stage 1, first slice (2026-11-03): 1,734 functions, about 30,000 instructions.
+Stage 1, first slice: 1,734 functions, about 30,000 instructions.
 
 | | |
 |-|-|
@@ -263,7 +268,7 @@ Found on the way: a function's code can start below its entry (`NemDec_WriteVDP`
 loops back into `$07FBF8`), so a readable function starts with a `goto` to its entry when it
 isn't the lowest address.
 
-Stage 2 and the first of stage 3 (2026-11-04):
+Stage 2 and the first of stage 3:
 
 - **Flags only where they can be read.** Within a stretch, a flag the next flag operation
   overwrites before anything reads it isn't computed (the JIT's analysis); at a stretch's ends,
@@ -289,7 +294,7 @@ Stage 2 and the first of stage 3 (2026-11-04):
 | The 15-stage run | identical | identical |
 | 68000 time, that run | 0.83 s | 0.70 s |
 
-Then (2026-11-04, later):
+Then:
 
 - **Short branches inside an instruction as `if`s**: a test that skips straight code to a label
   right after it (the privilege check and the interrupt check of an SR write, a stub check)
@@ -329,7 +334,7 @@ Then (2026-11-04, later):
 153,000 lines now (from 384,000 in the first slice). Checked again: replays 524 of 524 both
 ways, the 15-stage run identical on all 13,530 frames, 68000 time 0.67 s.
 
-Stage 4 begun (2026-11-04, later):
+Stage 4 begun:
 
 - **Register values as C locals.** From an instruction that writes a register in full to the next
   that does, inside straight code (each instruction's only way in is the one before, no stretch
@@ -502,7 +507,7 @@ Stage 4 begun (2026-11-04, later):
   `FadeInSetup`, `ClearRamBuffer`; the castle hall's (`LoadLevelPalette`, `SpawnObjectList`,
   `CastleHallRebuild`). The screens themselves are thin (a fade, then the objects): their work
   is in the objects on them, numbered kinds of their own. 394 `sub_` left.
-- **Level start, cameras and each stage's frame effect** (2026-11-05), from `GameState_0C` and
+- **Level start, cameras and each stage's frame effect**, from `GameState_0C` and
   Mickey's code down. `StageSetup` runs each stage's own set-up from a table by level and act
   (`StageSetup01`...`StageSetup28`, stage numbers from the stage select's tables at `$A008`
   and `$A024`; stages sharing one, `StageSetup15to18`, and the shared parts,

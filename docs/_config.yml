@@ -1,0 +1,30 @@
+title: Castle of Illusion PC port
+description: An unofficial PC, Linux, Steam Deck and Android port of Castle of Illusion Starring Mickey Mouse (Genesis, 1990).
+remote_theme: just-the-docs/just-the-docs@v0.10.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-relative-links
+
+color_scheme: dark
+search_enabled: true
+heading_anchors: true
+
+aux_links:
+  "GitHub": "https://github.com/saphiron86/castle-of-illusion-port"
+  "Downloads": "https://github.com/saphiron86/castle-of-illusion-port/releases"
+aux_links_new_tab: true
+
+relative_links:
+  enabled: true
+  collections: false
+
+footer_content: "A fan project, not affiliated with Disney or Sega. No game data is included: the port runs your own ROM."
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - notes

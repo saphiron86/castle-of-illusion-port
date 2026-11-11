@@ -1,3 +1,9 @@
+---
+title: Native code
+parent: Technical notes
+nav_order: 1
+---
+
 # Native code (the translator)
 
 The port can run the game's 68000 code as native code instead of through the Musashi
@@ -313,7 +319,7 @@ loop through Musashi's PPC. Every number in `config/recomp.txt` is hex, counts i
    functions without going through `jit::run` each time, the rarer flag operations inline.
    With `COI_PERF_MAP=1` (Linux) perf names each translated instruction's code
    (`m68k_<address>`, `_checked` for the checked copy).
-2. **What the probes don't reach** (checked 2026-11-10): `movep` and a `bcc.s` with
+2. **What the probes don't reach**: `movep` and a `bcc.s` with
    displacement `$FF` (a branch to an odd address) aren't decoded; the game has neither, a
    function with one is left out and the interpreter runs it exactly (the self-test's two
    handover tests); without an interpreter the game would stop with a message there. Interrupts

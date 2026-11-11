@@ -31,3 +31,8 @@ android/local.properties
 # The release signing key's location and passwords (the key itself lives outside the repo)
 android/keystore.properties
 *.jks
+
+# Local Jekyll preview of the docs site
+.sass-cache/
+.jekyll-cache/
+_site/

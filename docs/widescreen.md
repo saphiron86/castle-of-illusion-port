@@ -1,3 +1,9 @@
+---
+title: Widescreen
+parent: Technical notes
+nav_order: 4
+---
+
 # Widescreen: what assumes a 320-pixel screen
 
 The original renders 320 x 224. A 16:9 picture at 224 lines is about 400 pixels wide. This document records which parts of the game depend on the screen width, from the disassembly, and what the PC port has to change.
@@ -133,7 +139,7 @@ Everything above applies once a level has been set up through `LoadLevelHeader` 
 
 ## Status in the port
 
-Stage numbers are the 1-28 numbers used by `--stage` (see the README).
+Stage numbers are the 1-28 numbers used by `--stage` (see [Stages](stages.md)).
 
 Implemented in `port/src/patches.cpp` and `port/src/main.cpp`:
 

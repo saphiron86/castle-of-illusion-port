@@ -1,0 +1,4 @@
+// Wider pages for 1080p and larger screens: the theme's default is 50rem of text beside the
+// sidebar (about 1060 px in all); this allows 80rem (about 1540 px in all at 1920 px wide).
+// Narrow windows and phones are unchanged: the text still fits the window.
+$content-width: 80rem;

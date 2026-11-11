@@ -1,3 +1,9 @@
+---
+title: Sound
+parent: Technical notes
+nav_order: 3
+---
+
 # Sound: how the game talks to the Z80
 
 The 68000 does not play music or sound effects itself. At boot it loads a driver into Z80 RAM, and afterwards it only posts small requests into a mailbox there. The PC port can therefore emulate the Z80, the YM2612 and the SN76489, and route the 68000's mailbox writes into the emulated Z80 RAM.

@@ -2,7 +2,7 @@
 // C++ VDP and an SDL3 front end.
 //
 // Usage: coi [rom.bin] [--stage N] [--frames N] [--dump out.ppm] [--press BUTTON@FIRST-LAST ...]
-//   --stage N    start the first level of a new game at stage N (1-28), see README
+//   --stage N    start the first level of a new game at stage N (1-28), see docs/stages.md
 //   --show-state show the GameState in the window title
 //   --no-widescreen start at the original 320 x 224 (the F1 menu can switch it later)
 //   --no-smooth-swing start with smooth swinging off (whatever the saved settings say)
