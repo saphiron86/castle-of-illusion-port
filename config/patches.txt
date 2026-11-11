@@ -1,0 +1,161 @@
+# The port's ROM patches by hand: C in place of the instruction a setting's patch replaces
+# (docs/decompile.md, "Patches by hand"). The port's own code, not the game's: what the patch in
+# port/src/cheats.cpp makes the 68000 do there, written in port/recomp/readable_rt.h's names.
+#
+#   @ <address> <setting> [note]
+#       <the C, indented>
+#
+# `coi_recomp --readable` (with an image family) puts the C in the readable and the resumable
+# copy of every function that holds the instruction at <address>:
+#
+#   AT(...);  /* the game's instruction */
+#   if (SETTING(<setting>)) {  /* note */
+#       <the C>
+#   } else {
+#       <the game's instruction>
+#   }
+#
+# so the setting's variant of those functions isn't needed. The C must do exactly what the
+# patched code does: its cycles (CYCLES; the generator checks the total against the setting's
+# image), every flag, register and memory access. It either goes on to the next instruction or
+# ends with a return or JUMP (then there is no else). It is checked as the variants were: the
+# 15-stage run per setting, the replays and the sweep, identical to the interpreter.
+
+@ 00B8CA infinite-items  infinite items: the count only tested (tst.w), not taken down
+    CYCLES(12);
+    test_flags(2, read16(ThrowCount));
+
+# Invincibility: no enemy contact (rts in place of the first test in each contact check, so
+# MickeyFlashing isn't even read), no damage (rts at HurtMickey's start), and no death on a
+# hazard (the bset that marks Mickey dead becomes three nops). Falling off still costs a try.
+@ 0092B4 invincibility  invincibility: no enemy contact (rts)
+    CYCLES(16);
+    return pop32();
+
+@ 0092DA invincibility  invincibility: no enemy contact (rts)
+    CYCLES(16);
+    return pop32();
+
+@ 0092EE invincibility  invincibility: no damage (rts)
+    CYCLES(16);
+    return pop32();
+
+@ 00BFF8 invincibility  invincibility: Mickey isn't marked dead (three nops)
+    CYCLES(4);
+    STEP(0x00BFFA);
+    CYCLES(4);
+    STEP(0x00BFFC);
+    CYCLES(4);
+
+# Infinite power: a hit flashes and knocks Mickey back but takes no power (bra.s over the
+# subtraction, to the next instruction; the flags stay as the move before left them).
+@ 0092F4 infinite-power  infinite power: no power taken (bra.s to the next instruction)
+    CYCLES(10);
+
+# Infinite tries: none lost when out of power (bra.s over the subtraction) or falling off the
+# stage (tst.w in place of subq.w).
+@ 009300 infinite-tries  infinite tries: no try taken (bra.s to the next instruction)
+    CYCLES(10);
+
+@ 00BD6E infinite-tries  infinite tries: the tries only tested (tst.w), not taken down
+    CYCLES(12);
+    test_flags(2, read16(Tries));
+
+# Infinite continues: the continue screen keeps the count (tst.b in place of subq.b; the flag
+# the sne after it sets stays on while any are left).
+@ 07A590 infinite-continues  infinite continues: the count only tested (tst.b), not taken down
+    CYCLES(12);
+    test_flags(1, read8(Continues));
+
+# Start with full power: every life starts with power 5, whatever the difficulty. Named values
+# (`=`): the instruction stays and the constant the setting changes gets a name, defined as
+# (SETTING(<setting>) ? <value> : the game's own); the generator finds the game's own value and
+# checks that it is all the setting changes there.
+#
+#   = <address> <setting> <name> <value> [note]
+
+= 00972A full-power StartPower 5  the power a life starts with on Normal (3; Practice has 5)
+= 009744 full-power HardStartPower 5  the power a life starts with on Hard (2)
+
+# Walk faster: the walking speed limit $25000 (2.3 pixels a frame) in its two comparisons and
+# where it is set, and the speed above which walking slows Mickey down to it moved up by as much.
+= 00C8F0 walk-faster WalkSlowAbove 0x27000  above this speed, walking slows Mickey down to WalkLimit
+= 00CA18 walk-faster WalkLimit 0x25000  the walking speed limit (the game's: 1.375 pixels a frame)
+= 00CA22 walk-faster WalkLimit 0x25000
+= 00CA2A walk-faster WalkLimit 0x25000
+
+# Widescreen (port/src/patches.cpp, docs/widescreen.md): 40 pixels more on each side. Its bounds
+# and widths as named values; where it calls one of its own routines (config/labels.txt names
+# them, `Wide...`) in place of two of the game's instructions, a jsr and a nop, an instruction
+# patch that calls it: `CALL(<routine>, <return address>)`, then `STEP` where the nop starts.
+# The routines stay generated code (one function each, in the base program, which has them from
+# widescreen's image). DrawObject's deletion range stays a variant: its jsr and four nops replace
+# a cmpi, two branches and a tst, and two of the nops start where the game's tst and bmi.w do.
+= 001C3C widescreen ClipLeft 0x38  ClipSpriteX keeps a piece from this sprite X (screen X -72; the game's: $60, screen X -32)
+= 001C42 widescreen ClipRight 0x200  up to below this one (the game's: $1E0, screen X 352)
+= 00F344 widescreen ViewBlocks 0x1A  the view's width in blocks for IsRectVisibleA/B (the game's: 20, 320 pixels)
+= 00DAAC widescreen ViewBlocks 0x1A
+= 00FE8E widescreen TopsHideLeft 0x38  stage 15's building tops hide at or left of this sprite X (the game's: $60)
+= 00FE94 widescreen TopsHideRight 0x208  and from this one (the game's: $1E0)
+= 00FEBA widescreen TopsFromLeft 0x40  they appear for a building from this far left of CameraB_X (the game's: 24)
+= 00FEC4 widescreen TopsToRight 0x1C0  up to this far right of it, less TopsFromLeft (the game's: $170)
+= 06D59C widescreen SpawnRowCells 5  a spawn row's cells, less one (dbra; the game's: 4, five cells)
+
+@ 00EEB6 widescreen  widescreen: minimum Y 0, minimum X 40 (jsr WideCameraMin, nop)
+    CYCLES(20);
+    CALL(WideCameraMin, 0x00EEBC);
+    STEP(0x00EEBC);
+    CYCLES(4);
+
+@ 00EEF2 widescreen  widescreen: maximum X width - 360, or - 320 in an arena locked at 192 (jsr, nop)
+    CYCLES(20);
+    CALL(WideCameraMax, 0x00EEF8);
+    STEP(0x00EEF8);
+    CYCLES(4);
+
+@ 00F71E widescreen  widescreen: the player's left wall on the original minimum (jsr, nop)
+    CYCLES(20);
+    CALL(WidePlayerLeftWall, 0x00F724);
+    STEP(0x00F724);
+    CYCLES(4);
+
+@ 00EDF0 widescreen  widescreen: both cameras clamped to their limits before the fill (jsr, nop)
+    CYCLES(20);
+    CALL(WideClampCameras, 0x00EDF6);
+    STEP(0x00EDF6);
+    CYCLES(4);
+
+@ 00F332 widescreen  widescreen: the view's first block 3 earlier, not below 0 (jsr)
+    CYCLES(20);
+    CALL(WideViewStartA, 0x00F338);
+
+@ 00DA9C widescreen  widescreen: the view's first block 3 earlier, not below 0 (jsr)
+    CYCLES(20);
+    CALL(WideViewStartB, 0x00DAA2);
+
+@ 06D586 widescreen  widescreen: the row from the cell left of camera X - 40's (jsr, nop)
+    CYCLES(20);
+    CALL(WideSpawnRowStart, 0x06D58C);
+    STEP(0x06D58C);
+    CYCLES(4);
+
+@ 06D53C widescreen  widescreen: the column test on camera X - 40 moving left, X + 40 right (jmp)
+    CYCLES(12);
+    JUMP(0x07FFA0);  /* WideSpawnColumn */
+
+# Smooth swinging (port/src/smooth_swing.cpp): a vine's 34-step swing as 204 one-frame steps.
+# Its script as a named value; its three routines (from $0C0000, config/labels.txt's `Swing...`)
+# called or jumped to in place of the game's instructions. They stay generated code.
+= 000A98 smooth-swing SwingScript 0x0C0100  the vine's animation script (the game's: $06A30C, 34 steps of 6 frames)
+
+@ 000AA4 smooth-swing  smooth swinging: the starting step ($29) in the finer steps, x 6 (jsr SwingStartStep)
+    CYCLES(20);
+    CALL(SwingStartStep, 0x000AAA);
+
+@ 000AE4 smooth-swing  smooth swinging: Mickey's offset from the in-between table, by step (jmp SwingOffset)
+    CYCLES(12);
+    JUMP(0x0C0020);  /* SwingOffset */
+
+@ 00B73A smooth-swing  smooth swinging: his pose from the original step, step / 6 (jsr SwingPoseStep)
+    CYCLES(20);
+    CALL(SwingPoseStep, 0x00B740);

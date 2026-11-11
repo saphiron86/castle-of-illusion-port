@@ -61,9 +61,12 @@ const Entry kEntries[] = {
     entry("clean_edge_line_width", FIELD(clean_edge_line_width)),
     entry("clean_rock_edges", FIELD(clean_rock_edges)),
     entry("smooth_fades", FIELD(smooth_fades)),
+    entry("smooth_water", FIELD(smooth_water)),
+    entry("smooth_glass", FIELD(smooth_glass)),
     entry("remove_sprite_limit", FIELD(remove_sprite_limit)),
     entry("vsync", FIELD(vsync)),
     entry("show_fps", FIELD(show_fps)),
+    entry("show_coordinates", FIELD(show_coordinates)),
     entry("high_refresh_interpolation", FIELD(interpolate)),
     entry("frame_rate", FIELD(frame_rate)),
     entry("mdplus_soundtrack", FIELD(mdplus)),
@@ -93,6 +96,8 @@ const Entry kEntries[] = {
     entry("custom_smooth_scrolling", FIELD(custom.smooth_scroll)),
     entry("custom_clean_rock_edges", FIELD(custom.clean_rock_edges)),
     entry("custom_smooth_fades", FIELD(custom.smooth_fades)),
+    entry("custom_smooth_water", FIELD(custom.smooth_water)),
+    entry("custom_smooth_glass", FIELD(custom.smooth_glass)),
     entry("custom_remove_sprite_limit", FIELD(custom.remove_sprite_limit)),
     entry("custom_hqx", FIELD(custom.hqx)),
     entry("custom_scanlines", FIELD(custom.scanlines)),
@@ -120,20 +125,21 @@ std::string trim(const std::string& s)
 bool Look::operator==(const Look& o) const
 {
     return widescreen == o.widescreen && smooth_swing == o.smooth_swing && smooth_scroll == o.smooth_scroll
-        && clean_rock_edges == o.clean_rock_edges && smooth_fades == o.smooth_fades
+        && clean_rock_edges == o.clean_rock_edges && smooth_fades == o.smooth_fades && smooth_water == o.smooth_water
+        && smooth_glass == o.smooth_glass
         && remove_sprite_limit == o.remove_sprite_limit && hqx == o.hqx && scanlines == o.scanlines && crt == o.crt;
 }
 
 Look quick_look(Quick quick)
 {
     if (quick == Quick::Vanilla)
-        return {false, false, false, false, false, false, 1, 0, false};
+        return {false, false, false, false, false, false, false, false, 1, 0, false};
     return look_of(Settings{});                     // Enhanced: the defaults
 }
 
 Look look_of(const Settings& s)
 {
-    return {s.widescreen, s.smooth_swing, s.smooth_scroll, s.clean_rock_edges, s.smooth_fades,
+    return {s.widescreen, s.smooth_swing, s.smooth_scroll, s.clean_rock_edges, s.smooth_fades, s.smooth_water, s.smooth_glass,
             s.remove_sprite_limit, s.hqx, s.scanlines, s.crt.enabled};
 }
 
@@ -144,6 +150,8 @@ void set_look(Settings& s, const Look& look)
     s.smooth_scroll = look.smooth_scroll;
     s.clean_rock_edges = look.clean_rock_edges;
     s.smooth_fades = look.smooth_fades;
+    s.smooth_water = look.smooth_water;
+    s.smooth_glass = look.smooth_glass;
     s.remove_sprite_limit = look.remove_sprite_limit;
     s.hqx = look.hqx;
     s.scanlines = look.scanlines;

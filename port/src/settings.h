@@ -15,6 +15,8 @@ struct Look {
     bool smooth_scroll = true;
     bool clean_rock_edges = true;
     bool smooth_fades = true;
+    bool smooth_water = true;
+    bool smooth_glass = true;
     bool remove_sprite_limit = true;
     int hqx = 1;
     int scanlines = 0;
@@ -43,9 +45,12 @@ struct Settings {
     float clean_edge_line_width = 1.0f;     // cleanEdge's line width, 0.45-1.14
     bool clean_rock_edges = true;
     bool smooth_fades = true;
+    bool smooth_water = true;
+    bool smooth_glass = true;
     bool remove_sprite_limit = true;
     bool vsync = true;
     bool show_fps = false;
+    bool show_coordinates = false;  // Debug > Show Coordinates
     bool interpolate = false;
     int frame_rate = 0;             // pictures a second: 0 = the display's refresh, 60, 120 or 240
     Cheats cheats;

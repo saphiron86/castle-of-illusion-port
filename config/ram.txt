@@ -1,6 +1,7 @@
 # RAM variables: <hex address> <name> [comment]
 # tools/disasm.py writes these to src/ram.asm and uses the names in place of
 # matching absolute addresses.
+FFF22C Score            long: the score (EnemyToSparkle adds to it)
 FFF300 GameState        word: GameStateTable offset (state number x 2)
 FFF302 VIntMode         word: VInt_ModeTable entry
 FFF400 VBlankWait       byte: set by WaitVBlank, cleared by VInt
@@ -15,3 +16,32 @@ FFFAC4 CameraB_X
 FFFF0C ConsoleVersion   byte: copy of the version register $A10001
 FFFF60 RamStubs_RAM     21 jmp stubs copied from RamStubs by InstallRamStubs
 FFFF8A PlaySound_RAM    RAM stub that jumps to PlaySound
+FFF310 PadInput         word: the pad as the game reads it (bit 13 jump held, cheats.cpp)
+FFF320 ThrowCount       word: the items Mickey has to throw (at most 30, on the HUD)
+FFF322 Power            word: Mickey's power (the stars he can lose before a try)
+FFF324 Tries            word: tries left
+FFF410 MickeyGround     byte: what is under Mickey (bit 0 on the ground; bits 6 and 7 both feet settled)
+FFF451 BossBeaten       byte: a boss is beaten: every enemy counts as beaten (EnemyContact)
+FFF446 MickeyFlashing   byte: frames Mickey still flashes after a hit ($52 from HurtMickey), unharmed meanwhile
+FFF780 Palette          the 64 colours, uploaded to CRAM when $FFF403 is set
+FFF800 TargetPalette    the colours a fade goes to
+FFFF00 RandomSeed       long: Random's state (seeded $2A6D365A when 0)
+FFFF42 StageIndex       word: the stage, 0-27 (bus.cpp's stage select)
+FFFF44 Level            word: the level StageIndex maps to (table at $A008)
+FFFF46 Act              word: the act within it (table at $A024)
+FFF309 PadPressed       byte: the buttons newly pressed this frame (boss_rush.asm)
+FFF403 PaletteDirty     byte: set to have VInt copy Palette to CRAM
+FFF409 HudDirty         byte: which HUD parts DrawHud writes (bit 3 the score)
+FFF308 PadHeld          byte: the buttons held (PadPressed: newly pressed)
+FFF326 DemoFrame        word: the attract demo's frame
+FFF40A DemoMode         byte: the attract demo is playing
+FFF412 PartEnded        byte: the part is over, the next one starts (CheckNextPart)
+FFF44F GemTaken         byte: the stage's gem is taken (CheckGemTaken)
+FFF453 LibraryDoor      byte: the Library door Mickey took (1-4)
+FF9400 BlockAnims       32 slots of $20 bytes: the level's block animations (AddBlockAnim, UpdateBlockAnims)
+FF9802 CameraBMode      word: the level header's second word, UpdateCameraB's mode (CameraBMode0-11)
+FF9808 StageEffect      word: the level header's first word, UpdateScrolling's per-frame effect (table at $F6FE)
+FF982E DmaQueue         DMAs for VInt to run (FlushDmaQueue), 14 bytes each, ended by -1; $9828 points to the end
+FF9870 BgScrollMode     word: plane B's line scroll, 2 by 8-line rows (BgScrollPerCell), 3 per line (BgScrollPerLine)
+FF9890 PaletteCycles    long: the stage's palette cycle table, then three 6-byte slots (StartPaletteCycle, UpdatePaletteCycles)
+FFF40D VIntDmaRequest   byte: VIntMode3's one DMA (VIntDma1-8), cleared when it has run

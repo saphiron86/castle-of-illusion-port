@@ -2,13 +2,17 @@
 
 Starts at the code labels in config/labels.txt, follows every branch and call it
 can resolve, and writes a code map to build/trace/. Indirect jumps it cannot
-resolve are listed so they can be added to config/labels.txt by hand.
+resolve are listed so they can be added to config/labels.txt by hand. sites.txt lists
+each computed jmp/jsr with the destinations found for it, for the recompiler (port/recomp).
+
+The recompiler's two lists (addresses only) also go to config/, where the app's translator
+reads them (built in): recomp_functions.txt (subroutines.txt) and recomp_sites.txt (sites.txt).
 
 Usage: python tools/trace.py
 """
 import re
 import sys
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
 
 import capstone
@@ -18,6 +22,7 @@ BASEROM = ROOT / "build" / "baserom.bin"
 LABELS = ROOT / "config" / "labels.txt"
 DIRECTIVES = ROOT / "config" / "tracer.txt"
 OUT_DIR = ROOT / "build" / "trace"
+CONFIG_DIR = ROOT / "config"
 
 ROM_END = 0x80000
 
@@ -102,6 +107,7 @@ class Tracer:
         self.table_bases = {}     # rel8 table address -> address its offsets are relative to
         self.data = set()         # byte addresses known to be table data
         self.indirect = []        # (address, text) of unresolved jumps
+        self.sites = defaultdict(set)   # computed jmp/jsr address -> destinations found
         self.problems = []        # (address, text)
         self.queue = deque()
 
@@ -141,6 +147,7 @@ class Tracer:
             targets.append(address)
             address += insn.size
         self.jump_tables[table] = ("bra", targets)
+        self.sites[source].update(targets)
         if not targets:
             self.indirect.append((source, "jump table at $%X holds no bra instructions" % table))
         for target in targets:
@@ -150,6 +157,7 @@ class Tracer:
         """Follow a table of unsigned byte offsets from `base` (jmp base(pc,dN.w))."""
         targets = [base + b for b in self.rom[table:table + count]]
         self.jump_tables[table] = ("rel8", targets)
+        self.sites[source].update(targets)
         self.table_bases[table] = base
         self.data.update(range(table, table + count))
         for target in targets:
@@ -205,6 +213,7 @@ class Tracer:
                     if code > target:
                         lowest_code = min(lowest_code, code)
             return
+        self.sites[source].update(targets)
         for target in targets:
             self.add(target, source)
 
@@ -222,6 +231,7 @@ class Tracer:
             for i in range(stubs):            # 6-byte jmp (abs).l stubs, called or not
                 self.add(rom + 6 * i, rom)
         for site, destinations in self.targets.items():
+            self.sites[site].update(destinations)
             for target in destinations:
                 self.add(target, site)
 
@@ -288,6 +298,7 @@ class Tracer:
                         if register in leas:
                             self.helper_calls.append((address, target, leas[register]))
                             self.read_word_table(leas[register], kind, address)
+                            self.sites[self.helpers[target][2]].update(self.jump_tables[leas[register]][1])
                         else:
                             self.indirect.append((address, "call to helper $%X without lea into %s"
                                                   % (target, register)))
@@ -362,6 +373,20 @@ def main():
         for table, (kind, targets) in sorted(tracer.jump_tables.items()):
             f.write("%06X %-5s %3d entries: %s\n"
                     % (table, kind, len(targets), " ".join("%X" % t for t in targets)))
+    with open(OUT_DIR / "sites.txt", "w") as f:
+        f.write("# Computed jumps and calls and the destinations the tracer found (recomp.txt format)\n")
+        for site, targets in sorted(tracer.sites.items()):
+            insn = tracer.insns.get(site) or tracer.decode(site)
+            mnemonic = insn.mnemonic.split(".")[0] if insn else ""
+            if mnemonic in ("jmp", "jsr") and branch_target(insn) is None and targets:
+                f.write("%s %06X %s\n" % ("jump" if mnemonic == "jmp" else "call", site,
+                                           " ".join("%06X" % (t & 0xFFFFFF) for t in sorted(targets))))
+    # The recompiler's copies, for the app (port/recomp; built into it by port/CMakeLists.txt).
+    header = "# Written by tools/trace.py (a copy of build/trace/%s): addresses only.\n"
+    for name, copy in (("subroutines.txt", "recomp_functions.txt"), ("sites.txt", "recomp_sites.txt")):
+        text = (OUT_DIR / name).read_text()
+        with open(CONFIG_DIR / copy, "w", newline="\n") as f:
+            f.write(header % name + "\n".join(l for l in text.splitlines() if not l.startswith("#")) + "\n")
     with open(OUT_DIR / "disasm.txt", "w") as f:
         for address in sorted(tracer.insns):
             insn = tracer.insns[address]

@@ -5,6 +5,9 @@
 #include <functional>
 #include <vector>
 
+// The address of the instruction the 68000 is running (Musashi's PPC, or translated code's).
+uint32_t current_pc();
+
 class Vdp;
 class Sound;
 
@@ -41,6 +44,26 @@ public:
     // Back to the power-on state (RAM cleared, Z80 bus released, no stage select pending),
     // as for a cold boot.
     void power_on();
+
+    // The I/O state the 68000 changes besides memory: the controller ports and the Z80's bus,
+    // for saving and restoring it (the translator's lockstep check, main.cpp).
+    struct IoState {
+        uint8_t pad_data, port_ctrl[3];
+        bool z80_bus_requested;
+        bool operator==(const IoState& o) const
+        {
+            return pad_data == o.pad_data && port_ctrl[0] == o.port_ctrl[0] && port_ctrl[1] == o.port_ctrl[1]
+                && port_ctrl[2] == o.port_ctrl[2] && z80_bus_requested == o.z80_bus_requested;
+        }
+    };
+    IoState io_state() const { return {pad_data, {port_ctrl[0], port_ctrl[1], port_ctrl[2]}, z80_bus_requested}; }
+    void set_io_state(const IoState& s)
+    {
+        pad_data = s.pad_data;
+        for (int i = 0; i < 3; i++)
+            port_ctrl[i] = s.port_ctrl[i];
+        z80_bus_requested = s.z80_bus_requested;
+    }
 
 private:
     void apply_stage_select();

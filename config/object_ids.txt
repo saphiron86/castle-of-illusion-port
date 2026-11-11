@@ -1,0 +1,87 @@
+# Object IDs: <hex ID> <name> [comment]
+# The word at (a0) of an object slot picks its code (RunObject, ObjectCodeLow/High in labels.txt).
+# The readable C (docs/decompile.md) names that code Obj<name> and its routines Obj<name>_N.
+# Named from how they look and where they appear (stages numbered as the sprite captures number
+# them); IDs not listed keep ObjXX. Several bosses are a few objects working together.
+01 Mickey              the player (his slot is $FFDC00)
+03 Sparkle             a white twinkle (stages 5 7 8 9 24)
+04 ToyBlock            a checkered block (stage 7)
+06 Spring              a coil spring Mickey bounces on (stage 7)
+07 Door                a door, open or shut (most stages)
+08 UpDownBlock         a block with up and down arrows (stage 8)
+0C Item                an apple, a bag of apples, a chest or a star (most stages)
+0D OrnateBlock         a carved block (stages 10 14 15 24 26)
+0E WaterSpout          a fountain of water (stage 10)
+10 CandyCane           (stages 15 23)
+32 ToySoldier          (stages 6 7 8)
+33 ToyPlane            (stages 7 8 16-19)
+34 Clown               a clown juggling on a unicycle (stages 7 8)
+37 SpringHead          a head on a spring (stage 7)
+38 SpringHeadSide      the same, springing sideways (stage 7)
+3A JuggleBall          the clown's ball (stages 7 8)
+3C Tree                a walking tree (stages 1 2)
+3D Tulip               a spitting flower (stage 1)
+3E Seed                a small ball, what the forest's plants throw (stage 1)
+3F Bat                 (stages 4 10 11 12 24 26)
+40 Bookworm            (stages 14 16-19)
+41 LetterA             Fast mob that jumps, an A (stages 14 16-19)
+42 SugarCube           a floating sugar cube (stages 20 21 22)
+43 GummyFish           a red gummy fish leaping out of the water (stage 15)
+44 BoneFish            a fish skeleton (stages 10 25)
+45 Knight              an armoured knight (stage 24)
+46 Signpost            an arrow sign (stage 4)
+47 Mace                thrown by Knights (stage 24)
+48 Bubble              a bubble (stage 24)
+4C RollingBall         a big dark rolling ball (stage 24)
+4D Gem                 the gem a boss leaves (stages 5 9 13 15 23 24 27)
+4E Skull               (stages 15 24)
+4F Wafer               a candy wafer platform (stages 15 26)
+50 Mushroom            a walking mushroom (stages 1 2 4 10)
+51 Spider              a spider hanging on its thread (stage 3)
+52 SpiderThread        its thread (stage 3)
+53 Butterfly           a green butterfly (stages 2 3)
+54 BigApple            a giant apple (stage 2)
+55 Ghosts              a small winged creature (stage 4)
+56 BoneFishJumper      a leaping fish skeleton (stages 10 11)
+57 BigAppleLibrary     a giant apple (stages 16-19)
+58 AngryBook           a book lying flat, tries to crush the player (stages 16-19)
+5B FastWaterfall       a powerful waterfall, damages the player
+65 StoneBlock          a carved green block, falls on the player (stage 24)
+6D MickeyIcon          Mickey on a pedestal (stages 15 24)
+8C Gear                a cog (stage 26)
+8D Pendulum            a gold disc (stage 26)
+8E Cupcake             a platform that rises and falls (stage 15)
+8F PassageTrigger      starts a passage for Mickey (MickeyPassage) when he touches it, its $29 the way (1 down, 2 up): invisible (stage 15, a pair in the arched doorway)
+90 ExitSign            (stages 2 4 6-8 10-12 15 24)
+93 Spark               a tiny yellow spark (most stages from 6)
+95 Fireworks           a firework explosion (stages 15 24)
+96 Shelf               a thin platform with something on it (stages 16-19)
+98 SmallGem            (stages 15 24)
+BE CakeBuilding        (stage 15)
+BF CreamDome           (stage 15)
+C2 CastleStatue        attempts to damage the player when they walk under (stage 24)
+C8 OafLegs             stage 27's boss: the legs
+C9 OafHead             stage 27's boss: the head
+CA OafBody             stage 27's boss: the body
+CB DragonHead          stage 23's boss
+CC DragonTorso         stage 23's boss: the wings and arms
+CD DragonSegment       stage 23's boss: its body segments
+CE StormMen            stage 13's boss, a green fish-man
+D2 JackInTheBoxFeet    stage 9's boss, a box on springs: the base
+D3 JackInTheBoxMain    stage 9's boss: the center box
+D4 JackInTheBoxHead    stage 9's boss: the clown's head
+D5 JackInTheBoxGloves  stage 9's boss: the boxing gloves
+D6 JackInTheBoxRing    stage 9's boss: arm rings
+D7 JackInTheBoxSpring  stage 9's boss: a spring
+D9 OldOakTree          stage 5's boss, a log with a face
+DA Acorn               stage 5's boss: acorns that fall from above
+DB TotemSegment        stage 13: a part of a totem
+DC TotemSegment2       stage 13: the same
+DD StormMenRising      stage 13's boss: the fish-man again
+DE TotemSegment3       stage 13: same as other totems
+E1 Mizrabel            the final boss (stage 28)
+E3 MizrabelGhost       (stage 28)
+E6 MizrabelGhost2      (stage 28)
+E7 MizrabelGhost3      (stage 28)
+EA MagicOrb            Mizrabel's orb, trapping Minnie (stage 28)
+EB Minnie              (stage 28)

@@ -1,5 +1,6 @@
-# Known addresses: <hex address> <name> [code|data]
-# Code labels seed the tracer in tools/trace.py; all names are used by tools/disasm.py.
+# Known addresses: <hex address> <name> [code|data|label]
+# Code labels seed the tracer in tools/trace.py; a label names code inside a traced function (a
+# jump target), with no seed; all names are used by tools/disasm.py.
 
 # Boot and main loop
 000200 EntryPoint code          # reset vector: Sega boot code (TMSS, VDP/Z80/PSG init)
@@ -12,41 +13,106 @@
 
 # Game states: GameStateTable entries, named after the GameState value that selects them.
 # States $18-$26 are jmp stubs into the module at $07A000.
-009C94 GameState_00 code
-009CA6 GameState_02 code
-009CAC GameState_04 code
-009CDE GameState_06 code
-009E96 GameState_08 code
-009F38 GameState_0A code
-0095D2 GameState_0C code
-0097BA GameState_0E code
+009C94 GameState_00 code        # back to the start (after a game over or the ending): a sound, then the module at $07A43A
+009CA6 GameState_02 code        # the Sega logo (set up)
+009CAC GameState_04 code        # the Sega logo (shown, then out)
+009CDE GameState_06 code        # the attract story pages (the attract demo after them)
+009E96 GameState_08 code        # the options screen (set up)
+009F38 GameState_0A code        # the options screen (difficulty, sound test, controls, Boss Rush)
+0095D2 GameState_0C code        # a level start (LoadLevelArt, InitHud, PlayStageMusic...)
+0097BA GameState_0E code        # the frame of play (objects, camera, DemoPlayback, CheckGemTaken, CheckNextPart...)
 00FC50 GameState_10 code
-009D56 GameState_12 code
-00A0B8 GameState_14 code
-00A0FE GameState_16 code
-000408 GameState_18 code
-00040E GameState_1A code
-000414 GameState_1C code
-00041A GameState_1E code
-000420 GameState_20 code
-000426 GameState_22 code
-00042C GameState_24 code
-000432 GameState_26 code
-00A170 GameState_28 code
-00A1C8 GameState_2A code
-00A110 GameState_2C code
-00A158 GameState_2E code
+009D56 GameState_12 code        # the title screen (Press Start)
+00A0B8 GameState_14 code        # the ending (set up)
+00A0FE GameState_16 code        # the ending
+000408 GameState_18 code        # the game over (set up)
+00040E GameState_1A code        # the game over
+000414 GameState_1C code        # the copyright screen (set up)
+00041A GameState_1E code        # the copyright screen
+000420 GameState_20 code        # the castle hall between stages (set up)
+000426 GameState_22 code        # the castle hall between stages
+00042C GameState_24 code        # the stage clear (set up; CheckGemTaken leads here)
+000432 GameState_26 code        # the stage clear
+00A170 GameState_28 code        # the opening story (set up)
+00A1C8 GameState_2A code        # the opening story at a new game
+00A110 GameState_2C code        # Boss Rush's results (ResultsStart, boss_rush.asm)
+00A158 GameState_2E code        # after the final boss: Mizrabel beaten, Minnie freed
+
+# The frame of play (GameState_0E) and what it runs
+009954 DemoPlayback code        # the attract demo: while DemoMode, the pad from the recording at $FFE000 by DemoFrame (1,500 frames at most); Start ends it
+00981C CheckGemTaken code       # the gem taken (GemTaken) and no fade running: GameState $24, ClearObjects
+009878 CheckNextPart code       # the part ended ($FFF412): GameState $0C for the next; through a Library door (LibraryDoor), the stage it leads to
+00F0C0 UpdateBlockAnims code    # the level's animated blocks (32 entries from $FF9400): each one's timer, then its next frame
+00F472 AddBlockAnim code        # an entry of the animated blocks list at $FF9400 from (a1)
+00F512 UpdatePaletteCycles code # the level's cycling colours (entries from $FF9890): each one's timer, then its colours a step on
+001CC0 ClearObjects code        # every object slot cleared (boss_rush.asm)
+
+# The level start (GameState_0C)
+009FF0 SetLevelAndAct code      # Level and Act from StageIndex (the byte tables at $A008 and $A024)
+0099B8 InitHud code             # the HUD at a level start: its parts drawn, the level's graphics sets, ClearObjects
+003CE6 LoadLevelArt code        # this Level and Act's art: a list of VDP addresses and Nemesis sources, NemDec_ToVDP for each
+00F4DC InitBlockAnims code      # the 32 animated-block entries from $FF9400 set up
+009686 PlayStageMusic code      # the music for StageIndex (a table)
+
+# The game states in the module at $07A000 (GameState_18-26 jump there)
+07A530 GameOverSetup label      # GameState $18: the game over: set up (in the module at $07A000)
+07A5E2 GameOver label           # GameState $1A: the game over (in the module at $07A000)
+07A93E CopyrightSetup label     # GameState $1C: the copyright screen: set up (in the module at $07A000)
+07A9A6 Copyright label          # GameState $1E: the copyright screen (in the module at $07A000)
+07A9EE StageClearSetup label    # GameState $24: the stage clear, set up (in the module at $07A000)
+07AADE StageClear label         # GameState $26: the stage clear (in the module at $07A000)
+07B006 LoadLevelPalette code    # the palette for this Level, from the table of them at a1
+07AD42 SpawnObjectList code     # objects of ID d1 into the slots from a0: a count, then each one's ObjSpawnArg, from a1
+07ADE8 CastleHallRebuild label  # the castle hall rebuilt when $FFF41C bit 0 asks: the slots cleared, nine objects $87 (args 0-8), its graphics and palette
+07AB7C CastleHallSetup label    # GameState $20: the castle hall between stages: set up (in the module at $07A000)
+07ADDA CastleHall label         # GameState $22: the castle hall between stages (in the module at $07A000)
+
+# The module at $07A000: its copies of the engine's helpers
+07C0EC SetAnimationB code       # the module's copy of SetAnimation
+07C0E8 NextRoutineSetAnimB code # the module's copy of NextRoutineSetAnim
+07C10E NextRoutineAnimB0 code   # the module's NextRoutineAnim0
+07C112 NextRoutineAnimB2 label  # the module's NextRoutineAnim2
+07C116 NextRoutineAnimB4 code   # the module's NextRoutineAnim4
+07C11A NextRoutineAnimB6 label  # the module's NextRoutineAnim6
+07C11E NextRoutineAnimB8 label  # the module's NextRoutineAnim8
+07C122 NextRoutineAnimB10 code  # the module's NextRoutineAnim10
+07C126 NextRoutineAnimB12 label # the module's NextRoutineAnim12
+07C12A SetAnimationB0 label     # the module's SetAnimation0
+07C12E SetAnimationB2 code      # the module's SetAnimation2
+07C132 SetAnimationB4 code      # the module's SetAnimation4
+07C136 SetAnimationB6 code      # the module's SetAnimation6
+07C13A SetAnimationB8 label     # the module's SetAnimation8
+07C13E SetAnimationB10 label    # the module's SetAnimation10
+07C3EE FillLongs32b code        # d1 into 32 longs from a1 (a copy in the module)
+07C430 CopyLongs32B code        # 32 longs from a1 to a2
+07C460 CopyLongs8B code         # 8 longs from a1 to a2 (CopyLongs32's end)
+07C3D8 FadeInSetup code         # TargetPalette = Palette, then Palette black: what a fade in from black starts with
+07A494 ClearRamBuffer code      # the RAM from $FF0000 cleared ($FB00 bytes)
+
+# From port/src/boss_rush.asm's equates
+00AD0A ClearVramAndScroll code        # clears VRAM and the scroll buffers (boss_rush.asm)
+009C42 UpdateScore code         # the score into the HUD buffer, HudDirty bit 3 when it changed (boss_rush.asm)
+009B4A DrawHud code             # writes the HUD parts flagged in HudDirty (boss_rush.asm)
+07C162 DrawFrame code           # the level-complete screen's border (boss_rush.asm)
 
 # Utilities
 009486 FillLongs32 code         # unrolled fill: d1 to (a1)+, 32 longs
 0094A6 FillLongs16 code         # last 16 longs of the same sequence
 0094B6 FillLongs8 code          # last 8 longs of the same sequence
+07C41E FillLongs8b code         # the same 8-long fill, a copy in the module at $07A000
 0094C8 WriteLongsToPort code    # unrolled d1 to (a1) without increment (VDP data port)
 00950A CopyLongs32 code         # unrolled copy of 32 longs, (a1)+ to (a2)+
 00953A CopyLongs8 code          # last 8 longs of the same sequence
 0095B8 WaitVBlank code          # set VBlankWait, enable interrupts, spin until VInt clears it
 
 # VDP
+00CF3E LoadPalette code         # the colours at (a1) into Palette (each word's bits give its slot; bit 0 ends the list), uploaded at vblank
+00CF44 LoadTargetPalette code   # the same into TargetPalette, what a fade goes to
+07C2A2 ScreenFade code          # fades Palette towards TargetPalette or black by $FFF340 (its sign picks the way)
+07C2FE FadeComponent code       # one colour component of d0 scaled by d2/64
+00E4AE DecompressSetsToRam code # up to 4 sets (a byte each of d0, from the table after it): NemDec_ToRAM
+00E51E DecompressSets code      # up to 4 sets (a byte each of d1): NemDec_ToRAM, or EniDec where bit 0 of the source is clear
+0073E2 DecompressToBuffer code  # set d0 of the table at $4A2D0: NemDec_ToRAM to $FF0000
 00A78E LoadGraphicsSets code    # up to 4 set IDs packed in d0, decompressed to VRAM via NemDec_ToVDP
 00AC50 ClearVRAM code           # DMA fill all of VRAM with 0, then wait for the DMA
 00ADB4 LoadSolidColorTiles code # tiles 0-15 at VRAM $0000, each filled with one palette index
@@ -55,13 +121,203 @@
 
 # Objects
 00C5DC AnimateObject code       # step animation: script at $6(a0), anim $A, frame $B, timer $C
+00C55C ShowFrame label          # the object's current animation frame to $30(a0), without stepping it (AnimateObject's last part)
 001AB6 DrawObject code          # animate, convert to screen space, delete if out of range, build sprites
 001C94 DeleteObject code        # release the spawn-list entry at $24(a0), clear the 64-byte slot
+0018EC RunObjects code          # each of d7+1 slots from a0 with an object (an ID at (a0)): RunObject
+001904 RunObject code           # d0 = the ID at (a0): call its code, from ObjectCodeLow or ObjectCodeHigh
+001D40 ObjectCodeLow data       # the code of objects $00-$C7, a word each, indexed by the ID
+001ED0 ObjectCodeHigh data      # the code of objects $C8 and up, a long each
+001C74 RunRoutine code          # jump to routine ObjRoutine ($3(a0)) of the table at a1 (absolute words)
+001C84 RunRoutineRel code       # the same with the table's words offsets from the table (code above $FFFF)
 001C1E ClipSpriteY code         # keep a sprite piece only if $60 <= Y < $180 (screen Y -32 to 255)
 001C34 ClipSpriteX code         # keep a sprite piece only if $60 <= X < $1E0 (screen X -32 to 351), unless bit 5 of $E(a0)
 001CD2 ApplyVelocity code       # 16.16 position $10/$14(a0) += velocity $18/$1C(a0)
+001CE8 SetAnimation code        # start animation d0: ObjAnim = d0, frame 0, its timer (and $D(a0)) from the animation's second byte
+001CE4 NextRoutineSetAnim code  # ObjRoutine + 1, then SetAnimation
+001D0A NextRoutineAnim0 code    # NextRoutineSetAnim with animation 0
+001D0E NextRoutineAnim2 code    # NextRoutineSetAnim with animation 2
+001D12 NextRoutineAnim4 label   # NextRoutineSetAnim with animation 4
+001D16 NextRoutineAnim6 label   # NextRoutineSetAnim with animation 6
+001D1A NextRoutineAnim8 code    # NextRoutineSetAnim with animation 8
+001D1E NextRoutineAnim10 label  # NextRoutineSetAnim with animation 10
+001D22 NextRoutineAnim12 label  # NextRoutineSetAnim with animation 12
+001D26 SetAnimation0 code       # SetAnimation with animation 0
+001D2A SetAnimation2 code       # SetAnimation with animation 2
+001D2E SetAnimation4 code       # SetAnimation with animation 4
+001D32 SetAnimation6 code       # SetAnimation with animation 6
+001D36 SetAnimation8 label      # SetAnimation with animation 8
+001D3A SetAnimation10 label     # SetAnimation with animation 10
+00A5C0 FindObject code          # a1 = the first slot with ID d0's high word, among the slots d0's low word picks (table at $A5E4); eq if found
+00958E Random code              # d0 = the next pseudo-random number (from RandomSeed)
+# Collision: an object's hitboxes are $20(a0) and $21(a0), each an index into the table at
+# $699CE of 4 bytes (Y offset, height, X offset, width); DrawObject sets them from the frame.
+00926A LoadHitbox code          # a5 = the hitbox $20(a0) names
+00927C LoadHitboxA1 code        # a6 = the hitbox $20(a1) names
+00928E LoadHitbox2 code         # a5 = the hitbox $21(a0) names
+0091F2 HitboxesOverlap code     # a0's hitbox (a5) against a1's (a6)
+009362 HitboxInRect code        # d7 = 1 if a0's hitbox (a5) meets the rectangle at a1 (top, bottom, left, right words)
+009264 TouchesMickey code       # d7 = 1 if the hitbox $20(a0) meets Mickey's rectangle at $FFF330
+009318 BouncedOn code           # d7 = 1 if Mickey lands on it: hitbox $21(a0) against $FFF338 while $FFF40B is set (falling, or rising from above); sets bit 1 of $FFDC31
+0093A2 HitByThrown code         # d7 = 1 if one of Mickey's thrown items (the 5 slots from $FFDC40) hits it; the item is cleared
+009454 BlockAt code             # d7 = the collision type of the block at the object's position + (d2, d1); 0 off the map
+003F8C ProbeBlocks code         # BlockAt for two points (the table at $58BB4 + $30(a0), entry d0); d7 = the first not 0
+00B8A6 ThrowItem code           # if Mickey has items to throw and a free slot from $FFDC40: one fewer, d7 = 1, then the throw
+009C20 ShowThrowCount code      # ThrowCount at most 30, then on the HUD
+0004F0 EnemyToSparkle code      # an enemy beaten: its points (ObjPoints) to Score, then it becomes a Sparkle (object 3)
+001FA2 EnemyContact label       # an enemy each frame: beaten if ObjBeaten or $FFF451 is set, or BouncedOn or HitByThrown; else TouchHurtsMickey
+001FC0 EnemyBeaten label        # a sound, then EnemyToSparkle
+0092D2 TouchHurtsMickey code    # HurtMickey if the hitbox $20(a0) meets Mickey, unless he is flashing (MickeyFlashing) or $FFF450/$FFF447 is set (the invincibility cheat returns first)
+0092B2 TouchHurtsMickey2 code   # the same with the hitbox $21(a0), and $FFF444 set
+0092EE HurtMickey code          # Mickey is hit: MickeyFlashing, one Power less; at none he dies and loses one of Tries (cheats.cpp)
+00187C RunAllObjects code       # per frame: the camera moves pending at $FFF362/$FFF364, then every pool's objects (RunObjects)
+00A592 StartPaletteFade code    # LoadTargetPalette from (a1), then the fade's counters $32-$34(a0)
+058D64 PaletteFadeStep code     # one step of the fade StartPaletteFade began, every $33(a0) frames
+058B9C SetProbes code           # $30(a0) = entry d0 of this Level's table: which points ProbeBlocks tests
+05899E InitPlantObject code     # ObjAnimScript = the forest plants' animations ($5D5FC); ObjTileBase and $2E(a0) from this Level and Act's table for its ID ($2E doubled when $FFFF0D is 1)
+058994 InitMushroomObject code  # the same with the mushrooms' animations ($5CAB2)
 00F32E IsRectVisibleA code      # block rect at $18-$1E(a0) vs CameraA view of $14 x $E blocks (320 x 224)
 00DA9C IsRectVisibleB code      # same test against CameraB, $14 x $C blocks
+
+# Mickey: object $01, in the slot at $FFDC00. His states are ObjRoutine values in pairs, the
+# second facing left (1 and 2 standing, 3 and 4 walking...), from his table at $AF5C; found by
+# logging $FFDC03 while playing stage 1 with scripted presses, and by playing the other stages.
+00AFC2 MickeyStart code         # state 0: Mickey at this Level and Act's start, then MickeyJumpMoving (he drops in)
+00B0A8 MickeyStand code         # states 1/2: standing
+00B0BC MickeyWalk code          # states 3/4: walking
+00B0C8 MickeyJump code          # states 5/6: a jump from standing
+00B0D4 MickeyJumpMoving code    # states 7/8: in the air after a running jump (and dropping in at a stage's start)
+00B0E0 MickeyFall code          # states 9/10: falling from standing, by its code (no jump); not seen in the tests
+00B0EC MickeyFallMoving code    # states 11/12: falling after walking off a ledge
+00B10C MickeyCrouch code        # states 15/16: crouching
+00B11C MickeyLand code          # states 17/18: landing from a standing jump (about 20 frames)
+00B128 MickeyBounce code        # states 19/20: the bounce attack (Down or C again in the air); BouncedOn lands it
+00B15A MickeyThrow code         # states 21/22: throwing, standing
+00B0F8 MickeySlip code          # states 13/14: a small slide from standing, his footing not settled ($FFF410 bits 6/7 not both set; bit 1 or 2 picks the side): seen after stopping, often on stage 3's platforms
+00B166 MickeyThrowInAir code    # states 23/24: throwing in the air, from a standing jump
+00B172 MickeyThrowJumpMoving code  # states 25/26: throwing in the air, from a running jump
+00B17E MickeyThrowCrouching code  # states 27/28: throwing while crouching
+00B18A MickeySlope code         # states 29/30: running down a steep slope
+00B192 MickeyDying code         # states 31/32: dying (sinking into jelly or a liquid, a hit at no power)
+00B1C4 MickeyPitFall code       # states 33/34: falling into a bottomless pit
+00B1E8 MickeyHurt code          # states 35/36: hurt (crushed by the big apple)
+00B1FA MickeySwing code         # states 37/38: holding a swinging vine or rope
+00B292 MickeySwim code          # states 39/40: swimming
+00B2A2 MickeyCarried code       # states 41/42: carried through an underwater tunnel on a set path
+00B322 MickeyPassage code       # states 43/44: through a passage between two floors, hidden, 4 px a frame down or up ($FFF452, from an object $8F touched: stage 15's arched doorway on Hard), then walking on
+00B386 MickeyInCurrent code     # states 45/46: caught by a raging current (stage 12): a hit, then carried where the current goes ($FF9878/$FF9880) until it lets go
+00B3CC MickeyFinaleFall code    # state 47: after the final boss ($FFF45A bit 0): falling to the floor (Y $1D0)
+00B404 MickeyFinaleWalk code    # state 48: walking to X $F0, then $FFF420 set
+00B460 MickeyFinaleWait code    # state 49: waiting for $FFF420 to clear, then animation $4C
+00B47C MickeyFinaleEnd code     # state 50: $A0 frames; at $40 left, object $6C in the slot at $FFDC40
+00BA0A MickeyOnGround code      # each frame on the ground: his movement, collision and the speed limit
+00BA22 MickeyOnGroundStill code # the same, standing still (MickeyStop first)
+00BA3E MickeyInAir code         # each frame in the air: MickeyJumpRise, collision, falling
+00B52E MickeyStop code          # his horizontal speed to 0, unless something pushes him ($FFF456)
+00C8A8 MickeyJumpRise code      # while jump is held: up to 20 frames of rising speed (cheats.cpp)
+00BD6A MickeyFellOff code       # he fell off the stage: no power, one try less (cheats.cpp)
+00CAB2 MickeyToStandLeft label  # state 2 and its animation (2)
+00CABE MickeyToWalk label       # state 3 and its animation (4)
+00CACA MickeyToWalkLeft label   # state 4 and its animation (6)
+00CAD6 MickeyToJump label       # state 5 and its animation (12)
+00CAE2 MickeyToJumpLeft label   # state 6 and its animation (14)
+00CB1E MickeyToCrouch label     # state 15 and its animation (24)
+00CB2A MickeyToCrouchLeft label # state 16 and its animation (26)
+00CB36 MickeyToThrow label      # state 21 and its animation (32)
+00CB42 MickeyToThrowLeft label  # state 22 and its animation (34)
+00CB4E MickeyToThrowInAir label # state 23 and its animation (36)
+00CB5A MickeyToThrowInAirLeft label# state 24 and its animation (38)
+00CB78 MickeyToThrowCrouching label# state 27 and its animation (44)
+00CB82 MickeyToThrowCrouchingLeft label# state 28 and its animation (46)
+00CBD2 MickeyToSwingLeft label  # state 38 and its animation (58)
+00B494 MickeyCheckFinale code   # the final boss beaten ($FFF45A bit 0): MickeyFinaleFall
+00B4F4 MickeyCheckCurrent code  # caught by a current ($FF9864): MickeyInCurrent, and a hit unless flashing
+00B53A MickeyFriction code      # his horizontal speed $1000 nearer 0 each frame, at most $16000 (the walking limit)
+00B56C MickeyCheckPassage code  # a PassageTrigger touched ($FFF452): MickeyPassage
+00B59A MickeyCheckCarried code  # an underwater tunnel's current ($FFF44D): its path, then MickeyCarried
+00B66A MickeyBubbles code       # swimming: a bubble every 32 frames (in the pool at $FFDD80)
+00B6A6 MickeyCheckWater code    # in water ($FFF44B), not yet swimming: MickeySwim
+00B6DC MickeyCheckSwing code    # holding a vine or rope ($FFF447): MickeySwing
+00B794 MickeyFlash code         # while MickeyFlashing counts down: hidden every other frame (ObjFlags bit 2)
+00B9FE MickeySwimMove code      # swimming, each frame: the pad, sinking, moving with collision
+00BA5C MickeyOnSlope code       # each frame on a steep slope: the pad, collision, the slope's speed
+00BA7C MickeySlopeSpeed code    # on a slope: his speed from the slope's ($FFF328), by the way he faces
+00BB2A MickeyGravity code       # his vertical speed: less gravity while jump is held, at most $60000
+00BB60 MickeySinkSpeed code     # swimming: sinking, at most $14000
+00BB7E MickeyMoveSwim label     # swimming: moves him, with the blocks around him (water blocks, types 9-12, let him through)
+00BC30 MickeySwimCeiling code   # swimming: a block above (not water) stops him rising
+00BC50 MickeySwimWallLeft code  # swimming: a block on the left stops him
+00BC80 MickeySwimWallRight code # swimming: a block on the right stops him
+00BCB0 MickeyMoveY code         # moves him by his vertical speed, then the blocks under and above him
+00BD9E MickeyFloorBlock code    # the block under him by its type (BlockAt): floor, slopes, the rest
+00BED0 MickeyBlockAction code   # BlockAt, then what that type of block does (a table per use)
+00BED8 BlockActionJump label    # (the jump through a block-type table)
+00BF06 MickeyLandOnBlock label  # falling onto a block: on its top, if he crossed it this frame
+00BF26 MickeyStandOnBlock label # on the block's top (16-px grid): vertical speed 0, MickeyGround set
+00BF40 MickeyStandOnHalfBlock label# the same on a half block (an 8-px top)
+00BF62 BlockPit label           # a pit block: falling into it ($FFF44E)
+00BF6A BlockHurts label         # a damaging block: a hit unless flashing, knocked up
+00BF9A MickeyCeilingBlock code  # the block above him by its type
+00BFCA MickeyBumpHead label     # a ceiling: his rise stopped, a sound
+00BFEA MickeyCheckDeadly label  # a deadly block (type 7) above his feet: MickeyHazard
+00C006 MickeyEnterWater label   # into water: a sound and a splash (object $93)
+00C022 SpawnSplash code         # object $93 in a free slot from $FFDD80
+00C058 MickeyLeftBlock code     # the block on his left by its type
+00C088 MickeyStopLeft label     # a wall on his left: moving left stopped
+00C0BA MickeyRightBlock code    # the block on his right by its type
+00C0EA MickeyStopRight label    # a wall on his right: moving right stopped
+00C11C MickeySolidObjects code  # Mickey against every object that is solid (ObjFlags bit 5)
+00C142 MickeySolidObject code   # one of them: standing on it, or pushed by its sides
+00C3A4 MickeyLandTo code        # after landing: standing or walking, by his speed and the way he faces
+00C62A MickeySlopeInput code    # the pad on a slope
+00C666 MickeySwimInput code     # the pad while swimming
+00C718 MickeyAirSteer code      # the pad in the air: his horizontal speed, at most $1A000
+00C834 MickeyCheckJump code     # jump pressed on the ground: a sound, rising at $32000
+00C8E8 MickeyWalkInput code     # the pad on the ground, by direction (a table): speed at most $18000
+00C92C MickeyPadNone label      # no direction: friction, and crouching ends
+00C9A6 MickeyPadLeft label      # left: walking left, faster
+00C9BA MickeyPadRight label     # right: walking right, faster
+00CC04 MickeyThrowOrigin code   # where a thrown item starts, by his animation
+00CC48 MickeyThrowSpawn label   # the thrown item: a sound, ID 2, 4 px a frame the way he faces
+00C3C2 MickeyCheckLanding label # the air states: landed (MickeyGround bit 0)? Then walking, standing or crouching, by the pad
+00B95A MickeyCheckGround label  # the ground states: nothing under him? Then falling
+00B72E MickeySwingFrame label   # swinging: his frame from the swing's angle (the port's smooth-swing table at $0C0040)
+00C344 MickeyAnimBounce label   # the bounce attack's animation
+00C382 MickeyAnimLand label     # landing's animation
+00C43E MickeyAnimFallMoving label  # falling off a ledge: its animation, by his speed
+00C476 MickeyAnimFall label     # falling: its animation (a faster fall's from 3 px a frame)
+00C496 MickeyAnimJumpMoving label  # a running jump's animation, by his speed
+00C4FA MickeyAnimJump label     # a standing jump's animation, by his speed
+00C570 MickeyAnimThrowJumpMoving label  # throwing in a running jump: its animation
+00C5B6 MickeyAnimThrowInAir label  # throwing in a standing jump: its animation
+
+00CBE0 MickeySetAnimation code  # animation d0 for Mickey: ObjAnim, frame 0, its timer (his own copy of SetAnimation)
+00CBDC MickeyNextState code     # ObjRoutine + 1, then MickeySetAnimation
+00B84C MickeyGroundInput code   # the pad on the ground (standing, walking, landing, slipping): walk, jump, crouch, throw
+00B87E MickeyAirInput code      # the pad in the air after a standing jump or fall
+00B948 MickeyAirInputMoving code  # the same after a running jump or walking off a ledge
+00B824 MickeyCrouchInput code   # the pad while crouching
+00B7B8 MickeyThrowInput code    # the throws' own frames (each throwing state)
+00B8D8 MickeyBounceInput code   # the pad during the bounce attack
+00BAF0 MickeyCheckSlip code     # standing: MickeyToSlip or MickeyToSlipLeft when his footing isn't settled
+00BAA8 MickeySlipEnd code       # slipping: back to standing once both feet are settled ($FFF410 bits 6 and 7)
+00CA4A MickeyCheckHurt code     # a hit from TouchHurtsMickey2 ($FFF444 bit 0): MickeyToHurt
+00CA64 MickeyCheckPitFall code  # fallen into a pit ($FFF44E bit 0): a sound, MickeyToPitFall
+00CAA6 MickeyToStand code       # state 1 and its animation (0)
+00CAEE MickeyToJumpMoving code  # state 7 and its animation (8)
+00CAFA MickeyToJumpMovingLeft code# state 8 and its animation (10)
+00CB06 MickeyToSlip code        # state 13 and its animation (20)
+00CB12 MickeyToSlipLeft code    # state 14 and its animation (22)
+00CB64 MickeyToThrowJumpMoving code# state 25 and its animation (40)
+00CB6E MickeyToThrowJumpMovingLeft code# state 26 and its animation (42)
+00CB8C MickeyToSlope code       # state 29 and its animation (48)
+00CB96 MickeyToSlopeLeft code   # state 30 and its animation (50)
+00CBA0 MickeyToDying code       # state 31 and its animation (52)
+00CBAA MickeyToPitFall code     # state 33 and its animation (60)
+00CBB4 MickeyToPitFallLeft code # state 34 and its animation (62)
+00CBBE MickeyToHurt code        # state 35 and its animation (54)
+00CBC8 MickeyToSwing code       # state 37 and its animation (56)
+00BFF8 MickeyHazard code        # a deadly hazard: Mickey is dead (cheats.cpp)
 
 # Object spawning (spawn grid of 128 x 128 px cells at SpawnGrid)
 06D52A UpdateSpawns code        # per frame: SpawnColumn when CameraA X crosses a 128 px boundary
@@ -100,9 +356,192 @@
 07FC7A NemDec_WriteVDP_XOR code
 07FC86 NemDec_WriteRAM code
 07FC90 NemDec_WriteRAM_XOR code
+07FCEE EniDec code              # Enigma decompression of (a0) to (a1), d0 added to each word (tilemaps)
+07FE5C EniDec_Read code         # its bit reader
 
 # Interrupts
 00CF92 VInt code                # vertical blank, IRQ 6
 00D036 VInt_ModeTable data      # bra table, indexed by VIntMode
 00D478 VInt_Lag code            # VBlankWait was clear: the main loop did not finish the frame
 00D4C6 HInt code                # horizontal blank, IRQ 4: per-line vertical scroll
+
+# The port's own routines for its ROM patches (port/src/patches.cpp, port/src/smooth_swing.cpp),
+# in the image family's base program; config/patches.txt calls them by these names. Widescreen's
+# in the $FF padding at the end of the ROM (docs/widescreen.md):
+07FED6 WideSpawnRowStart label  # widescreen: a spawn row starts from the cell left of camera X - 40's
+07FEE4 WideViewStartA label     # widescreen: IsRectVisibleA's first block 3 earlier (not below 0)
+07FEF2 WideViewStartB label     # widescreen: IsRectVisibleB's first block 3 earlier (not below 0)
+07FF00 WideCameraMin label      # widescreen: InitCamera's minimum Y 0, minimum X 40
+07FF24 WidePlayerLeftWall label # widescreen: CameraFollow's left wall on the original minimum (40 as 0) + 16
+07FF36 WideClampCameras label   # widescreen: both cameras clamped to their limits before the initial plane fill
+07FF4C WideClampCamera label    # its clamp of the camera at a0 (minimum, then maximum, as UpdateCamera)
+07FF6E WideCameraMax label      # widescreen: InitCamera's maximum X width - 360 (the arenas locked at 192: - 320)
+07FF8A WideDeleteRange label    # widescreen: DrawObject deletes objects past 168 left or from 552 right
+07FFA0 WideSpawnColumn label    # widescreen: UpdateSpawns' column test on X -/+ 40 (stage 25 moving right: X)
+# Smooth swinging's, from $0C0000 (past the end of the ROM):
+0C0000 SwingStartStep label     # smooth swinging: a vine's starting step ($29) x 6 into $B
+0C0020 SwingOffset label        # smooth swinging: Mickey's offset from the vine ($36, $32) from the step's table entry
+0C0040 SwingPoseStep label      # smooth swinging: Mickey's pose from the original step (step / 6, in d5)
+
+# Level start, cameras and per-stage frame effects ($D000-$FFFF): StageSetup's table at $DC86
+# (by Level, then Act; stage numbers from the tables at $A008/$A024), the level header's first
+# word ($9808) picking the frame effect (table at $F6FE), its second ($9802) CameraB's mode.
+00DC2A StageSetup code # GameState_0C: clears $FF9800-, $FF2000-; palette cycles from $F660; then the stage's own set-up from the table at $DC86 (by Level, then Act)
+00DCCC StageSetup01 code # Level 0 act 0: one more set, then StageSetupLevel0
+00DCD6 StageSetupLevel0 code # stages 1, 3 and 5 (stage 1's runs into it): $9800 bit 0, art, palette, block animation $FEFC, marks 24 cells of $FF5000
+00DDE2 StageSetup02 code # Level 0 act 1: art, palettes, BgScrollPerLine
+00DD52 StageSetup03 code # Level 0 act 2 (and the unused act 4): one set, then StageSetupLevel0
+00DD8C StageSetup04 code # Level 0 act 3: art, palette, palette cycles 1 and 5
+00DD62 StageSetup05 code # Level 0 act 5: art, StageSetupLevel0, palette
+00DE26 StageSetup06 code # Level 1 act 0
+00DE8C StageSetup07 code # Level 1 act 1
+00DEC8 StageSetup08 code # Level 1 act 2
+00DF0E StageSetup09 code # Level 1 act 3
+00DF46 StageSetupLevel1 code # stages 6-9: $9800 bit 0, block animation from a1, art, the $FF7000 pointers, tile words at $FF0470 and $FF0658
+00DFC6 StageSetup10 code # Level 2 act 0
+00E07C StageSetup11 code # Level 2 act 1
+00E0DE StageSetup12 code # Level 2 act 2
+00E15A StageSetup13 code # Level 2 act 3
+00E1A6 StageSetup14 code # Level 3 act 0
+00E1CC StageSetup15to18 code # Level 3 acts 1-4
+00E286 StageSetup19to21 code # Level 3 acts 5-7: art, BgScrollPerLine, rows repeated into $FF5000 and $FF2000, BgWaveStep run 320 times
+00E216 StageSetup22 code # Level 3 act 8
+00E22C StageSetup23 code # Level 3 act 9
+00E39E StageSetup24 code # Level 4 act 0
+00E3C0 StageSetup25 code # Level 4 act 1
+00E406 StageSetup26 code # Level 4 act 2
+00E418 StageSetup27 code # Level 4 act 3
+00E47E StageSetup28 code # Level 5 act 0
+00E802 FillWordsAscending code # d1, d1+1, ... to (a1)+, d7+1 words
+00E80C CopyVramWords code # d7+1 words from VRAM d0 to VRAM d1, one at a time through the data port
+00E842 BgScrollPerLine code # $9870 = 3, VDP horizontal scroll per line ($8B03), $F302 = 4, the table at $FF9000 cleared
+00E858 BgScrollPerCell code # $9870 = 2, the same; UpdateCameras then scrolls plane B by 8-line rows
+00E32C RepeatRows16 code # 16 rows of 16 bytes from a2 to a1, each written d6+1 times
+00F650 ClearPaletteCycles code # the 9 words at $9894 (the palette cycles' slots)
+00F5E2 StartPaletteCycle code # cycle d0 from the table at ($9890): a free slot of three, its first colours into $F800
+00EDF0 FillPlanes code # LoadLevelHeader's end: 33 block columns of both planes from the cameras' X (plane B written whole when $9800 bit 0)
+00EE7C FillPlaneColumn code # FillPlanes: the column 8 blocks left of X d0, through StreamColumnAt
+00EE8C WriteBlockRowToVdp code # 32 blocks from (a0)+ through the block table a1 (offset d3 in each) to the VDP data port
+00F9B4 StreamColumnAt label # StreamColumn's work: block column d1 of the camera at a6 into its buffer ($FF1000 or $FF1200)
+00FA30 DrawColumnBlocks code # a column of blocks into a plane buffer: each block's four tile words, the layout read downwards
+00FA68 DrawColumnBlocksFlipped code # the same with the layout read upwards and each tile's vertical flip bit toggled ($9801 set, CameraA)
+00F96A DrawRowBlocks code # a row of blocks into a plane buffer (UpdateCamera's rows)
+00F7A4 UpdateCameras code # UpdateCamera for CameraA, UpdateCameraB; plane B's line scroll from $FF9000 when $9800 bit 0 ($9870 2 or 3)
+00F6E4 UpdateScrolling code # from Mickey's code: CameraFollow, UpdateCameras, then the stage's frame effect by $9808 (the level header's first word)
+00FB10 UpdateCameraB code # CameraB's velocity from CameraA by $9802 (the level header's second word), table at $FB20
+00FB7A CameraBMode0 code # CameraB stays (stages 12, 28)
+00FB38 CameraBMode1 code # CameraB at Y 7/8, X 1/2 of CameraA's
+00FB44 CameraBMode2 code # Y 1/2, X 1/2
+00FB5A CameraBMode3 code # Y 1/11, X 1/2
+00FB6C CameraBMode4 code # X 1/2, Y stays
+00FB7C CameraBMode5 code # Y and X as CameraA's
+00FBAA CameraBMode6 code # Y as CameraA's, X 7/8
+00FB4C CameraBMode7 code # Y 2/3, X 1/2
+00FBCA CameraBMode8 code # Y 1/2, X 1/2 (as mode 2)
+00FBD2 CameraBMode9 code # as CameraA's (set at once), then BgWaveStep (stages 19-21)
+00FBBA CameraBMode10 code # Y as CameraA's, X 5/4
+00FB86 CameraBMode11 code # Y 2/5, X 1/4
+00FBEA BgWaveStep code # the line-scroll wave: $FF4000 moved on a long, a step ($F2D4) reversed every $F2D8 frames, every other word to $FF9000
+00D530 StageEffect01 label # stages 1 and 3, by $9808: palette line 3 cleared while Mickey is below Y $180; a colour at $F7F8 changed at random times
+00D5D2 StageEffect02 label # stage 2: plane B's line-scroll table, then a palette pair stepped every 8 frames up to 12 ($9872)
+00D66C EraseRequestedBlock code # stage 7's frame effect (stage 8's starts with it): when $F413, the 2 x 2 blocks at Y $F34C, X $F34E made 0 in the layout and plane A
+00F2B4 DrawBlocksToPlane code # d1+1 x d2+1 blocks from (a1) into the layout at a2 and the plane at VDP address d0
+00D6EC StageEffect08 label # stage 8: EraseRequestedBlock, $9877 counted down; $F442 sets GameState $10
+00D712 StageEffect10 label # stage 10: a plane fill past X $E30 when $FF0D is 2, plane B's scroll stepped, colours $F7A8 rotated every 5 frames
+00D794 StageEffect11 label # stages 11 and 13: plane B's scroll from X / 4, colours $F7F6 rotated every 17 frames, then StageEffect11Colors
+00D7D4 StageEffect11Colors code # colours $F7C2-$F7CE rotated every 3 frames (StageEffect11's end, StageEffect12's start)
+00D804 StageEffect12 label # stage 12: StageEffect11Colors, a step by $9876 (StageEffect12_0-5) moving CameraB, a flag at $9864 by Mickey's Y
+00D886 StageEffect12_0 label # waits $9872 frames, then $9800 bit 1 and sound $C8
+00D8A4 StageEffect12_1 label # $9880 up by $3000 a frame to $180000
+00D8CA StageEffect12_2 label # waits $9872 frames, sound $C8
+00D8E6 StageEffect12_3 label # $9880 up by $6000 to $400000, $9878 accelerating
+00D920 StageEffect12_4 label # waits, then writes 1 to the sound driver's $A01C08
+00D964 StageEffect12_5 label # $9880 back down to $100000, then all reset and a random wait (back to step 0)
+00D9C6 StageEffect22 label # stages 22 and 23: line scroll at $FF9020 from CameraB's X / 2
+00D9E4 StageEffect24 label # stage 24: palettes by what CameraB shows and Mickey's Y past $3B0; palette cycle 0
+00DAD2 StageEffect25 label # stage 25: colours $F7EC-$F7F0 rotated every 16 frames
+00DAFE StageEffect26 label # stages 26 and 27: colours $F7D4-$F7D8 rotated every $9873 frames
+00DB2A StageEffect28 code # stage 28 (and the ending's $A15E): horizontal scroll for 224 lines, 7 bands at different speeds
+00D03A VIntMode1 label # VInt_ModeTable entry 1 (VIntMode 1, StageSetup's): a DMA from $FFF500 to VRAM $E800, FlushPlaneUpdates, UploadMickeyFrame, VIntFinish
+00D03E VIntMode2 label # VInt_ModeTable entry 2
+00D042 VIntMode3 label # VInt_ModeTable entry 3: as mode 2 (unless VIntDmaRequest is 7 or more), then the one DMA VIntDmaRequest picks (VIntDma0-8)
+00D046 VIntMode4 label # VInt_ModeTable entry 4 (BgScrollPerLine/Cell's): as mode 1, then a DMA from $FFEC00 (the line-scroll table) to VRAM $EC00
+00D04A VIntMode5 label # VInt_ModeTable entry 5
+00D04E VIntMode6 label # VInt_ModeTable entry 6: VIntFinish only
+00D446 VIntFinish label # every VInt mode's end: RandomStep, ReadPad, the frame counters at $F304/$F306, registers back, rte
+00D486 UploadMickeyFrame code # when $F404 bit 0: Mickey's frame (ObjFrame of the slot at $FFDC00) from the table at $16B80 to VRAM $0800
+00D506 RandomStep code # VInt's step of RandomSeed (seeded $2A6D3651 when 0)
+00AE4E ReadPad code # pad 1 through $A10003: PadHeld, and PadPressed (newly pressed)
+00F11A BlockAnimStep code # UpdateBlockAnims: one block animation's frame: QueueBlockAnimDma, then the next frame (or the slot cleared)
+00F14C BlockAnimNextFrame code # frame ($12) + 1, back to 0 past the last ($13)
+00F162 QueueBlockAnimDma code # the frame's tiles as a DMA (VDP registers $93-$97, destination) on the queue at ($9828)
+00F378 BlockAnimHandler code # the block animation's own code by its byte 1, table at $F390 (none when 0)
+00F3C4 BlockAnimByMickey label # BlockAnimHandler 2: picks the animation ($8 = $10304 or $10300) by whether Mickey is within its area
+00F4EE ClearBlockAnim code # the 32-byte block animation slot at a0 cleared
+00F1F0 FlushDmaQueue code # from VInt: each DMA on the queue at $982E written to the VDP, up to the -1 that ends it
+00F5B6 PaletteCycleColours code # UpdatePaletteCycles: slot d4's colours, a0 in Palette, a5 in $F800, d3 its count
+00FEB6 InCameraBRangeY code # the cake building and cream dome: every flag set when d1 + $18 is within CameraB's Y to Y + $170
+00FDB8 DivideLong code # d2 / d7 with a 32-bit quotient (two divu)
+
+# The bosses' inner routines (their callers are the boss objects' routines)
+010498 BossFlashColours code # the bosses' hit flash: on odd ObjTimer the colours of palette line 1 whose bits are set in d0 white ($EEE), on even the line back from $F820
+01254C AccelVelYMax5 code # ObjVelY += the long at $36, its size held to $50000 (the old oak's acorns, the jack-in-the-box's parts)
+011B28 AccelVelYMax6 code # ObjVelY += the long at $36, at most $60000 (falling; StormMenRisingMove's end)
+012D8A AccelVelXMax6 code # ObjVelX += the long at $32, its size held to $60000
+0125A2 JackInTheBoxPlaceParts code # the parts in slots $D440, $D480, $D4C0, $D500 placed from the slot at $D400 (d0 lower)
+01250E JackInTheBoxTowardMickey code # ObjVelX +/-1 toward Mickey's X, and the facing byte of slots $D440 and $D480 with it
+0134EA DragonHeadPlacePart code # the slot at $D440 placed beside the head ($1C pixels the way it faces, $10 up), animation 4 or 6
+013534 DragonHeadPlaceBeside code # the object at a1 placed beside the head ($24 pixels the way it faces, 8 up)
+013850 OafLegsPlaceParts code # the slots at $D440 and $D400 placed above the legs ($30 and $18 up), X by the animation frame and facing
+0138C0 OafLegsPlacePartsHigh code # the same, $40 and $28 up, X as the legs'
+0109F6 MizrabelLaunchPieces code # objects $E3/$E6 from slot $D500 on (up to 8) put at her position with a velocity each from the table at $68942; $E7 marked
+010AAE MizrabelSpawnD1 code # every 8 frames: sound $A1, an object $D1 at (252, 352), its velocity the next of 8 from the table at $6890A
+010B22 MizrabelJitterY code # every 2 frames Y moved by $29, whose sign then flips
+010B98 MizrabelGhostSpawn code # an object d5 at the slot $D400's position, offsets and velocity from the table at $688DA (entry d7)
+010D84 MizrabelGhostNextMove code # velocity and ObjTimer from the tables at $6887A/$68862 by $26
+01179C TotemSegmentSpawnPieces code # six objects $D8 around it, each with a random velocity up and left when d5
+011AC4 StormMenRisingMove code # ApplyVelocity, turning at X limits from the slot at $D410's X, then landing on blocks or falling (AccelVelYMax6)
+
+# The module at $07A000: its own copies of engine helpers (B) and its drawing helpers
+07C146 RunRoutineRelB code # the module's RunRoutineRel: entry ObjRoutine of the table at a1, words offsets from the table
+07C156 DrawTileMapFromList code # DrawByteTileMap with its arguments from (a1)+: a VDP address, width, height, tile base
+07C272 DrawByteTileMap label # d2+1 rows of d1+1 tiles, each a byte from (a1)+ plus d3, to the VDP from address d0, rows $100 bytes apart
+07C0D6 ClearObjectsB label # the object slots from $FFD000 cleared (4 KB)
+07C098 ApplyVelocityB label # the module's ApplyVelocity: 16.16 position $10/$14(a0) += velocity $18/$1C(a0)
+07C0AA DeleteObjectB code # the module's DeleteObject: the spawn entry at $24(a0) released, then the 64-byte slot cleared
+07C234 DrawBlockMap32 code # 32 x 32 blocks from (a1)+ (each 2 x 2 tiles from the table at a2) to the VDP from address d0
+07C468 CopyLongs4B label # 4 longs from a1 to a2
+07C2D2 ScreenFadeStep code # ScreenFade's step: all 64 colours of Palette one step towards TargetPalette (FadeComponent x 3), then WaitVBlank
+07C1C0 NumberDigitsBlank code # d0's 8 decimal digits as tiles ($E010 + digit) into $F2F0, leading zeros blank (-1)
+07C1C4 NumberDigits code # the same with the leading zeros
+07C1D0 ScoreDigits code # the same from tile $8010 (UpdateScore)
+07AB56 NumberDigitsBlankTo code # NumberDigitsBlank, then the 8 digits to a2
+07AB5C NumberDigitsTo code # NumberDigits, then the 8 digits to a2
+
+# VInt mode 3's DMAs (by VIntDmaRequest, table at $D1D8) and more of the bosses
+00D1EA VIntDma0 label # VIntMode3 with VIntDmaRequest 0: no DMA, VIntFinish
+00D1EE VIntDma1 label # VIntMode3's DMA 1: $1000 words from $FF1020 to VRAM $C000
+00D22A VIntDma2 label # VIntMode3's DMA 2: $810 words from $FF0000 to VRAM $5400
+00D266 VIntDma3 label # VIntMode3's DMA 3: $800 words from $FF3000 to VRAM $9400
+00D2A2 VIntDma4 label # VIntMode3's DMA 4: $5B0 words from $FF4000 to VRAM $A400
+00D2DE VIntDma5 label # VIntMode3's DMA 5: $1C0 words from $FF4B60 to VRAM $1200
+00D31A VIntDma6 label # VIntMode3's DMA 6: $3D0 words from $FF0000 to VRAM $2A00
+00D356 VIntDma7 label # VIntMode3's DMA 7: $450 words from $FF7080 to VRAM $8840
+00D392 VIntDma8 label # VIntMode3's DMA 8: $F40 words from $FF5200 to VRAM $6000
+0109BE MizrabelEraseTiles code # every 13th byte of the tiles at $FF5200-$FF7080 from offset $26 cleared, then VIntDma8 (VIntMode 3 for one frame, then 4)
+013564 DragonSegmentMove code # the segment at a1 moved by its velocity (Y only when the head's $29 bit 6 is clear)
+01357E DragonSegmentFollow code # the segment at a1's velocity 1/8 of the way to the one at a2, then DragonSegmentMove
+0136FA DragonSegmentPose code # the segment at a1's animation (8 or 10, by the signs) and frame (0-5, by dy against dx) toward the one at a2
+0135D6 DragonSegmentsAdd code # each segment follows the next and takes its pose; while the last is above Y $1E0, one more (object $CD) at Y $1F8, count $26 + 1
+01364A DragonSegmentsRemove code # the segments follow back; the last pulled down, and past Y $200 marked (ObjFlags bit 0) and the count $26 - 1; the head placed on the slot at $D440
+013804 OafLegsWalkStep code # on frame 0 of animation 2 or 3, X moved 6 or 4 the way it faces; otherwise OafLegsPlaceParts
+
+# The HUD's helpers (InitHud, DrawHud, UpdateScore and what changes the power and tries)
+009BB0 ShowPower code # Power (at most 5) as five HUD tiles into $F244 ($807C each one left, $807D each one gone), HudDirty bit 0
+009BE4 ShowTries code # Tries (at most 10) as two digit tiles into $F234 (TwoDigitTiles), HudDirty bit 1
+009C06 TwoDigitTiles code # d0's tens and units as tiles $8010 + digit: the tens in the high word, the units in the low
+009A2A FillHudRows code # four plane rows from VRAM $BC00 filled with a pair of tiles each (FillHudRow)
+009A6A FillHudRow code # d4 (two tile words) 32 times to the VDP data port
+009AC4 DrawHudLayout code # InitHud: the HUD's tiles from the table at $9A74, two more, and the stage's own pair (by StageIndex, its number into $F350)
+009542 CopyLongs4 code # 4 longs from a1 to a2
+009584 CopyLongs4ToPort label # 4 longs from a1 to the port at a2

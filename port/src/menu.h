@@ -21,6 +21,8 @@ struct MenuState {
     float* clean_edge_line_width;   // edited in place
     bool* clean_rock_edges;     // edited in place
     bool* smooth_fades;         // edited in place
+    bool* smooth_water;         // edited in place
+    bool* smooth_glass;         // edited in place
     bool* remove_sprite_limit;  // edited in place
     bool* vsync;                // edited in place
     bool* show_fps;             // edited in place
@@ -34,6 +36,11 @@ struct MenuState {
     int quick;                  // the Quick Settings in use (Quick in settings.h)
     const char* busy;           // a task under way, shown over the game (nullptr: none)
     float busy_progress;        // its progress, 0-1 (below 0: none to show)
+    bool* show_coordinates;     // edited in place
+    int stage_index;            // the game's stage index ($FFFF42), for the coordinates
+    int game_state;             // GameState ($FFF300)
+    int mickey_x, mickey_y;     // Mickey's position in the level ($FFDC10, $FFDC14)
+    int camera_x, camera_y;     // CameraA ($FFFA84, $FFFA80)
 };
 
 enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, ImportMdPlus, OpenSettingsFolder, GoToStage, QuickSettings };

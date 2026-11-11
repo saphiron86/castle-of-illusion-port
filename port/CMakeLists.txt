@@ -28,11 +28,19 @@ set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${THIRD_PARTY}/SDL ${CMAKE_BINARY_DIR}/SDL EXCLUDE_FROM_ALL)
 
+# A release build with translated code as the only CPU: Musashi isn't built or linked (only its
+# header, for the register names), the translator (COI_JIT) is, and it translates at once.
+option(COI_NO_INTERPRETER "Translated code only: no Musashi (implies COI_JIT)" OFF)
+if(COI_NO_INTERPRETER)
+    set(COI_JIT ON)
+endif()
+
 # --- Musashi 68000 core ------------------------------------------------------
 # m68kmake generates the opcode handlers from m68k_in.c at build time. Cross-compiling (the
 # Android build) it can't run what it builds, so it uses the m68kmake of the desktop build
 # (build/port), which has to be built first.
 set(MUSASHI ${THIRD_PARTY}/Musashi)
+if(NOT COI_NO_INTERPRETER)
 set(MUSASHI_GEN ${CMAKE_BINARY_DIR}/musashi)
 if(CMAKE_CROSSCOMPILING)
     find_program(M68KMAKE m68kmake NO_DEFAULT_PATH PATHS
@@ -56,10 +64,12 @@ add_library(musashi STATIC
     ${MUSASHI}/m68kcpu.c
     ${MUSASHI}/m68kdasm.c
     ${MUSASHI}/softfloat/softfloat.c
-    ${MUSASHI_GEN}/m68kops.c)
+    ${MUSASHI_GEN}/m68kops.c
+    src/musashi_regs.c)
 # Our configuration (src/musashi_conf.h) wraps Musashi's own m68kconf.h.
 target_include_directories(musashi PUBLIC ${MUSASHI} ${MUSASHI_GEN} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(musashi PUBLIC MUSASHI_CNF="musashi_conf.h" PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 
 # --- ymfm (YM2612) and the Z80 core ------------------------------------------
 file(GLOB YMFM_SOURCES ${THIRD_PARTY}/ymfm/src/*.cpp)
@@ -130,6 +140,7 @@ set(PORT_SOURCES
     src/fade.cpp
     src/menu.cpp
     src/patches.cpp
+    src/rom_family.cpp
     src/settings.cpp
     src/smooth_scroll.cpp
     src/smooth_swing.cpp
@@ -158,6 +169,147 @@ else()
         target_link_options(coi PRIVATE -static-libstdc++ -static-libgcc)
     endif()
 endif()
-target_link_libraries(coi PRIVATE musashi ymfm z80 imgui ${SDL_LIBRARY})
+if(COI_NO_INTERPRETER)
+    target_link_libraries(coi PRIVATE ymfm z80 imgui ${SDL_LIBRARY})
+    target_include_directories(coi PRIVATE ${MUSASHI} ${CMAKE_CURRENT_SOURCE_DIR}/src)     # m68k.h only
+    target_compile_definitions(coi PRIVATE MUSASHI_CNF="musashi_conf.h" COI_NO_INTERPRETER)
+else()
+    target_link_libraries(coi PRIVATE musashi ymfm z80 imgui ${SDL_LIBRARY})
+endif()
+
+# --- The translator (port/recomp, docs/native.md) ------------------------------------------
+# COI_JIT (on by default): the app's own 68000 translator. The game's code runs as machine
+# code (x86-64 or ARM64) translated from the player's ROM as the app runs (--jit, always on), with
+# the interpreter for anything it doesn't translate; --native-test checks it against the
+# interpreter. No game code is built in: only config/recomp.txt and the tracer's lists
+# (config/recomp_functions.txt, recomp_sites.txt), which hold addresses.
+option(COI_JIT "Build the app's own 68000 translator (on by default; --no-native turns it off)" ON)
+set(RECOMP_CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/../config/recomp.txt)
+set(RECOMP_FRONT recomp/decode.cpp recomp/lower.cpp recomp/program.cpp)
+set(COI_TRANSLATOR ${COI_JIT})
+# Local development builds (not in the public tree) add their own options here.
+include(${CMAKE_CURRENT_SOURCE_DIR}/native_dev.cmake OPTIONAL)
+
+# --- The readable C (docs/decompile.md) -----------------------------------------------------
+# With -DCOI_READABLE=ON the build generates the game's code as readable C from your ROM (the
+# first 512 KB .bin in rom/, or -DCOI_READABLE_ROM=<file>), into the build folder only: the
+# repository and the downloads never hold it. coi_family writes the image family the port's
+# settings patch (rom_family.h), coi_recomp --readable translates it with config/ (names, notes,
+# the hand-written patches in patches.txt) into generated/readable.c and resume.c, and coi runs
+# it: the readable C for your ROM with any mix of settings, the translator for anything else (an
+# MD+ pack's ROM). Desktop builds only (it runs the two tools on the build machine).
+option(COI_READABLE "Build the readable C from your ROM (rom/) into the build" OFF)
+set(COI_READABLE_ROM "" CACHE FILEPATH "With COI_READABLE: the ROM (default: the first 512 KB .bin in rom/)")
+# Development: -DCOI_NATIVE=ON -DCOI_NATIVE_ROM=<an image> translates that one image into plain C
+# (-DCOI_DECOMP=ON: readable C) and links it in, for checking against the interpreter
+# (--native-test, docs/native.md); the image must be the one the run patches (coi --save-rom).
+option(COI_NATIVE "Build the C translation of one ROM image (needs COI_NATIVE_ROM)" OFF)
+option(COI_DECOMP "With COI_NATIVE: translate into readable C" OFF)
+set(COI_NATIVE_SWEEP "" CACHE STRING "Optional: the function list to translate (default: config/recomp_functions.txt)")
+set(NATIVE_ROM_DEPENDS "")
+if(COI_READABLE AND NOT CMAKE_CROSSCOMPILING)
+    set(READABLE_ROM "${COI_READABLE_ROM}")
+    if(NOT READABLE_ROM)
+        file(GLOB ROM_CANDIDATES ${CMAKE_CURRENT_SOURCE_DIR}/../rom/*.bin)
+        foreach(candidate ${ROM_CANDIDATES})
+            file(SIZE ${candidate} candidate_size)
+            if(candidate_size EQUAL 524288 AND NOT READABLE_ROM)
+                set(READABLE_ROM ${candidate})
+            endif()
+        endforeach()
+    endif()
+    if(NOT EXISTS "${READABLE_ROM}")
+        message(FATAL_ERROR "COI_READABLE needs your ROM: a 512 KB .bin in rom/, or -DCOI_READABLE_ROM=<file>")
+    endif()
+    message(STATUS "Readable C from ${READABLE_ROM}")
+    add_executable(coi_family src/coi_family.cpp src/rom_family.cpp src/patches.cpp src/smooth_swing.cpp
+        src/boss_rush.cpp src/cheats.cpp)
+    target_compile_definitions(coi_family PRIVATE _CRT_SECURE_NO_WARNINGS)
+    set(FAMILY_DIR ${CMAKE_CURRENT_BINARY_DIR}/family)
+    add_custom_command(
+        OUTPUT ${FAMILY_DIR}/base.bin ${FAMILY_DIR}/family.txt
+        COMMAND coi_family ${READABLE_ROM} ${FAMILY_DIR}
+        DEPENDS coi_family ${READABLE_ROM}
+        COMMENT "The ROM images the port's settings make (coi_family)")
+    set(COI_NATIVE ON)
+    set(COI_DECOMP ON)
+    set(COI_NATIVE_ROM ${FAMILY_DIR}/base.bin)
+    set(NATIVE_ROM_DEPENDS ${FAMILY_DIR}/family.txt)
+elseif(COI_READABLE)
+    message(FATAL_ERROR "COI_READABLE runs its tools on the build machine: not in a cross build")
+endif()
+if(COI_NATIVE AND NOT CMAKE_CROSSCOMPILING)
+    if(NOT COI_READABLE AND NOT EXISTS "${COI_NATIVE_ROM}")
+        message(FATAL_ERROR "COI_NATIVE needs -DCOI_NATIVE_ROM=<the ROM image>")
+    endif()
+    add_executable(coi_recomp ${RECOMP_FRONT} recomp/recomp_main.cpp recomp/readable.cpp recomp/cycles68000.c
+        ${MUSASHI}/m68kdasm.c)
+    target_include_directories(coi_recomp PRIVATE ${MUSASHI} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(coi_recomp PRIVATE MUSASHI_CNF="musashi_conf.h" _CRT_SECURE_NO_WARNINGS)
+    set(NATIVE_LIST ${COI_NATIVE_SWEEP})
+    if(NOT NATIVE_LIST)
+        set(NATIVE_LIST ${CMAKE_CURRENT_SOURCE_DIR}/../config/recomp_functions.txt)
+    endif()
+    # (its computed jumps: sites.txt beside a tracer's subroutines.txt, recomp_sites.txt beside
+    # config/recomp_functions.txt)
+    get_filename_component(NATIVE_LIST_DIR ${NATIVE_LIST} DIRECTORY)
+    set(NATIVE_LIST_DEPENDS ${NATIVE_LIST})
+    foreach(sites sites.txt recomp_sites.txt)
+        if(EXISTS ${NATIVE_LIST_DIR}/${sites})
+            list(APPEND NATIVE_LIST_DEPENDS ${NATIVE_LIST_DIR}/${sites})
+        endif()
+    endforeach()
+    set(CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../config)
+    if(COI_DECOMP)
+        set(NATIVE_CODE ${CMAKE_CURRENT_BINARY_DIR}/generated/readable.c)
+        set(RESUME_CODE ${CMAKE_CURRENT_BINARY_DIR}/generated/resume.c)
+        add_custom_command(
+            OUTPUT ${NATIVE_CODE} ${RESUME_CODE}
+            COMMAND coi_recomp --readable ${COI_NATIVE_ROM} ${RECOMP_CONFIG} ${NATIVE_CODE} ${RESUME_CODE} ${NATIVE_LIST}
+            DEPENDS coi_recomp ${RECOMP_CONFIG} ${CONFIG_DIR}/labels.txt ${CONFIG_DIR}/ram.txt ${CONFIG_DIR}/hardware.txt
+                ${CONFIG_DIR}/objects.txt ${CONFIG_DIR}/object_ids.txt ${CONFIG_DIR}/object_fields.txt
+                ${CONFIG_DIR}/port_labels.txt ${CONFIG_DIR}/patches.txt ${COI_NATIVE_ROM} ${NATIVE_ROM_DEPENDS}
+                ${NATIVE_LIST_DEPENDS}
+            COMMENT "Translating the game's 68000 code from your ROM into readable C")
+        target_sources(coi PRIVATE ${NATIVE_CODE} ${RESUME_CODE})
+    else()
+        set(NATIVE_CODE ${CMAKE_CURRENT_BINARY_DIR}/generated/native_code.c)
+        add_custom_command(
+            OUTPUT ${NATIVE_CODE}
+            COMMAND coi_recomp ${COI_NATIVE_ROM} ${RECOMP_CONFIG} ${NATIVE_CODE} ${NATIVE_LIST}
+            DEPENDS coi_recomp ${RECOMP_CONFIG} ${COI_NATIVE_ROM} ${NATIVE_ROM_DEPENDS} ${NATIVE_LIST_DEPENDS}
+            COMMENT "Translating the game's 68000 code from the ROM into C")
+        target_sources(coi PRIVATE ${NATIVE_CODE})
+    endif()
+    target_compile_definitions(coi PRIVATE COI_NATIVE_C)
+    set(COI_TRANSLATOR ON)
+elseif(COI_NATIVE)
+    set(COI_TRANSLATOR ON)
+endif()
+if(COI_TRANSLATOR)
+    target_sources(coi PRIVATE ${RECOMP_FRONT}
+        recomp/jit.cpp recomp/x64.cpp recomp/arm64.cpp recomp/native_helpers.c recomp/cycles68000.c)
+    # --jit: the app translates the ROM itself, with config/recomp.txt and the tracer's lists
+    # (config/recomp_functions.txt, recomp_sites.txt: addresses only), built in.
+    set(RECOMP_LISTS ${RECOMP_CONFIG} ${CMAKE_CURRENT_SOURCE_DIR}/../config/recomp_functions.txt
+        ${CMAKE_CURRENT_SOURCE_DIR}/../config/recomp_sites.txt)
+    set(RECOMP_LISTS_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/recomp_lists.h)
+    set(RECOMP_LISTS_TEXT "// Generated by port/CMakeLists.txt from config/recomp*.txt.\n#pragma once\n")
+    file(READ ${RECOMP_CONFIG} RECOMP_TEXT_CONFIG)
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../config/recomp_functions.txt RECOMP_TEXT_FUNCTIONS)
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../config/recomp_sites.txt RECOMP_TEXT_SITES)
+    file(WRITE ${RECOMP_LISTS_HEADER}.new "${RECOMP_LISTS_TEXT}\n"
+        "constexpr const char* kRecompConfig = R\"coi(${RECOMP_TEXT_CONFIG})coi\";\n"
+        "constexpr const char* kRecompFunctions = R\"coi(${RECOMP_TEXT_FUNCTIONS})coi\";\n"
+        "constexpr const char* kRecompSites = R\"coi(${RECOMP_TEXT_SITES})coi\";\n")
+    configure_file(${RECOMP_LISTS_HEADER}.new ${RECOMP_LISTS_HEADER} COPYONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMP_LISTS})
+    target_include_directories(coi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/recomp)
+    if(COI_NO_INTERPRETER)
+        target_compile_definitions(coi PRIVATE COI_NATIVE)
+    else()
+        target_compile_definitions(musashi PUBLIC COI_NATIVE COI_NATIVE_TRACE)
+    endif()
+endif()
 target_compile_definitions(coi PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_include_directories(coi PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)

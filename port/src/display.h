@@ -37,6 +37,10 @@ struct LayeredFrame {
                                 // layers, the sprites', plane B's and the background-camera
                                 // sprites', in game pixels
     const uint32_t* backdrop;   // per line, 0xAARRGGBB
+    // Smooth Water: plane A's translucent water, low and high priority, premultiplied
+    // 0xAARRGGBB (0 = none), each width x height, laid over the layers behind it after plane
+    // A's layer of the same priority (moving with it); nullptr: none.
+    const uint32_t* water[2] = {nullptr, nullptr};
 };
 
 // The `hqx` value that picks cleanEdge (torcado's upscaler, display.cpp) instead of hqx; it
@@ -116,4 +120,5 @@ private:
     HqxTarget hqx_flat;
     Layer layers[kLayers];
     unsigned line_shifts = 0, line_backdrop = 0;
+    unsigned water[2] = {};                     // Smooth Water's layers (LayeredFrame::water)
 };

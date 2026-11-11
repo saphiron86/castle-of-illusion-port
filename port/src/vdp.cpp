@@ -58,7 +58,7 @@ void Vdp::write_port(uint32_t port, uint16_t value)
     if (port >= 0x08)                               // HV counter (read-only), PSG: ignored for now
         return;
     if (trace)
-        std::printf("[vdp] PC=%06X control write $%04X%s\n", m68k_get_reg(nullptr, M68K_REG_PPC), value,
+        std::printf("[vdp] PC=%06X control write $%04X%s\n", current_pc(), value,
                     pending ? " (second word)" : "");
 
     if (pending) {                                  // second word of a command
@@ -67,7 +67,7 @@ void Vdp::write_port(uint32_t port, uint16_t value)
         address = (address & 0x3FFF) | ((value & 0x03) << 14);
         if (trace)
             std::printf("[vdp] PC=%06X command code=$%02X address=$%04X\n",
-                        m68k_get_reg(nullptr, M68K_REG_PPC), code, address);
+                        current_pc(), code, address);
         if ((code & 0x20) && (reg[1] & 0x10))
             do_dma();
         return;
@@ -77,7 +77,7 @@ void Vdp::write_port(uint32_t port, uint16_t value)
         if (r < 24)
             reg[r] = value & 0xFF;
         if (trace)
-            std::printf("[vdp] PC=%06X reg%d = $%02X\n", m68k_get_reg(nullptr, M68K_REG_PPC), r, value & 0xFF);
+            std::printf("[vdp] PC=%06X reg%d = $%02X\n", current_pc(), r, value & 0xFF);
         return;
     }
     code = (code & 0x3C) | (value >> 14);           // first word of a command
@@ -219,15 +219,20 @@ int Vdp::entry_pixel(uint16_t entry, int x, int y, bool& priority) const
 }
 
 // A plane A pixel remapped by extend_plane_a: from strip_cells where they cover it.
-int Vdp::strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority) const
+int Vdp::strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority,
+                     uint16_t* entry_out) const
 {
     x &= width_cells * 8 - 1;
     y &= height_cells * 8 - 1;
     const int cx = (x >> 3) - strip_cells_x, cy = (y >> 3) - strip_cells_y;
     if (strip_cells_w > 0 && cx >= 0 && cx < strip_cells_w && cy >= 0
-        && (size_t)(cy * strip_cells_w + cx) < strip_cells.size())
-        return entry_pixel(strip_cells[cy * strip_cells_w + cx], x, y, priority);
-    return plane_pixel(base, x, y, width_cells, height_cells, priority);
+        && (size_t)(cy * strip_cells_w + cx) < strip_cells.size()) {
+        const uint16_t entry = strip_cells[cy * strip_cells_w + cx];
+        if (entry_out)
+            *entry_out = entry;
+        return entry_pixel(entry, x, y, priority);
+    }
+    return plane_pixel(base, x, y, width_cells, height_cells, priority, entry_out);
 }
 
 // For a black plane pixel `a` (CRAM colour 0) at plane coordinates (x, y): a black gap
@@ -363,6 +368,18 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
     std::memset(sprite_pixel, 0, out_width);
     std::memset(sprite_priority, 0, out_width);
     std::memset(sprite_on_b, 0, out_width);
+    // Overlays (drawn by render_pixels) replace the sprites they hide.
+    overlay_rows.clear();
+    const bool hiding = !overlays.empty() && !column_vscroll && !window_line;
+    if (hiding)
+        for (const Overlay& o : overlays) {
+            int dx = 0, dy = 0;
+            if (sprite_offset)
+                sprite_offset(o.sprite, line, 0, scale, dx, dy);
+            const int row = line - (o.y + dy);
+            if (row >= 0 && row < o.h)
+                overlay_rows.push_back({&o, row, (o.x + left) * scale + (layers ? 0 : sub_a) + dx});
+        }
     int link = 0, on_line = 0;
     bool nonzero_x_seen = false;                    // for sprite masking
     const int max_sprites = h40 ? 80 : 64, max_per_line = sprite_limit ? (h40 ? 20 : 16) : max_sprites;
@@ -399,6 +416,8 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
                 shift += dx;
             }
             int row = line - (y + dy);
+            if (hiding && (size_t)link < hidden_sprites.size() && hidden_sprites[link])
+                row = -1;                           // drawn as an overlay instead
             if (row >= 0 && row < cells_h * 8) {
                 if (attr & 0x1000) row = cells_h * 8 - 1 - row;
                 for (int cx = 0; cx < cells_w * 8; cx++) {
@@ -499,12 +518,360 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
     }
 }
 
+uint32_t Vdp::overlay_at(int ox, int scale, bool& priority) const
+{
+    for (const OverlayRow& r : overlay_rows) {
+        const int rel = ox - r.start;
+        if (rel < 0)
+            continue;
+        const int x = rel / scale;
+        if (x < r.overlay->w)
+            if (const uint32_t c = r.overlay->argb[r.row * r.overlay->w + x]) {
+                priority = r.overlay->priority;
+                return c;
+            }
+    }
+    return 0;
+}
+
 // The planes of one line, fetched once per game pixel. With sub-pixel scrolling (scale > 1)
 // several output pixels show the same plane pixel, each plane at its own offset, so plane A,
 // plane B and the window are looked up once for each game pixel they show (with their colours
 // from a 64-entry table) and the output pixels then only pick from those. Draws exactly what
 // the per-pixel loop in render_line does.
 void Vdp::render_pixels(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers,
+                        uint32_t backdrop, const uint8_t* sprite_pixel, const bool* sprite_priority,
+                        const bool* sprite_on_b, int sub_a, int sub_b, int hs_a, int hs_b, bool window_line,
+                        int window_hp, bool window_right, int window_w, int native_width, int window_period,
+                        int base_a, int base_b, int base_window, int plane_w, int plane_h)
+{
+    auto floor_div = [](int v, int d) { return v >= 0 ? v / d : -((-v + d - 1) / d); };
+    if (water_tiles.empty() && overlay_rows.empty() && !plane_b_rgb && tile_rgba_index.empty()) {
+        render_pixels_plain(line, out, width, left, scale, layers, backdrop, sprite_pixel, sprite_priority, sprite_on_b,
+                            sub_a, sub_b, hs_a, hs_b, window_line, window_hp, window_right, window_w, native_width,
+                            window_period, base_a, base_b, base_window, plane_w, plane_h);
+        return;
+    }
+    const int out_width = width * scale;
+
+    // The palette's colours, then (from 64) colours given for single plane B pixels
+    // (plane_b_rgb): such a pixel's index points at its own entry.
+    uint32_t colors[256];
+    for (int i = 0; i < 64; i++)
+        colors[i] = color(i);
+    int extra_colors = 64;
+    const bool b_rgb = plane_b_rgb && plane_b_rgb_w == plane_w * 8 && plane_b_rgb_h == plane_h * 8;
+
+    // Plane pixels: the palette index (0 = transparent) and priority; for plane A also
+    // whether it is a strip fill drawn in front of everything.
+    struct Pixel { uint8_t index; bool priority; bool front; };
+    constexpr int kSpan = kMaxWidth + 8;
+    Pixel window_px[kSpan], a_px[kSpan], b_px[kSpan];
+    bool window_used[kSpan];
+
+    // The window (the HUD), by unshifted position x.
+    const int x_lo = -left, x_hi = floor_div(out_width - 1, scale) - left;
+    for (int x = x_lo; x <= x_hi; x++) {
+        Pixel& p = window_px[x - x_lo];
+        bool pri = false;
+        const bool in_native = x >= 0 && x < native_width;
+        const bool in_window = in_native && (window_line || (window_right ? x >= window_hp : x < window_hp));
+        window_used[x - x_lo] = in_window || (window_line && !in_native);
+        if (in_window) {
+            p.index = (uint8_t)plane_pixel(base_window, x, line, window_w, 32, pri);
+        } else if (window_line && !in_native) {
+            int wx = window_period ? ((x % window_period) + window_period) % window_period
+                                   : (x < 0 ? 0 : native_width - 8) + (((x % 8) + 8) % 8);
+            p.index = (uint8_t)plane_pixel(base_window, wx, line, window_w, 32, pri);
+        } else {
+            p.index = 0;
+        }
+        p.priority = pri;
+        p.front = false;
+    }
+
+    // Plane A, by its position xa, from a_lo - 1 to a_hi + 1 (the pixels either side are
+    // Smooth Water's neighbours): a_px[i] is at xa = a_lo - 1 + i. water[i] marks the pixels
+    // of water tiles (Smooth Water): kWater for water and transparent ones, kBehind for those
+    // that show what lies behind the water, plus kHasBehind in tiles that have such pixels.
+    const int vs_a = vsram[0], vs_b = vsram[1];
+    const int a_lo = floor_div(-sub_a, scale) - left, a_hi = floor_div(out_width - 1 - sub_a, scale) - left;
+    const int a_first = a_lo - 1, a_count = a_hi - a_lo + 3;
+    const bool water_on = water_tiles.size() == 2048 && !window_line;
+    // kPicture: a pixel of a tile drawn from tile_rgba (its colour and opacity in a_picture).
+    enum : uint8_t { kDry, kWater, kBehind, kKind = 3, kHasBehind = 4, kPicture = 8 };
+    const bool pictures = tile_rgba_index.size() == 2048 && !window_line;
+    static uint32_t a_picture[kSpan];
+    static uint8_t water[kSpan];                    // static: off the stack (lines are drawn one at a time)
+    int water_lo = a_count, water_hi = -1;          // the span of this line's water pixels
+    auto fetch_a = [&](int ln, int hs, Pixel* row, uint8_t* row_water, int from, int to) {
+        bool any = false;
+        for (int i = from; i < to; i++) {
+            const int xa = a_first + i;
+            Pixel& p = row[i];
+            bool pri = false;
+            uint16_t entry = 0;
+            int px = xa - hs, py = ln + vs_a;
+            const bool remapped = (extend_plane_a_inside || xa < 0 || xa >= native_width) && extend_plane_a
+                                  && extend_plane_a(xa, ln, px, py);
+            int a = remapped ? strip_pixel(base_a, px, py, plane_w, plane_h, pri, &entry)
+                             : plane_pixel(base_a, px, py, plane_w, plane_h, pri, &entry);
+            const uint32_t mask = water_on ? water_tiles[entry & 0x7FF] : 0;
+            row_water[i] = !mask ? kDry
+                         : !(a & 15) || (mask >> (a & 15) & 1) ? kWater
+                         : (mask >> (16 + (a & 15)) & 1) ? kBehind : kDry;
+            if (row_water[i] && mask >> 16)
+                row_water[i] |= kHasBehind;
+            if (pictures && tile_rgba_index[entry & 0x7FF] >= 0) {
+                const int fx = entry & 0x0800 ? 7 - (px & 7) : px & 7, fy = entry & 0x1000 ? 7 - (py & 7) : py & 7;
+                row_water[i] = kPicture;
+                if (row == a_px)
+                    a_picture[i] = tile_rgba[tile_rgba_index[entry & 0x7FF]][fy * 8 + fx];
+            }
+            any |= row_water[i] != kDry;
+            if (row_water[i] == kDry && clean_black_edges && a && (cram[a] & 0xEEE) == 0 && (edge_palette[a] & 0xEEE) == 0)
+                a = clean_black_edge(a, base_a, px, py, plane_w, plane_h);
+            p.index = (uint8_t)a;
+            p.priority = pri;
+            p.front = remapped && (strip_fill_in_front || (strip_fill_in_front_left && xa < 0)) && a;
+        }
+        return any;
+    };
+    const bool any_water = fetch_a(line, hs_a, a_px, water, 0, a_count);
+    if (any_water)
+        for (int i = 0; i < a_count; i++)
+            if (water[i]) {
+                water_lo = std::min(water_lo, i);
+                water_hi = i;
+            }
+
+    // Smooth Water: each water pixel's colour (the average of the opaque water pixels around
+    // it) and opacity (their share of the pixels of water tiles around it), over 3x3 pixels
+    // weighted 1-2-1, and, where the tile paints what lies behind the water (kBehind
+    // pixels), the average of those around it as the colour beneath. The lines above and
+    // below are fetched with their own scroll.
+    static uint32_t water_rgb[kSpan], behind_rgb[kSpan];
+    static uint8_t water_alpha[kSpan];
+    static bool has_behind[kSpan];
+    if (any_water) {
+        static Pixel above[kSpan], below[kSpan];
+        static uint8_t above_water[kSpan], below_water[kSpan];
+        int hs_up, hs_down, hs_b_unused;
+        line_scroll(line > 0 ? line - 1 : line, hs_up, hs_b_unused);
+        line_scroll(line < kScreenHeight - 1 ? line + 1 : line, hs_down, hs_b_unused);
+        // only across the water and a pixel either side (the kernel's reach)
+        const int from = std::max(0, water_lo - 1), to = std::min(a_count, water_hi + 2);
+        fetch_a(line - 1, hs_up, above, above_water, from, to);
+        fetch_a(line + 1, hs_down, below, below_water, from, to);
+        const Pixel* rows[3] = {above, a_px, below};
+        const uint8_t* rows_water[3] = {above_water, water, below_water};
+        auto average = [](int r, int g, int b, int n) {
+            return n ? (uint32_t)(r / n) << 16 | (uint32_t)(g / n) << 8 | (uint32_t)(b / n) : 0u;
+        };
+        for (int i = std::max(1, water_lo); i <= std::min(a_count - 2, water_hi); i++) {
+            if (water[i] == kDry)
+                continue;
+            if (water[i] & kPicture) {              // drawn from tile_rgba
+                water_alpha[i] = (uint8_t)(a_picture[i] >> 24);
+                water_rgb[i] = a_picture[i] & 0xFFFFFF;
+                has_behind[i] = false;
+                continue;
+            }
+            int total = 0, cover = 0, r = 0, g = 0, b = 0, behind = 0, br = 0, bg = 0, bb = 0;
+            for (int dy = 0; dy < 3; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    const uint8_t kind = rows_water[dy][i + dx];
+                    if (kind == kDry || (kind & kPicture))
+                        continue;
+                    const int w = (dy == 1 ? 2 : 1) * (dx == 0 ? 2 : 1);
+                    const int index = rows[dy][i + dx].index;
+                    const uint32_t c = colors[index];
+                    total += w;
+                    if ((kind & kKind) == kBehind) {
+                        behind += w;
+                        br += w * (int)(c >> 16 & 0xFF), bg += w * (int)(c >> 8 & 0xFF), bb += w * (int)(c & 0xFF);
+                    } else if (index) {
+                        cover += w;
+                        r += w * (int)(c >> 16 & 0xFF), g += w * (int)(c >> 8 & 0xFF), b += w * (int)(c & 0xFF);
+                    }
+                }
+            water_alpha[i] = (uint8_t)(cover * 255 / total);
+            water_rgb[i] = average(r, g, b, cover);
+            has_behind[i] = behind > 0 && (water[i] & kHasBehind);  // only inside such tiles
+            behind_rgb[i] = 0xFF000000u | average(br, bg, bb, behind);
+        }
+    }
+    auto blend = [](uint32_t under, uint32_t over, int alpha) {
+        auto channel = [&](int shift) {
+            return ((under >> shift & 0xFF) * (255 - alpha) + (over >> shift & 0xFF) * alpha + 127) / 255 << shift;
+        };
+        return 0xFF000000u | channel(16) | channel(8) | channel(0);
+    };
+
+    // Plane B, by its position xb.
+    const int b_lo = floor_div(-sub_b, scale) - left, b_hi = floor_div(out_width - 1 - sub_b, scale) - left;
+    for (int xb = b_lo; xb <= b_hi; xb++) {
+        Pixel& p = b_px[xb - b_lo];
+        bool pri = false;
+        int bx = xb - hs_b, by = line + vs_b;
+        const bool b_remapped = (extend_plane_b_inside || xb < 0 || xb >= native_width) && extend_plane_b
+                                && extend_plane_b(xb, line, bx, by);
+        p.index = (uint8_t)plane_pixel(base_b, bx, by, plane_w, plane_h, pri);
+        if (b_rgb && p.index && extra_colors < 256)
+            if (const uint32_t c = plane_b_rgb[(by & (plane_h * 8 - 1)) * plane_b_rgb_w + (bx & (plane_w * 8 - 1))]) {
+                colors[extra_colors] = c;
+                p.index = (uint8_t)extra_colors++;
+            }
+        if (b_remapped && strip_b_priority_right && xb >= native_width)
+            pri = true;
+        p.priority = pri;
+        p.front = false;
+    }
+
+    // Each output pixel: step the three positions (x, xa, xb) along without dividing.
+    int x_i = 0, x_r = 0;
+    int a_i = 1, a_r = -sub_a - floor_div(-sub_a, scale) * scale;
+    int b_i = 0, b_r = -sub_b - floor_div(-sub_b, scale) * scale;
+    if (!any_water && overlay_rows.empty()) {
+        // Lines without water or overlays: the plain loop (kept apart, as it is the
+        // renderer's busiest; the checks below slow it down noticeably).
+        for (int ox = 0; ox < out_width; ox++) {
+            const Pixel& pa = window_used[x_i] ? window_px[x_i] : a_px[a_i];
+            const Pixel& pb = b_px[b_i];
+            if (++x_r == scale) x_r = 0, x_i++;
+            if (++a_r == scale) a_r = 0, a_i++;
+            if (++b_r == scale) b_r = 0, b_i++;
+            const int a = pa.index, b = pb.index;
+            const bool pri_a = pa.priority, pri_b = pb.priority;
+            if (pa.front) {
+                if (layers)                         // in front of everything
+                    layers->layer[LineLayers::SpritesHigh][ox] = colors[a];
+                else
+                    out[ox] = colors[a];
+                continue;
+            }
+            const int s = sprite_pixel[ox];
+            const bool pri_s = s && sprite_priority[ox];
+            if (layers) {
+                if (b) layers->layer[pri_b ? LineLayers::BHigh : LineLayers::BLow][ox] = colors[b];
+                if (a) layers->layer[pri_a ? LineLayers::AHigh : LineLayers::ALow][ox] = colors[a];
+                if (s && sprite_on_b[ox]) layers->layer[LineLayers::SpritesB][ox] = colors[s];
+                else if (s) layers->layer[pri_s ? LineLayers::SpritesHigh : LineLayers::SpritesLow][ox] = colors[s];
+                continue;
+            }
+            int pixel;
+            if (s && pri_s) pixel = s;
+            else if (a && pri_a) pixel = a;
+            else if (b && pri_b) pixel = b;
+            else if (s) pixel = s;
+            else if (a) pixel = a;
+            else if (b) pixel = b;
+            else pixel = -1;
+            out[ox] = pixel < 0 ? backdrop : colors[pixel];
+        }
+        return;
+    }
+    uint64_t memo_key = ~0ull;                      // the water's last result (see below)
+    const Pixel* memo_pb = nullptr;
+    uint32_t memo_out = 0;
+    for (int ox = 0; ox < out_width; ox++) {
+        const bool in_window = window_used[x_i];
+        const Pixel& pa = in_window ? window_px[x_i] : a_px[a_i];
+        const Pixel& pb = b_px[b_i];
+        const int a_at = a_i;
+        if (++x_r == scale) x_r = 0, x_i++;
+        if (++a_r == scale) a_r = 0, a_i++;
+        if (++b_r == scale) b_r = 0, b_i++;
+        const int a = pa.index, b = pb.index;
+        const bool pri_a = pa.priority, pri_b = pb.priority;
+        if (any_water && !in_window && water[a_at] != kDry) {
+            // Water: what lies in front of plane A at its priority shows as it is; beneath
+            // it, the water is laid over what lies there.
+            const int s = sprite_pixel[ox];
+            const bool pri_s = s && sprite_priority[ox];
+            const int alpha = water_alpha[a_at];
+            const uint32_t tint = water_rgb[a_at];
+            if (layers) {
+                if (b) layers->layer[pri_b ? LineLayers::BHigh : LineLayers::BLow][ox] = colors[b];
+                if (s && sprite_on_b[ox]) layers->layer[LineLayers::SpritesB][ox] = colors[s];
+                else if (s) layers->layer[pri_s ? LineLayers::SpritesHigh : LineLayers::SpritesLow][ox] = colors[s];
+                if (layers->water[pri_a]) {         // premultiplied
+                    layers->water[pri_a][ox] = alpha ? (uint32_t)alpha << 24 | (blend(0, tint, alpha) & 0xFFFFFF) : 0;
+                    if (has_behind[a_at])
+                        layers->layer[pri_a ? LineLayers::AHigh : LineLayers::ALow][ox] = behind_rgb[a_at];
+                } else if (a) {
+                    layers->layer[pri_a ? LineLayers::AHigh : LineLayers::ALow][ox] = colors[a];
+                }
+                continue;
+            }
+            // Neighbouring output pixels (with smooth scrolling, several per game pixel) mostly
+            // have the same inputs: reuse the last result then.
+            bool over_priority = false;
+            const uint32_t over = !overlay_rows.empty() && !s ? overlay_at(ox, scale, over_priority) : 0;
+            const uint64_t key = (uint64_t)over << 32 | (uint32_t)a_at << 16 | (uint32_t)(s << 1 | pri_s) << 8
+                                 | (uint32_t)(b << 1 | pri_b);
+            if (key == memo_key && &pb == memo_pb) {
+                out[ox] = memo_out;
+                continue;
+            }
+            memo_key = key, memo_pb = &pb;
+            if (has_behind[a_at]) {                 // plane A paints what lies beneath
+                out[ox] = memo_out = s && (pri_s || !pri_a) ? colors[s] : !pri_a && b && pri_b ? colors[b]
+                                   : blend(behind_rgb[a_at], tint, alpha);
+                continue;
+            }
+            int front = 0, under = 0;
+            if (s && pri_s) front = s;
+            else if (!pri_a && b && pri_b) front = b;
+            else if (!pri_a && s) front = s;
+            else if (b && pri_b) under = b;
+            else if (s) under = s;
+            else under = b;
+            uint32_t beneath = under ? colors[under] : backdrop;
+            if (over && (over_priority || !(b && pri_b)))
+                beneath = blend(beneath, over, over >> 24);
+            out[ox] = memo_out = front ? colors[front] : blend(beneath, tint, alpha);
+            continue;
+        }
+        if (pa.front) {
+            if (layers)                             // in front of everything
+                layers->layer[LineLayers::SpritesHigh][ox] = colors[a];
+            else
+                out[ox] = colors[a];
+            continue;
+        }
+        const int s = sprite_pixel[ox];
+        const bool pri_s = s && sprite_priority[ox];
+        // An overlay, behind the other sprites: its colour here (alpha in the top byte).
+        bool over_priority = false;
+        const uint32_t over = !overlay_rows.empty() && !s ? overlay_at(ox, scale, over_priority) : 0;
+        if (layers) {
+            if (b) layers->layer[pri_b ? LineLayers::BHigh : LineLayers::BLow][ox] = colors[b];
+            if (a) layers->layer[pri_a ? LineLayers::AHigh : LineLayers::ALow][ox] = colors[a];
+            if (s && sprite_on_b[ox]) layers->layer[LineLayers::SpritesB][ox] = colors[s];
+            else if (s) layers->layer[pri_s ? LineLayers::SpritesHigh : LineLayers::SpritesLow][ox] = colors[s];
+            else if ((over >> 24) >= 128)           // the layers keep pixels whole
+                layers->layer[over_priority ? LineLayers::SpritesHigh : LineLayers::SpritesLow][ox] =
+                    0xFF000000u | over;
+            continue;
+        }
+        int pixel;
+        if (s && pri_s) pixel = s;
+        else if (a && pri_a) pixel = a;
+        else if (b && pri_b) pixel = b;
+        else if (s) pixel = s;
+        else if (a) pixel = a;
+        else if (b) pixel = b;
+        else pixel = -1;
+        out[ox] = pixel < 0 ? backdrop : colors[pixel];
+        if ((over >> 24) && (over_priority || !((a && pri_a) || (b && pri_b))))
+            out[ox] = blend(out[ox], over, over >> 24);
+    }
+}
+
+// render_pixels as it was before Smooth Water, Smooth Glass and the spout and waterfall
+// morphs: used while none of them is active (nearly everywhere), as it is measurably faster.
+void Vdp::render_pixels_plain(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers,
                         uint32_t backdrop, const uint8_t* sprite_pixel, const bool* sprite_priority,
                         const bool* sprite_on_b, int sub_a, int sub_b, int hs_a, int hs_b, bool window_line,
                         int window_hp, bool window_right, int window_w, int native_width, int window_period,

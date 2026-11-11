@@ -1,0 +1,31 @@
+# Fields of one kind of object: <hex ID> <hex offset> <name> [comment]
+# Where these differ from config/objects.txt's (offsets every object uses alike), a kind's own
+# functions use these: its code, its routines, and what only they call (readable C,
+# docs/decompile.md). The names must be unique; prefix them with the kind.
+01 24 MickeyPath           word: the path an underwater tunnel carries him along (MickeyCheckCarried)
+01 26 MickeyPassageSteps   byte: the passage's steps left (MickeyPassage)
+01 31 MickeyRequests       byte: bit 1 a bounce landed (BouncedOn), bit 2 a hit to take (ObjMickey)
+32 26 ToySoldierResume     byte: the routine to go back to after a hop
+32 36 ToySoldierGravity    long: added to its vertical speed each frame ($2000; -$4000 for a hop)
+38 2A SpringHeadSideHomeX  long: its X before it springs out, where it comes back to
+38 32 SpringHeadSidePull   long: added to its X speed while out, pulling it back ($2000, either way)
+38 36 SpringHeadSideBaseX  long: the spring's base X
+3F 32 BatHomeX             word: its X where it hangs, which it flies back to
+3F 36 BatHomeY             word: its Y where it hangs
+41 26 LetterAResume        byte: the routine to go back to after a jump
+41 27 LetterAWait          byte: frames before it may jump at Mickey again
+41 32 LetterAVelX          long: its X speed, kept while it jumps and put back after
+43 26 GummyFishWait        byte: frames it waits under the water before the next leap ($28)
+43 32 GummyFishHomeX       long: where it leaps from (X)
+43 36 GummyFishHomeY       long: where it leaps from (Y: the water)
+45 26 KnightTimer          byte: frames to the next step ($A0 walking, $20 turning)
+45 27 KnightResume         byte: the routine to go back to after throwing
+45 2A KnightMace           long: the mace it threw (an object $47; beaten with it)
+50 32 MushroomStartX       long: its X at the start, which it walks back to
+50 36 MushroomGravity      long: added to its vertical speed each frame ($5000, the other way when it flips)
+53 26 ButterflyTimer       byte: frames before it turns
+53 27 ButterflyResume      byte: the routine to go back to
+C8 27 OafLegsFlags         byte: bit 0 facing left (animation 2, not 0), bit 1 a hit taken (the boss-hit sound), bit 2 a second hit the same time
+C8 2A OafLegsHits          byte: hits taken (one, or two at once); at 16 BossBeaten
+CB 27 DragonHeadHits       byte: hits taken, two for each (with the boss-hit sound $BE)
+CB 2A DragonHeadPattern    byte: its attack pattern, 0-4 in turn (each gives its way, its timer and $32, from the table at $133AE)

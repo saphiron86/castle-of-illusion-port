@@ -170,6 +170,8 @@ class Generator:
             # RAM is $FF0000-$FFFFFF; config/ram.txt keys use the sign-extended form
             ram = self.ram.get(0xFF000000 | value) if value & 0xFFFFFF >= 0xFF0000 else None
             if ram:
+                if value != 0xFF000000 | value:      # a long address written $00FFxxxx: keep its top byte
+                    return "(%s&$FFFFFF).%s" % (ram[0], m.group(2))
                 return "(%s).%s" % (ram[0], m.group(2))
             if m.group(2) == "l" and value in self.hardware:
                 return "(%s).l" % self.hardware[value][0]

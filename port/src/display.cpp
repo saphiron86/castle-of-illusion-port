@@ -354,6 +354,7 @@ in vec2 uv;
 out vec4 frag;
 
 uniform sampler2D layer0, layer1, layer2, layer3, layer4, layer5, layer6;
+uniform sampler2D water0, water1;   // Smooth Water: plane A's water, low and high (game pixels)
 uniform sampler2D shifts;     // per line: plane A's layers, the sprites', plane B's, the
                               // background-camera sprites' (game pixels)
 uniform sampler2D backdrop;   // per line
@@ -381,9 +382,11 @@ void main()
     vec3 c = texelFetch(backdrop, ivec2(row, 0), 0).rgb;
     c = over(c, layer0, x - s.z, y);      // plane B, low
     c = over(c, layer1, x - s.x, y);      // plane A, low
+    c = over(c, water0, x - s.x, y);      // its water
     c = over(c, layer2, x - s.y, y);      // sprites, low
     c = over(c, layer3, x - s.z, y);      // plane B, high
     c = over(c, layer4, x - s.x, y);      // plane A, high
+    c = over(c, water1, x - s.x, y);      // its water
     c = over(c, layer5, x - s.w, y);      // sprites moving with the background camera
     c = over(c, layer6, x - s.y, y);      // sprites, high
     frag = vec4(c * shade, 1.0);
@@ -1214,6 +1217,16 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, f.height, 1, 0, GL_RGBA, GL_FLOAT, f.shifts);
     glBindTexture(GL_TEXTURE_2D, line_backdrop);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.height, 1, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.backdrop);
+    static const uint32_t kNoWater = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!water[i])
+            water[i] = pixel_texture(GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, water[i]);
+        if (f.water[i])
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.width, f.height, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.water[i]);
+        else
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, kPixelFormat, GL_UNSIGNED_BYTE, &kNoWater);
+    }
 
     int out_w = 0, out_h = 0;
     SDL_GetWindowSizeInPixels(window, &out_w, &out_h);
@@ -1238,6 +1251,11 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     glActiveTexture(GL_TEXTURE0 + kLayers + 1);
     glBindTexture(GL_TEXTURE_2D, line_backdrop);
     glUniform1i(loc("backdrop"), kLayers + 1);
+    for (int i = 0; i < 2; i++) {
+        glActiveTexture(GL_TEXTURE0 + kLayers + 2 + i);
+        glBindTexture(GL_TEXTURE_2D, water[i]);
+        glUniform1i(loc("water" + std::to_string(i)), kLayers + 2 + i);
+    }
     glUniform2f(loc("picture"), (float)logical_width, (float)f.height);
     glUniform1f(loc("margin"), (float)f.margin);
     glUniform2f(loc("clip"), (float)f.clip_left, (float)f.clip_right);

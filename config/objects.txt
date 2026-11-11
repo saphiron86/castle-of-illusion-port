@@ -1,0 +1,22 @@
+# Object fields: <hex offset> <name> [comment]
+# An object is a slot in one of three pools (32 slots at $FFD000, 10 at $FFDD80, 32 at $FFD400;
+# the player at $FFDC00), see docs/widescreen.md. The readable C (docs/decompile.md) names
+# accesses to A0 + offset with these, A0 being the object the game is running.
+02 ObjFlags         byte: bit 1 animation held (DrawObject doesn't step it), bit 2 not drawn this frame (MickeyFlash), bit 3 position in screen coordinates, bit 4 never deleted off screen, bit 5 solid (Mickey can stand on it: MickeySolidObjects)
+03 ObjRoutine       byte: the routine the object runs, an index into its routine table (the dispatch at $1C74)
+04 ObjTileBase      word: the first tile of the object's sprites
+06 ObjAnimScript    long: its animations, a table of word offsets (AnimateObject, DrawObject)
+0A ObjAnim          byte: the animation playing, an index into ObjAnimScript
+0B ObjAnimFrame     byte: the frame of it showing (back to 0 after the animation's last)
+0C ObjAnimTimer     byte: frames left on this one (reloaded from the animation's second byte)
+10 ObjX             long: X position (the word at $10 is the pixel)
+14 ObjY             long: Y position (the word at $14 is the pixel)
+18 ObjVelX          long: X velocity, added to ObjX by ApplyVelocity
+1C ObjVelY          long: Y velocity, added to ObjY by ApplyVelocity
+22 ObjTimer         word: a countdown the routines use (set to a delay, counted down each frame, then the next step)
+24 ObjSpawnEntry    long: the spawn-list entry it came from (cleared by DeleteObject)
+28 ObjBeaten        byte: an enemy beaten when set, whatever touches it (EnemyContact)
+29 ObjSpawnArg      byte: the spawn-list entry's second byte, each kind's own setting (a direction, a variant)
+2E ObjPoints        word: the points an enemy gives (EnemyToSparkle); set per level for its ID, doubled when $FFFF0D is 1
+30 ObjFrame         byte: the frame showing, from its animation (ShowFrame); also picks ProbeBlocks' points
+3A ObjLifetime      byte: frames left before it deletes itself (a Sparkle: $37, set by EnemyToSparkle)

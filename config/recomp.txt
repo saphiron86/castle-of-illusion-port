@@ -1,0 +1,26 @@
+# What the translator (port/recomp, docs/native.md) translates from the ROM, besides the
+# tracer's lists (recomp_functions.txt, recomp_sites.txt); built into the app. Addresses in hex.
+#   function ADDR        a function to translate (with everything it calls)
+#   jump INSN T1 T2 ...  the computed jmp at INSN goes to one of T1, T2, ...
+#   call INSN T1 T2 ...  the computed jsr at INSN calls one of T1, T2, ...
+#   stubs RAM ROM COUNT  COUNT jmp (xxx).l stubs copied from ROM to RAM at boot
+
+# InstallRamStubs copies the 21 jmp stubs at $00044C to $FFFF60; nothing rewrites them.
+# (Every number here is hex: 15 = 21.)
+stubs FFFF60 00044C 15
+
+# The Nemesis graphics decompressor: to the VDP data port, and to RAM at a4.
+function 07FBAE     # NemDec_ToVDP
+function 07FBC0     # NemDec_ToRAM
+# Each 8 pixels decoded, jmp (a3) goes to the writer chosen at the start: NemDec_WriteVDP,
+# NemDec_WriteRAM, or their XOR versions ten bytes on (adda.w #$A,a3).
+jump 07FC38 07FC70 07FC7A 07FC86 07FC90
+
+# The Enigma decoder (sub_07FCEE): jmp tbl_07FD84(pc,d1.w) with d1 = 0-14, into a table of
+# eight bra.s instructions.
+jump 07FD34 07FD84 07FD86 07FD88 07FD8A 07FD8C 07FD8E 07FD90 07FD92
+
+# Boss Rush's results screen (port/src/boss_rush_results.asm, ResultsFrame): jmp .phases(pc,d0.w)
+# with d0 the phase's offset: fade in, count, wait, fade out. The tracer reads only the
+# original ROM, so it never sees this code.
+jump 0D05D8 0D05E4 0D0608 0D0692 0D06AC

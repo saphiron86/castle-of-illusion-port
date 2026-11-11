@@ -341,6 +341,19 @@ MenuChoice menu_frame(const MenuState& state)
                 }
                 ImGui::SetItemTooltip("Fades in and out between screens change colour smoothly instead of in\n"
                                       "the game's few steps. Off: as in the original.");
+                if (ImGui::MenuItem("Smooth Water", nullptr, *state.smooth_water)) {
+                    *state.smooth_water = !*state.smooth_water;
+                    choice.save_settings = true;
+                }
+                ImGui::SetItemTooltip("Water the game draws with dithering (the tea, the flooded castle, the\n"
+                                      "waterfalls and their foam, Toyland's jello) is see-through instead, and\n"
+                                      "flowing water moves smoothly. Off: as in the original.");
+                if (ImGui::MenuItem("Smooth Glass", nullptr, *state.smooth_glass)) {
+                    *state.smooth_glass = !*state.smooth_glass;
+                    choice.save_settings = true;
+                }
+                ImGui::SetItemTooltip("The library's glass jars, which the game draws with dithering, are\n"
+                                      "see-through instead. Off: as in the original.");
                 if (ImGui::MenuItem("Remove Sprite Limit", nullptr, *state.remove_sprite_limit)) {
                     *state.remove_sprite_limit = !*state.remove_sprite_limit;
                     choice.save_settings = true;
@@ -469,6 +482,13 @@ MenuChoice menu_frame(const MenuState& state)
                 choice.action = MenuAction::OpenSettingsFolder;
             ImGui::SetItemTooltip("Opens the folder that holds settings.ini.");
 #endif
+            ImGui::Separator();
+            if (ImGui::MenuItem("Show Coordinates", nullptr, *state.show_coordinates)) {
+                *state.show_coordinates = !*state.show_coordinates;
+                choice.save_settings = true;
+            }
+            ImGui::SetItemTooltip("Shows the stage, Mickey's position and the camera's in the top right\n"
+                                  "(below the FPS counter when that is on), for reporting where something happened.");
             ImGui::EndMenu();
         }
         // At the right, inside the safe area (clear of a phone's camera cutout): with the touch
@@ -496,8 +516,8 @@ MenuChoice menu_frame(const MenuState& state)
     }
     if (g_open && g_crt_window && crt_settings_window(*state.crt))
         choice.save_settings = true;
-    if (*state.show_fps) {
-        // Top right, below the menu bar when it is open.
+    if (*state.show_fps || *state.show_coordinates) {
+        // Top right, below the menu bar when it is open: the frame rate, then the coordinates.
         const ImGuiViewport* view = ImGui::GetMainViewport();
         const float top = view->Pos.y + (g_open ? ImGui::GetFrameHeight() : 0.0f) + 6.0f;
         ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x - 6.0f, top), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
@@ -506,9 +526,19 @@ MenuChoice menu_frame(const MenuState& state)
                                      | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
                                      | ImGuiWindowFlags_NoSavedSettings;
         if (ImGui::Begin("##fps", nullptr, flags)) {
-            ImGui::Text("%.0f fps", state.fps);
-            if (state.game_fps > 0.0f && std::fabs(state.game_fps - state.fps) > 0.5f)
-                ImGui::Text("game %.1f", state.game_fps);
+            if (*state.show_fps) {
+                ImGui::Text("%.0f fps", state.fps);
+                if (state.game_fps > 0.0f && std::fabs(state.game_fps - state.fps) > 0.5f)
+                    ImGui::Text("game %.1f", state.game_fps);
+            }
+            if (*state.show_coordinates) {
+                if (state.stage)
+                    ImGui::Text("stage %d (index %d)", state.stage, state.stage_index);
+                else
+                    ImGui::Text("state $%02X", state.game_state);
+                ImGui::Text("Mickey %d, %d", state.mickey_x, state.mickey_y);
+                ImGui::Text("camera %d, %d", state.camera_x, state.camera_y);
+            }
         }
         ImGui::End();
     }

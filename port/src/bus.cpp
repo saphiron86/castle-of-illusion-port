@@ -57,7 +57,7 @@ uint16_t Bus::read16(uint32_t address)
     if (address >= 0xE00000) {
         // The main loop reading GameState: the previous state routine has returned, so this
         // is the one safe point to switch states from outside.
-        if ((address & 0xFFFF) == 0xF300 && jump_stage >= 0 && m68k_get_reg(nullptr, M68K_REG_PPC) == kMainLoopRead)
+        if ((address & 0xFFFF) == 0xF300 && jump_stage >= 0 && current_pc() == kMainLoopRead)
             start_game_at_stage();
         return ram[address & 0xFFFF] << 8 | ram[(address + 1) & 0xFFFF];
     }
@@ -152,7 +152,7 @@ void Bus::log_watch(uint32_t address, uint16_t value, int size)
 {
     for (uint16_t w : watches)
         if ((address & 0xFFFF) == w || (size == 1 && (address & 0xFFFF) == w + 1))
-            std::printf("[watch] PC=%06X write%s $%06X = $%0*X\n", m68k_get_reg(nullptr, M68K_REG_PPC),
+            std::printf("[watch] PC=%06X write%s $%06X = $%0*X\n", current_pc(),
                         size == 1 ? ".b" : ".w", address, size * 2, value);
 }
 

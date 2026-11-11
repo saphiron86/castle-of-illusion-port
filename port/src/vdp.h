@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -46,6 +47,10 @@ public:
         int sub_a = 0, sub_b = 0;   // out: smooth_scroll's shifts, in 1/sub_scale pixels
         int sub_sprites = 0;        // out: the sprite layers' shift (sub_a, or sprite_layer_shift's)
         bool window_line = false;   // out: plane A's layers hold the window (not shifted)
+        // Optional (Smooth Water): plane A's translucent water, low and high priority, each
+        // `width` pixels, premultiplied 0xAARRGGBB (0 = none). Without them the water is
+        // drawn into plane A's layers as it is in the original.
+        uint32_t* water[2] = {nullptr, nullptr};
         uint32_t backdrop = 0;      // out: the colour behind every layer
     };
 
@@ -53,6 +58,21 @@ public:
     uint16_t cram[64] = {};
     uint16_t vsram[40] = {};
     uint8_t reg[32] = {};
+
+    // The ports' command state, for saving and restoring it (the recompiler's test harness).
+    struct PortState {
+        uint32_t address;
+        uint8_t code;
+        bool pending, fill_pending;
+    };
+    PortState port_state() const { return {address, code, pending, fill_pending}; }
+    void set_port_state(const PortState& s)
+    {
+        address = s.address;
+        code = s.code;
+        pending = s.pending;
+        fill_pending = s.fill_pending;
+    }
     bool trace = false;         // log register writes and commands to stdout
     bool sprite_masking = true; // X-0 sprites hide later sprites on their lines (off only for testing)
 
@@ -94,6 +114,42 @@ public:
     // CRAM still holds the value they were made for.
     const PaletteOverride* palette = nullptr;
     std::vector<uint16_t> edge_tiles;
+    // Smooth Water: the water the game draws as a dithered pattern on plane A (a checkerboard
+    // of one colour, or streaks with gaps) is drawn translucent instead. For each tile
+    // (2048), bit p is set when pixel value p (1-15) of that tile is water, and bit 16 + p
+    // when value p paints what lies behind the water (where streaks cross a ledge, the gaps
+    // show the ledge's own colours); transparent pixels of a water tile are water too, other
+    // pixels are drawn as usual. Each water pixel takes the colour and coverage of the water
+    // pixels around it (3x3, weighted 1-2-1), and that colour is laid over what lies beneath
+    // plane A (or the average of the "behind" pixels around it) with the coverage as its
+    // opacity, so a checkerboard becomes an even 50% tint. Empty: off.
+    std::vector<uint32_t> water_tiles;
+    // Pictures drawn in place of some sprites (Smooth Water: stage 10's waterspouts, morphed
+    // between their two poses). While there are any, the sprites marked in hidden_sprites (by
+    // sprite table index) are not drawn, and each overlay is drawn instead, behind the other
+    // sprites and (without `priority`) behind
+    // high-priority plane pixels, as a low-priority sprite would be: w x h pixels from view
+    // position (x, y) in game pixels, 0xAARRGGBB with straight alpha (0: clear). It moves
+    // like the sprite at table index `sprite` (sprite_offset) and with plane A.
+    struct Overlay {
+        int x = 0, y = 0, w = 0, h = 0;
+        bool priority = false;
+        int sprite = 0;
+        std::vector<uint32_t> argb;
+    };
+    std::vector<Overlay> overlays;
+    std::vector<uint8_t> hidden_sprites;            // 80 flags; empty: none
+    // Optional colours for plane B pixels (Smooth Water: background water that flows by colour
+    // cycling, morphed between the cycle's steps), by plane pixel (plane_b_rgb_w x plane_b_rgb_h,
+    // the plane's size), 0xFFRRGGBB, 0 = the pixel's own colour.
+    const uint32_t* plane_b_rgb = nullptr;
+    int plane_b_rgb_w = 0, plane_b_rgb_h = 0;
+    // Optional pictures for plane A tiles (Smooth Water: stage 25's water surface, morphed
+    // between its two animation frames): tile_rgba_index[tile] (2048) is -1 or an entry of
+    // tile_rgba, 8 x 8 pixels of straight 0xAARRGGBB, drawn in place of the tile's own pixels
+    // and blended over what lies beneath plane A as the water is. Empty: none.
+    std::vector<int16_t> tile_rgba_index;
+    std::vector<std::array<uint32_t, 64>> tile_rgba;
     // Optional sub-pixel scrolling, used when rendering with scale > 1: given a line's
     // horizontal scroll values for planes A and B, returns how far right to draw each, in
     // 1/scale pixels (sprites move with plane A).
@@ -125,10 +181,23 @@ private:
     int plane_pixel(int plane_base, int x, int y, int width_cells, int height_cells, bool& priority,
                     uint16_t* entry = nullptr) const;
     int entry_pixel(uint16_t entry, int x, int y, bool& priority) const;
-    int strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority) const;
+    int strip_pixel(int base, int x, int y, int width_cells, int height_cells, bool& priority,
+                    uint16_t* entry = nullptr) const;
     int clean_black_edge(int a, int base, int x, int y, int width_cells, int height_cells) const;
     // render_line's planes and compositing, without per-column vertical scroll.
+    // The overlays on the current line: each one's row and the output pixel its column 0 is at.
+    struct OverlayRow { const Overlay* overlay; int row, start; };
+    std::vector<OverlayRow> overlay_rows;
+    // The overlay colour (straight 0xAARRGGBB) at output pixel ox of the current line, 0 if
+    // none, and that overlay's priority.
+    uint32_t overlay_at(int ox, int scale, bool& priority) const;
     void render_pixels(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers, uint32_t backdrop,
+                       const uint8_t* sprite_pixel, const bool* sprite_priority, const bool* sprite_on_b, int sub_a,
+                       int sub_b, int hs_a, int hs_b, bool window_line, int window_hp, bool window_right, int window_w,
+                       int native_width, int window_period, int base_a, int base_b, int base_window, int plane_w,
+                       int plane_h);
+    // The same without Smooth Water's additions (faster), while they are not in use.
+    void render_pixels_plain(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers, uint32_t backdrop,
                        const uint8_t* sprite_pixel, const bool* sprite_priority, const bool* sprite_on_b, int sub_a,
                        int sub_b, int hs_a, int hs_b, bool window_line, int window_hp, bool window_right, int window_w,
                        int native_width, int window_period, int base_a, int base_b, int base_window, int plane_w,

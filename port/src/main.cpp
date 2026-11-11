@@ -5,6 +5,7 @@
 //   --stage N    start the first level of a new game at stage N (1-28), see README
 //   --show-state show the GameState in the window title
 //   --no-widescreen start at the original 320 x 224 (the F1 menu can switch it later)
+//   --no-smooth-swing start with smooth swinging off (whatever the saved settings say)
 //   --easy-bounce start with Easy Bounce Attack on (Enhancements > Gameplay)
 //   --smooth-swing start with Smooth Swinging on (Enhancements > Graphics)
 //   --smooth-scroll start with Smooth Scrolling on (Enhancements > Graphics); --no-smooth-scroll off
@@ -43,6 +44,8 @@
 //   --show-touch show the touch controls on a desktop too (windowed)
 //   --interp-back X  with --dump: draw the last frame as interpolation would X frames earlier (0-1)
 //   --refresh HZ treat the display as running at HZ (windowed; for testing the pacing)
+//   --no-native  run the game on the interpreter only (builds with the translator, COI_JIT, run
+//                its translation of the ROM by default; docs/native.md)
 //   --press      hold a button (up/down/left/right/a/b/c/start) for a range of frames (also windowed)
 
 #include <SDL3/SDL.h>
@@ -58,8 +61,22 @@
 #endif
 #include "touch.h"
 #include "icon_data.h"
+#ifdef COI_NATIVE
+#include "native_rt.h"
+#ifdef COI_NATIVE
+#include "program.h"
+#include "arm64.h"
+#include "jit.h"
+#include "recomp_lists.h"
+#include "x64.h"
+
+#include <future>
+#endif
+#include <map>
+#endif
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +94,7 @@
 #include "mdplus.h"
 #include "menu.h"
 #include "patches.h"
+#include "rom_family.h"
 #include "settings.h"
 #include "smooth_scroll.h"
 #include "smooth_swing.h"
@@ -183,6 +201,8 @@ bool g_widescreen = true;
 bool g_easy_bounce = false;
 bool g_clean_rock_edges = true;                     // Enhancements > Graphics > Clean Rock Edges
 bool g_smooth_fades = true;                         // Enhancements > Graphics > Smooth Fades (fade.cpp)
+bool g_smooth_water = true;                         // Enhancements > Graphics > Smooth Water
+bool g_smooth_glass = true;                         // Enhancements > Graphics > Smooth Glass
 FadeSmoother g_fade;
 PaletteOverride g_fade_palette;                     // this frame's colours
 PaletteOverride g_fade_palette_back;                // for frames drawn between two game frames
@@ -209,6 +229,7 @@ constexpr int kLayerMargin = 2;
 constexpr int kLayerStride = kWideWidth + 2 * kLayerMargin;   // room for any width
 bool g_layered = false;
 std::vector<uint32_t> g_layers[LayeredFrame::kLayers];
+std::vector<uint32_t> g_water_layers[2];            // Smooth Water: plane A's water, low and high priority
 static_assert(LayeredFrame::kLayers == Vdp::LineLayers::kCount, "layer counts differ");
 float g_line_shifts[Vdp::kScreenHeight * 4];
 uint32_t g_line_backdrop[Vdp::kScreenHeight];
@@ -223,6 +244,21 @@ Vdp g_vdp(g_bus);
 Sound g_sound(g_bus);
 std::vector<int16_t> g_audio;                       // interleaved stereo samples for the current frame
 int g_irq_pending = 0;                              // bit n = interrupt level n pending
+// The CPU's interrupt input, as Musashi's m68k_set_irq keeps it (CPU_INT_LEVEL, nmi_pending):
+// the level, and a non-maskable one (a change to level 7) waiting to be taken. Translated code
+// reads these; Musashi keeps its own copy for when it runs. (The Mega Drive never raises 7.)
+int g_irq_level = 0;
+bool g_nmi_pending = false;
+
+void set_irq(int level)
+{
+    if (g_irq_level != 7 && level == 7)
+        g_nmi_pending = true;
+    g_irq_level = level;
+#ifndef COI_NO_INTERPRETER
+    m68k_set_irq(level);
+#endif
+}
 
 void update_irq()
 {
@@ -232,7 +268,12 @@ void update_irq()
             level = l;
             break;
         }
-    m68k_set_irq(level);
+    set_irq(level);
+}
+
+extern "C" unsigned int coi_native_irq_level(void)
+{
+    return g_nmi_pending ? 8 : unsigned(g_irq_level);
 }
 
 void raise_irq(int level)
@@ -562,6 +603,11 @@ void render_layer_line(Vdp& vdp, int line, bool wide)
         std::fill(row, row + stride, i == 0 && border ? 0xFF000000u : 0u);
         layers.layer[i] = row + border + kLayerMargin - margin;
     }
+    for (int i = 0; i < 2; i++) {
+        uint32_t* row = &g_water_layers[i][line * stride];
+        std::fill(row, row + stride, 0u);
+        layers.water[i] = row + border + kLayerMargin - margin;
+    }
     layers.sub_scale = kSubpixels;
     if (wide)
         vdp.render_line(line, nullptr, kWideWidth + 2 * margin, kWideMargin + margin, 1, &layers);
@@ -611,6 +657,684 @@ void render_line(Vdp& vdp, int line, uint32_t* row, bool wide)
     vdp.render_line(line, row + border, kWidth, 0, g_scale);
 }
 
+// Smooth Water: the big waterfalls of stages 11-13 flow by palette cycling: every 3 frames
+// the game moves colours 1-7 of palette line 2 (CRAM 33-39) up one place (colour 2 takes
+// colour 1's value, ..., colour 1 takes colour 7's), so their shades step down the streaks.
+// Between steps each colour is eased towards the value the next step will give it, so the
+// streaks glide instead. (The small waterfalls in the background cycle colours 11-14 of line
+// 3 every 17 frames; eased, their few shades pulsed, so they are left as they are.)
+struct WaterCycle {
+    int first, count, dir;                        // CRAM entries; +1: each takes the one below's
+    static constexpr int kMaxCount = 16;
+    uint16_t last[kMaxCount] = {};
+    uint16_t before[kMaxCount] = {};                // the colours before the last step
+    bool primed = false, on = false;
+    int frame = 0, last_step = -1000, period = 3;
+
+    void update(bool active, const uint16_t* cram)
+    {
+        frame++;
+        if (!active) {
+            primed = on = false;
+            return;
+        }
+        const uint16_t* now = cram + first;
+        bool rotated = primed, same = true;
+        for (int i = 0; i < count; i++) {
+            rotated &= now[i] == last[(i + count - dir) % count];
+            same &= now[i] == last[i];
+        }
+        if (rotated && !same) {
+            const int since = frame - last_step;
+            // A step a frame or two late (the game lags now and then) keeps the period.
+            if (since >= 2 && since <= 40 && (since < period || since > period + 2))
+                period = since;
+            last_step = frame;
+            std::copy(last, last + count, before);
+        }
+        std::copy(now, now + count, last);
+        primed = true;
+        // The cycle is running. A late step holds the next colours until it comes; one that
+        // doesn't come within two periods means the cycle stopped.
+        on = frame - last_step < 2 * period;
+    }
+
+    // The colours `back` game frames (0-1) before the current one, and how far (0-1) they
+    // are on their way to the next step's: a moment before the last step is the end of the
+    // step before it.
+    const uint16_t* colours_at(double back, double& t) const
+    {
+        const double since = frame - last_step - back;
+        if (since < 0) {
+            t = std::clamp((period + since) / period, 0.0, 1.0);
+            return before;
+        }
+        t = std::clamp(since / period, 0.0, 1.0);
+        return last;
+    }
+
+    // Sets the cycling colours in `palette` (as shown `back` game frames before the current
+    // one): the frame's (kept by update: by the time frames in between are drawn, CRAM may
+    // already hold the next frame's), eased towards their next values. (Smooth Fades would
+    // take a step of this cycle for a fade and ease it too, so its colours aren't used here.)
+    void apply(PaletteOverride& palette, double back) const
+    {
+        if (!on)
+            return;
+        double t;
+        const uint16_t* colours = colours_at(back, t);
+        auto scale = [](int v) { return (uint32_t)(v * 255 / 7); };
+        uint32_t now[kMaxCount];
+        for (int i = 0; i < count; i++) {
+            const uint16_t c = colours[i];
+            palette.source[first + i] = last[i];        // what CRAM holds for this frame
+            now[i] = scale((c >> 1) & 7) << 16 | scale((c >> 5) & 7) << 8 | scale((c >> 9) & 7);
+        }
+        for (int i = 0; i < count; i++) {
+            const uint32_t a = now[i], b = now[(i + count - dir) % count];
+            uint32_t mixed = 0xFF000000;
+            for (int shift = 0; shift <= 16; shift += 8) {
+                const double v = (a >> shift & 0xFF) * (1 - t) + (b >> shift & 0xFF) * t;
+                mixed |= (uint32_t)std::lround(v) << shift;
+            }
+            palette.rgb[first + i] = mixed;
+        }
+    }
+};
+WaterCycle g_water_cycles[1] = {{33, 7, 1}};
+
+// Smooth Water: some background water flows by palette cycling on plane B, a few colours that
+// all move one place every so many frames, so the shades step along the water:
+//   - stages 11 and 13: the small waterfalls (tiles 575, 576, 586 and 588; values 11-14 of
+//     palette line 3, CRAM 59-62) every 17 frames, each colour taking the next one's value
+//     (value 11 takes 12's, ..., 14 takes 11's);
+//   - stages 24 and 25: the trickles down the walls (tiles 668-679; values 6-8 of line 3, CRAM
+//     54-56) every 16 frames, each colour taking the one before's (7 takes 6's, 6 takes 8's).
+// Eased like the big waterfalls, their few, unevenly used shades made the whole water pulse;
+// so each step is morphed instead, column by column. In each column, each run of these pixels
+// is matched with itself one step later (a dynamic-programming match that keeps the order of
+// the pixels and pairs equal colours), and between steps the shades slide along the matched
+// pairs: the picture before the step moved forward and the one after it moved back, blended,
+// so the last picture before a step is the step itself.
+struct Flow {
+    int first_stage, last_stage;                    // game stage indexes ($FFFF42)
+    int first_value, count, dir;                    // values on palette line 3 (CRAM 48 + value); dir as WaterCycle
+    std::vector<uint16_t> tiles;
+    WaterCycle cycle;
+};
+Flow g_flows[] = {
+    {10, 12, 11, 4, -1, {575, 576, 586, 588}, {59, 4, -1}},
+    {23, 24, 6, 3, 1, {668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679}, {54, 3, 1}},
+};
+struct FlowRun { const Flow* flow; int x, y; std::vector<uint8_t> values; };   // plane pixels (x, y..), values 0..count-1
+std::map<std::vector<uint8_t>, std::vector<std::pair<int16_t, int16_t>>> g_flow_matches;
+std::vector<FlowRun> g_flow_runs;
+std::vector<uint32_t> g_flow_rgb, g_flow_rgb_back; // plane B colours (Vdp::plane_b_rgb)
+int g_flow_plane_w = 0, g_flow_plane_h = 0;
+
+// Matches a run of values with itself one step later: value v now shows the colour that value
+// v - dir shows after the step.
+const std::vector<std::pair<int16_t, int16_t>>& flow_match(const Flow& flow, const std::vector<uint8_t>& values)
+{
+    std::vector<uint8_t> key = values;
+    key.push_back((uint8_t)(flow.count * 4 + flow.dir + 1));    // the same values in another flow match differently
+    auto found = g_flow_matches.find(key);
+    if (found != g_flow_matches.end())
+        return found->second;
+    const int n = (int)values.size(), count = flow.count;
+    constexpr int kBand = 8;
+    std::vector<float> cost((n + 1) * (n + 1), 1e9f);
+    std::vector<uint8_t> from((n + 1) * (n + 1));
+    cost[0] = 0;
+    for (int i = 1; i <= n; i++)
+        for (int j = std::max(1, i - kBand); j <= std::min(n, i + kBand); j++) {
+            const float d = (values[i - 1] == (values[j - 1] - flow.dir + count) % count ? 0.0f : 1.0f)
+                            + 0.05f * std::abs(i - j);
+            const float diag = cost[(i - 1) * (n + 1) + j - 1], up = cost[(i - 1) * (n + 1) + j],
+                        left = cost[i * (n + 1) + j - 1];
+            const float best = std::min({diag, up, left});
+            cost[i * (n + 1) + j] = d + best;
+            from[i * (n + 1) + j] = best == diag ? 0 : best == up ? 1 : 2;
+        }
+    std::vector<std::pair<int16_t, int16_t>> pairs;
+    for (int i = n, j = n; i > 0 && j > 0;) {
+        pairs.push_back({(int16_t)(i - 1), (int16_t)(j - 1)});
+        const uint8_t f = from[i * (n + 1) + j];
+        if (f == 0) i--, j--;
+        else if (f == 1) i--;
+        else j--;
+    }
+    if (g_flow_matches.size() > 4096)
+        g_flow_matches.clear();
+    return g_flow_matches[key] = std::move(pairs);
+}
+
+// Finds the flowing pixels in plane B (their stages in play, Smooth Water on, their cycle
+// running) as runs down each column.
+void update_flows(bool on, uint16_t state)
+{
+    const int stage = g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43];
+    g_flow_runs.clear();
+    static const int kSizes[4] = {32, 64, 32, 128};
+    const int cells_w = kSizes[g_vdp.reg[16] & 3], cells_h = kSizes[(g_vdp.reg[16] >> 4) & 3];
+    const int base_b = (g_vdp.reg[4] & 0x07) << 13;
+    g_flow_plane_w = cells_w * 8, g_flow_plane_h = cells_h * 8;
+    for (Flow& flow : g_flows) {
+        flow.cycle.update(on && state == 0x0E && stage >= flow.first_stage && stage <= flow.last_stage, g_vdp.cram);
+        if (!flow.cycle.on)
+            continue;
+        std::map<int, std::vector<std::pair<int, uint8_t>>> columns;   // x -> (y, value)
+        for (int cy = 0; cy < cells_h; cy++)
+            for (int cx = 0; cx < cells_w; cx++) {
+                const uint32_t at = (base_b + (cy * cells_w + cx) * 2) & 0xFFFF;
+                const uint16_t entry = g_vdp.vram[at] << 8 | g_vdp.vram[at | 1];
+                const int tile = entry & 0x7FF;
+                if (((entry >> 13) & 3) != 3 || std::find(flow.tiles.begin(), flow.tiles.end(), tile) == flow.tiles.end())
+                    continue;
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++) {
+                        const int fx = entry & 0x0800 ? 7 - x : x, fy = entry & 0x1000 ? 7 - y : y;
+                        const uint8_t pair = g_vdp.vram[(tile * 32 + fy * 4 + (fx >> 1)) & 0xFFFF];
+                        const int value = (fx & 1 ? pair & 15 : pair >> 4) - flow.first_value;
+                        if (value >= 0 && value < flow.count)
+                            columns[cx * 8 + x].push_back({cy * 8 + y, (uint8_t)value});
+                    }
+            }
+        for (auto& [x, pixels] : columns) {
+            std::sort(pixels.begin(), pixels.end());
+            for (size_t i = 0; i < pixels.size();) {
+                FlowRun run{&flow, x, pixels[i].first, {}};
+                size_t k = i;
+                while (k < pixels.size() && pixels[k].first == run.y + (int)run.values.size())
+                    run.values.push_back(pixels[k++].second);
+                g_flow_runs.push_back(std::move(run));
+                i = k;
+            }
+        }
+    }
+}
+
+// The flowing pixels' colours `back` game frames (0-1) before the current one, into `out`
+// (plane B pixels; Vdp::plane_b_rgb). Returns false when there are none.
+bool flow_colours(std::vector<uint32_t>& out, double back)
+{
+    // Only the flowing pixels are set; clear the ones set last time (the runs may change).
+    static std::vector<size_t> set_before[2];
+    std::vector<size_t>& set = set_before[&out == &g_flow_rgb ? 0 : 1];
+    if (out.size() != (size_t)g_flow_plane_w * g_flow_plane_h)
+        out.assign((size_t)g_flow_plane_w * g_flow_plane_h, 0);
+    else
+        for (size_t at : set)
+            out[at] = 0;
+    set.clear();
+    if (g_flow_runs.empty())
+        return false;
+    auto scale = [](int v) { return v * 255.0f / 7; };
+    std::vector<float> acc;
+    const Flow* colours_of = nullptr;
+    double t = 0;
+    float now[WaterCycle::kMaxCount][3], next[WaterCycle::kMaxCount][3];
+    for (const FlowRun& run : g_flow_runs) {
+        const Flow& flow = *run.flow;
+        if (colours_of != &flow) {                  // this flow's colours now and after the step
+            colours_of = &flow;
+            // the frame's colours (CRAM may hold the next frame's by the time frames in
+            // between are drawn); a moment before the last step is the end of the one before
+            const uint16_t* colours = flow.cycle.colours_at(back, t);
+            for (int k = 0; k < flow.count; k++)
+                for (int ch = 0; ch < 3; ch++) {
+                    now[k][ch] = scale((colours[k] >> (1 + ch * 4)) & 7);
+                    next[k][ch] = scale((colours[(k - flow.dir + flow.count) % flow.count] >> (1 + ch * 4)) & 7);
+                }
+        }
+        const int n = (int)run.values.size();
+        acc.assign((size_t)n * 4, 0.0f);
+        for (const auto& [ya, yb] : flow_match(flow, run.values)) {
+            const double y = ya + (yb - ya) * t;
+            const int y0 = (int)std::floor(y);
+            const float f = (float)(y - y0);
+            for (const auto& [yy, w] : {std::pair<int, float>{y0, 1 - f}, {y0 + 1, f}}) {
+                if (yy < 0 || yy >= n || w <= 0)
+                    continue;
+                float* a = &acc[yy * 4];
+                for (int ch = 0; ch < 3; ch++)
+                    a[ch] += w * (float)((1 - t) * now[run.values[ya]][ch] + t * next[run.values[yb]][ch]);
+                a[3] += w;
+            }
+        }
+        for (int y = 0; y < n; y++) {
+            const float* a = &acc[y * 4];
+            float rgb[3];
+            for (int ch = 0; ch < 3; ch++)
+                rgb[ch] = a[3] > 0 ? a[ch] / a[3] : (t < 0.5 ? now : next)[run.values[y]][ch];
+            const size_t at = (size_t)((run.y + y) % g_flow_plane_h) * g_flow_plane_w + run.x;
+            set.push_back(at);
+            out[at] = 0xFF000000u | (uint32_t)std::lround(rgb[0]) << 16 | (uint32_t)std::lround(rgb[1]) << 8
+                      | (uint32_t)std::lround(rgb[2]);
+        }
+    }
+    return true;
+}
+
+// Points `vdp` at the flowing pixels' colours as shown `back` game frames before the current one.
+void set_flow_colours(Vdp& vdp, std::vector<uint32_t>& out, double back)
+{
+    if (flow_colours(out, back)) {
+        vdp.plane_b_rgb = out.data();
+        vdp.plane_b_rgb_w = g_flow_plane_w, vdp.plane_b_rgb_h = g_flow_plane_h;
+    } else {
+        vdp.plane_b_rgb = nullptr;
+    }
+}
+
+// Smooth Water: stage 10's waterspouts (object $0E, sprites from tile 848 to 917 on palette
+// line 1). The game animates them only by swapping each spout for its mirror image every 4-6
+// frames (its sprites' X mirrored about its middle, their flip bits toggled; the jet's edges
+// stay put), and bobs them a pixel up and down every 4 frames. They are drawn instead as a
+// smooth loop between the two poses, 5 frames towards the mirror image and 5 back, with the
+// in-between pictures morphed column by column: each column of the pose is matched to the
+// same column of the mirror image (a dynamic-programming match on opacity and brightness that
+// keeps the order of the pixels), and each matched pixel is moved part of the way up or down
+// while its colour blends. The bob is left out: a spout sitting one line below the highest
+// it has been over the last 8 frames is drawn one line higher (a real rise or fall still
+// shows). Each spout is the sprite from tile 848 (its crown's edge, whose flip bit tells the
+// pose) with the other sprites nearest to it, recognised from frame to frame by its middle in
+// the level. A spout is 80 pixels wide, with that sprite at its left edge, or flipped at its
+// right edge in the mirror image. Near the edges of the view the game leaves out the sprites
+// beyond them, so the picture is only taken while the spout's whole width is there; until
+// one has been, the spout is drawn as the game draws it. The game's own state is untouched:
+// this only changes what is drawn.
+struct SpoutMorph {
+    int key = 0;                                    // camera X * 2 + its sprites' left + right
+    int ys[8] = {}, seen = 0;                       // its top, newest first (for the bob)
+    int x = 0, y = 0, w = 0, h = 0;                 // view position and size
+    int sprite = 0;                                 // the anchor's sprite table index
+    std::vector<uint8_t> pose;                      // palette indexes (0 = clear), unflipped pose
+    std::vector<int> members;                       // its sprites' table indexes this frame
+    std::vector<std::vector<std::pair<int16_t, int16_t>>> pairs;   // per column: matched rows
+};
+std::vector<SpoutMorph> g_spouts;
+int g_spout_clock = 0;                              // game frames, for the loop
+
+constexpr int kSpoutLoop = 10;                      // frames for there and back
+constexpr int kSpoutWidth = 80;
+
+// The colour of palette index `i` as the frame shows it.
+uint32_t shown_rgb(int i)
+{
+    const uint16_t c = g_vdp.cram[i & 63];
+    if (g_vdp.palette && g_vdp.palette->source[i & 63] == c)
+        return g_vdp.palette->rgb[i & 63] & 0xFFFFFF;
+    auto scale = [](int v) { return (uint32_t)(v * 255 / 7); };
+    return scale((c >> 1) & 7) << 16 | scale((c >> 5) & 7) << 8 | scale((c >> 9) & 7);
+}
+
+// Matches each column of `spout.pose` with the same column of its mirror image.
+void match_spout_columns(SpoutMorph& spout)
+{
+    const int w = spout.w, h = spout.h;
+    auto feature = [&](int x, int y, float& opacity, float& light) {
+        const int i = spout.pose[y * w + x];
+        opacity = i ? 1.0f : 0.0f;
+        const uint32_t c = i ? shown_rgb(i) : 0;
+        light = ((c >> 16 & 0xFF) + (c >> 8 & 0xFF) + (c & 0xFF)) / 765.0f;
+    };
+    constexpr int kBand = 12;                       // the furthest a pixel moves
+    std::vector<float> cost((h + 1) * (h + 1));
+    std::vector<uint8_t> from((h + 1) * (h + 1));   // 0 diagonal, 1 up, 2 left
+    spout.pairs.assign(w, {});
+    for (int x = 0; x < w; x++) {
+        const int mx = w - 1 - x;                   // the mirror image's column x
+        std::fill(cost.begin(), cost.end(), 1e9f);
+        cost[0] = 0;
+        for (int i = 1; i <= h; i++)
+            for (int j = std::max(1, i - kBand); j <= std::min(h, i + kBand); j++) {
+                float oa, la, ob, lb;
+                feature(x, i - 1, oa, la);
+                feature(mx, j - 1, ob, lb);
+                const float d = std::abs(oa - ob) * 2 + std::abs(la - lb) + 0.02f * std::abs(i - j);
+                const float diag = cost[(i - 1) * (h + 1) + j - 1], up = cost[(i - 1) * (h + 1) + j],
+                            left = cost[i * (h + 1) + j - 1];
+                const float best = std::min({diag, up, left});
+                cost[i * (h + 1) + j] = d + best;
+                from[i * (h + 1) + j] = best == diag ? 0 : best == up ? 1 : 2;
+            }
+        auto& pairs = spout.pairs[x];
+        for (int i = h, j = h; i > 0 && j > 0;) {
+            pairs.push_back({(int16_t)(i - 1), (int16_t)(j - 1)});
+            const uint8_t f = from[i * (h + 1) + j];
+            if (f == 0) i--, j--;
+            else if (f == 1) i--;
+            else j--;
+        }
+    }
+}
+
+// Finds the spouts in the sprite list (stage 10 in play with Smooth Water on), keeps their
+// poses and matches up to date, and steadies their position.
+void update_spouts(bool on, uint16_t state)
+{
+    const bool here = on && state == 0x0E && (g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43]) == 9;
+    g_vdp.hidden_sprites.clear();
+    if (!here) {
+        g_spouts.clear();
+        return;
+    }
+    g_spout_clock++;
+    struct Piece { int index, x, y, w, h; uint16_t attr; };
+    std::vector<Piece> anchors, others;
+    const int base = g_vdp.reg[12] & 0x01 ? (g_vdp.reg[5] & 0x7E) << 9 : (g_vdp.reg[5] & 0x7F) << 9;
+    int link = 0;
+    for (int n = 0; n < 80; n++) {
+        const uint8_t* s = &g_vdp.vram[(base + link * 8) & 0xFFFF];
+        const uint16_t attr = s[4] << 8 | s[5];
+        const int tile = attr & 0x7FF;
+        if (tile >= 848 && tile <= 917 && ((attr >> 13) & 3) == 1)
+            (tile == 848 ? anchors : others).push_back({link, ((s[6] << 8 | s[7]) & 0x1FF) - 128,
+                                                        ((s[0] << 8 | s[1]) & 0x3FF) - 128,
+                                                        ((s[2] >> 2) & 3) + 1, (s[2] & 3) + 1, attr});
+        link = s[3] & 0x7F;
+        if (!link)
+            break;
+    }
+    const int camera_x = (int16_t)(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]);
+    std::vector<SpoutMorph> now;
+    for (const Piece& anchor : anchors) {
+        const bool flipped = anchor.attr & 0x0800;
+        const int x0 = flipped ? anchor.x + anchor.w * 8 - kSpoutWidth : anchor.x, x1 = x0 + kSpoutWidth;
+        std::vector<const Piece*> members = {&anchor};
+        for (const Piece& p : others) {
+            const Piece* nearest = nullptr;
+            for (const Piece& a : anchors)
+                if (!nearest || std::abs(p.x - a.x) + std::abs(p.y - a.y) < std::abs(p.x - nearest->x) + std::abs(p.y - nearest->y))
+                    nearest = &a;
+            if (nearest == &anchor && p.x >= x0 && p.x + p.w * 8 <= x1 && p.y >= anchor.y - 16)
+                members.push_back(&p);                  // inside its box
+        }
+        int y0 = 1 << 20, y1 = -(1 << 20), left = 1 << 20, right = -(1 << 20);
+        for (const Piece* p : members) {
+            left = std::min(left, p->x), right = std::max(right, p->x + p->w * 8);
+            y0 = std::min(y0, p->y), y1 = std::max(y1, p->y + p->h * 8);
+        }
+        const bool whole = left == x0 && right == x1;   // no sprite left out at a view edge
+        SpoutMorph spout;
+        spout.key = camera_x * 2 + x0 + x1;
+        for (const SpoutMorph& old : g_spouts)
+            if (std::abs(old.key - spout.key) <= 8)
+                spout = old;
+        spout.key = camera_x * 2 + x0 + x1;
+        spout.x = x0, spout.sprite = anchor.index;
+        spout.members.clear();
+        for (const Piece* p : members)
+            spout.members.push_back(p->index);
+        // The picture, drawn back to front (the sprite list's first is in front), unflipped:
+        // mirrored back when the game shows the mirror image.
+        const int w = x1 - x0, h = y1 - y0;
+        std::vector<uint8_t> pose(w * h);
+        for (auto it = members.rbegin(); it != members.rend(); ++it) {
+            const Piece& p = **it;
+            for (int cy = 0; cy < p.h * 8; cy++)
+                for (int cx = 0; cx < p.w * 8; cx++) {
+                    const int col = p.attr & 0x0800 ? p.w * 8 - 1 - cx : cx;
+                    const int row = p.attr & 0x1000 ? p.h * 8 - 1 - cy : cy;
+                    const int tile = (p.attr & 0x7FF) + (col >> 3) * p.h + (row >> 3);
+                    const uint8_t pair = g_vdp.vram[(tile * 32 + (row & 7) * 4 + ((col & 7) >> 1)) & 0xFFFF];
+                    const int pixel = col & 1 ? pair & 15 : pair >> 4;
+                    if (!pixel)
+                        continue;
+                    int px = p.x - x0 + cx;
+                    if (flipped)
+                        px = w - 1 - px;
+                    if (px >= 0 && px < w)
+                        pose[(p.y - y0 + cy) * w + px] = (uint8_t)(((p.attr >> 9) & 0x30) | pixel);
+                }
+        }
+        if (whole && (pose != spout.pose || w != spout.w || h != spout.h)) {
+            spout.pose = pose;
+            spout.w = w, spout.h = h;
+            match_spout_columns(spout);
+        }
+        // Steady: one line higher while one line below the highest of the last 8 frames.
+        std::move_backward(spout.ys, spout.ys + 7, spout.ys + 8);
+        spout.ys[0] = y0;
+        spout.seen = std::min(spout.seen + 1, 8);
+        const int highest = *std::min_element(spout.ys, spout.ys + spout.seen);
+        spout.y = y0 == highest + 1 ? highest : y0;
+        now.push_back(std::move(spout));
+    }
+    g_spouts = std::move(now);
+}
+
+// Sets `vdp`'s overlays to the spouts as the loop shows them `back` game frames (0-1) before
+// the current one.
+void spout_overlays(Vdp& vdp, double back)
+{
+    vdp.overlays.clear();
+    const double phase = std::fmod(g_spout_clock - back + kSpoutLoop * 1000.0, (double)kSpoutLoop) / (kSpoutLoop / 2);
+    const double t = phase <= 1 ? phase : 2 - phase;    // 0: the pose, 1: its mirror image
+    for (const SpoutMorph& spout : g_spouts) {
+        if (spout.pose.empty())
+            continue;                               // not seen whole yet: the game's sprites
+        if (&vdp == &g_vdp) {
+            vdp.hidden_sprites.resize(80);
+            for (int index : spout.members)
+                vdp.hidden_sprites[index] = 1;
+        }
+        const int w = spout.w, h = spout.h;
+        std::vector<float> acc((size_t)w * h * 5, 0.0f);    // premultiplied r, g, b, alpha; weight
+        for (int x = 0; x < w; x++)
+            for (const auto& [i, j] : spout.pairs[x]) {
+                const int ia = spout.pose[i * w + x], ib = spout.pose[j * w + (w - 1 - x)];
+                const uint32_t ca = ia ? shown_rgb(ia) : 0, cb = ib ? shown_rgb(ib) : 0;
+                const float aa = ia ? 1.0f : 0.0f, ab = ib ? 1.0f : 0.0f;
+                const float alpha = (float)(aa * (1 - t) + ab * t);
+                const double y = i * (1 - t) + j * t;
+                const int y0 = (int)std::floor(y);
+                const float f = (float)(y - y0);
+                for (const auto& [yy, wt] : {std::pair<int, float>{y0, 1 - f}, {y0 + 1, f}}) {
+                    if (yy < 0 || yy >= h || wt <= 0)
+                        continue;
+                    float* a = &acc[((size_t)yy * w + x) * 5];
+                    for (int k = 0; k < 3; k++) {
+                        const int shift = 16 - k * 8;
+                        a[k] += (float)(((ca >> shift & 0xFF) * aa * (1 - t) + (cb >> shift & 0xFF) * ab * t)) * wt;
+                    }
+                    a[3] += alpha * wt;
+                    a[4] += wt;
+                }
+            }
+        Vdp::Overlay overlay;
+        overlay.x = spout.x, overlay.y = spout.y, overlay.w = w, overlay.h = h, overlay.sprite = spout.sprite;
+        overlay.argb.assign((size_t)w * h, 0);
+        for (size_t p = 0; p < overlay.argb.size(); p++) {
+            const float* a = &acc[p * 5];
+            if (a[4] <= 0 || a[3] <= 0.01f)
+                continue;
+            const float alpha = std::min(1.0f, a[3] / a[4]);
+            uint32_t c = (uint32_t)std::lround(alpha * 255) << 24;
+            for (int k = 0; k < 3; k++)
+                c |= (uint32_t)std::clamp((int)std::lround(a[k] / a[3]), 0, 255) << (16 - k * 8);
+            overlay.argb[p] = c;
+        }
+        vdp.overlays.push_back(std::move(overlay));
+    }
+}
+
+// Smooth Water: stage 25's water surface (plane A tiles 416 and 417, palette line 2) has two
+// animation frames: every 16 frames the game rewrites the tiles with the other one (the crest
+// low, then high). Once both have been seen, the frames in between are morphed column by
+// column, as the spouts are (each column of one frame matched with the same column of the
+// other, the matched pixels moving part of the way while their colour and opacity blend):
+// the frame now moved towards the other one and the other one moved back, blended, so the last
+// picture before a swap is the swap itself. Drawn through Vdp::tile_rgba.
+struct TileSwap {
+    int first_stage, last_stage;                    // game stage indexes ($FFFF42)
+    std::vector<uint16_t> tiles;
+    int palette_line;
+    // per tile: its pixels now and in the other frame (palette values 0-15), and the matched
+    // rows of each column (now -> other)
+    std::vector<std::array<uint8_t, 64>> now, other;
+    std::vector<std::array<std::vector<std::pair<int8_t, int8_t>>, 8>> pairs;
+    bool known = false;                             // both frames seen
+    int frame = 0, last_swap = -1000, period = 16;
+};
+TileSwap g_tile_swaps[] = {
+    {23, 24, {416, 417}, 2},
+};
+
+std::array<uint8_t, 64> tile_values(int tile)
+{
+    std::array<uint8_t, 64> v;
+    for (int i = 0; i < 64; i++) {
+        const uint8_t pair = g_vdp.vram[(tile * 32 + (i >> 1)) & 0xFFFF];
+        v[i] = i & 1 ? pair & 15 : pair >> 4;
+    }
+    return v;
+}
+
+// Matches each column of `a` with the same column of `b` (opacity and brightness, keeping the
+// order of the pixels).
+std::array<std::vector<std::pair<int8_t, int8_t>>, 8> match_tile_columns(const std::array<uint8_t, 64>& a,
+                                                                         const std::array<uint8_t, 64>& b, int line)
+{
+    std::array<std::vector<std::pair<int8_t, int8_t>>, 8> out;
+    auto feature = [&](uint8_t value, float& opacity, float& light) {
+        opacity = value ? 1.0f : 0.0f;
+        const uint32_t c = value ? shown_rgb(line * 16 + value) : 0;
+        light = ((c >> 16 & 0xFF) + (c >> 8 & 0xFF) + (c & 0xFF)) / 765.0f;
+    };
+    for (int x = 0; x < 8; x++) {
+        float cost[9][9];
+        uint8_t from[9][9] = {};
+        for (auto& row : cost)
+            for (float& c : row)
+                c = 1e9f;
+        cost[0][0] = 0;
+        for (int i = 1; i <= 8; i++)
+            for (int j = 1; j <= 8; j++) {
+                float oa, la, ob, lb;
+                feature(a[(i - 1) * 8 + x], oa, la);
+                feature(b[(j - 1) * 8 + x], ob, lb);
+                const float d = std::abs(oa - ob) * 2 + std::abs(la - lb) + 0.02f * std::abs(i - j);
+                const float best = std::min({cost[i - 1][j - 1], cost[i - 1][j], cost[i][j - 1]});
+                cost[i][j] = d + best;
+                from[i][j] = best == cost[i - 1][j - 1] ? 0 : best == cost[i - 1][j] ? 1 : 2;
+            }
+        for (int i = 8, j = 8; i > 0 && j > 0;) {
+            out[x].push_back({(int8_t)(i - 1), (int8_t)(j - 1)});
+            if (from[i][j] == 0) i--, j--;
+            else if (from[i][j] == 1) i--;
+            else j--;
+        }
+    }
+    return out;
+}
+
+// Follows the swaps (their stages in play, Smooth Water on).
+void update_tile_swaps(bool on, uint16_t state)
+{
+    const int stage = g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43];
+    for (TileSwap& swap : g_tile_swaps) {
+        swap.frame++;
+        if (!on || state != 0x0E || stage < swap.first_stage || stage > swap.last_stage) {
+            swap.now.clear();
+            swap.known = false;
+            continue;
+        }
+        const size_t n = swap.tiles.size();
+        std::vector<std::array<uint8_t, 64>> current(n);
+        for (size_t k = 0; k < n; k++)
+            current[k] = tile_values(swap.tiles[k]);
+        if (swap.now.empty()) {
+            swap.now = current;
+            continue;
+        }
+        if (current == swap.now)
+            continue;
+        // a swap: back to the other frame (the cycle runs), or a first or new one
+        const bool cycling = swap.known && current == swap.other;
+        const int since = swap.frame - swap.last_swap;
+        if (cycling && since >= 2 && since <= 64 && (since < swap.period || since > swap.period + 2))
+            swap.period = since;
+        swap.other = swap.now;
+        swap.now = current;
+        swap.last_swap = swap.frame;
+        swap.known = true;
+        swap.pairs.resize(n);
+        for (size_t k = 0; k < n; k++)
+            swap.pairs[k] = match_tile_columns(swap.now[k], swap.other[k], swap.palette_line);
+    }
+}
+
+// Sets `vdp`'s tile pictures to the swaps as shown `back` game frames (0-1) before the current one.
+void set_tile_swaps(Vdp& vdp, double back)
+{
+    vdp.tile_rgba_index.clear();
+    vdp.tile_rgba.clear();
+    for (const TileSwap& swap : g_tile_swaps) {
+        if (!swap.known || swap.frame - swap.last_swap >= 2 * swap.period)
+            continue;                               // not swapping (yet)
+        // t: how far the frame shown is on its way to the other one; a moment before the last
+        // swap is the end of the way from the other one
+        const double since = swap.frame - swap.last_swap - back;
+        const bool before = since < 0;
+        const double t = std::clamp(before ? (swap.period + since) / swap.period : since / swap.period, 0.0, 1.0);
+        vdp.tile_rgba_index.resize(2048, -1);
+        for (size_t k = 0; k < swap.tiles.size(); k++) {
+            const auto& from = before ? swap.other[k] : swap.now[k];
+            const auto& to = before ? swap.now[k] : swap.other[k];
+            std::array<float, 64 * 5> acc{};        // premultiplied r, g, b, alpha; weight
+            for (int x = 0; x < 8; x++)
+                for (const auto& [i0, j0] : swap.pairs[k][x]) {
+                    // pairs map now -> other; the other way round before the last swap
+                    const int i = before ? j0 : i0, j = before ? i0 : j0;
+                    const int va = from[i * 8 + x], vb = to[j * 8 + x];
+                    const uint32_t ca = va ? shown_rgb(swap.palette_line * 16 + va) : 0;
+                    const uint32_t cb = vb ? shown_rgb(swap.palette_line * 16 + vb) : 0;
+                    const float aa = va ? 1.0f : 0.0f, ab = vb ? 1.0f : 0.0f;
+                    const double y = i * (1 - t) + j * t;
+                    const int y0 = (int)std::floor(y);
+                    const float f = (float)(y - y0);
+                    for (const auto& [yy, w] : {std::pair<int, float>{y0, 1 - f}, {y0 + 1, f}}) {
+                        if (yy < 0 || yy > 7 || w <= 0)
+                            continue;
+                        float* a = &acc[(yy * 8 + x) * 5];
+                        for (int ch = 0; ch < 3; ch++) {
+                            const int shift = 16 - ch * 8;
+                            a[ch] += w * (float)((ca >> shift & 0xFF) * aa * (1 - t) + (cb >> shift & 0xFF) * ab * t);
+                        }
+                        a[3] += w * (float)(aa * (1 - t) + ab * t);
+                        a[4] += w;
+                    }
+                }
+            std::array<uint32_t, 64> picture{};
+            for (int p = 0; p < 64; p++) {
+                const float* a = &acc[p * 5];
+                if (a[4] <= 0 || a[3] <= 0.01f)
+                    continue;
+                const float alpha = std::min(1.0f, a[3] / a[4]);
+                uint32_t c = (uint32_t)std::lround(alpha * 255) << 24;
+                for (int ch = 0; ch < 3; ch++)
+                    c |= (uint32_t)std::clamp((int)std::lround(a[ch] / a[3]), 0, 255) << (16 - ch * 8);
+                picture[p] = c;
+            }
+            vdp.tile_rgba_index[swap.tiles[k]] = (int16_t)vdp.tile_rgba.size();
+            vdp.tile_rgba.push_back(picture);
+        }
+    }
+}
+
+// The colours as CRAM holds them, as a palette override (when Smooth Fades isn't making one).
+void fill_plain_palette(PaletteOverride& out, const uint16_t* cram)
+{
+    auto scale = [](int v) { return (uint32_t)(v * 255 / 7); };
+    for (int i = 0; i < 64; i++) {
+        const uint16_t c = cram[i];
+        out.source[i] = c;
+        out.rgb[i] = 0xFF000000 | scale((c >> 1) & 7) << 16 | scale((c >> 5) & 7) << 8 | scale((c >> 9) & 7);
+    }
+}
+
 // High Refresh Interpolation (interp.cpp): the last two game frames, and a second VDP that
 // redraws the current one for a moment between them.
 FrameInterpolator g_interp;
@@ -638,11 +1362,21 @@ void render_interpolated(uint32_t* pixels, double back)
     v.strip_cells_w = g_vdp.strip_cells_w;
     v.clean_black_edges = g_vdp.clean_black_edges;
     v.edge_tiles = g_vdp.edge_tiles;
+    v.water_tiles = g_vdp.water_tiles;
+    v.hidden_sprites = g_vdp.hidden_sprites;
+    spout_overlays(v, back);
+    set_flow_colours(v, g_flow_rgb_back, back);
+    set_tile_swaps(v, back);
     std::memcpy(v.edge_palette, g_vdp.edge_palette, sizeof(v.edge_palette));
     v.sprite_limit = g_vdp.sprite_limit;
     v.palette = nullptr;
     if (g_vdp.palette) {
-        g_fade.fill(g_fade_palette_back, back);
+        if (g_smooth_fades)
+            g_fade.fill(g_fade_palette_back, back);
+        else
+            fill_plain_palette(g_fade_palette_back, g_vdp.cram);
+        for (const WaterCycle& cycle : g_water_cycles)
+            cycle.apply(g_fade_palette_back, back);
         v.palette = &g_fade_palette_back;
     }
     v.sprite_masking = g_vdp.sprite_masking;
@@ -885,6 +1619,23 @@ GpuTimer g_gpu_timer;
 #define TIMED(total, work) work
 #endif
 
+#ifdef COI_NATIVE
+Uint64 g_cpu_time = 0;      // time running the 68000 (interpreted or translated), for headless runs
+int64_t g_cpu_cycles = 0, g_native_cycles = 0;      // 68000 cycles run in all, and by translated code
+std::map<uint32_t, int64_t> g_interpreted;          // --native: where the interpreter ran, and how often
+#endif
+
+#ifdef COI_NATIVE
+void native_poll();
+int cpu_execute(int cycles);
+void native_reset();
+uint32_t cpu_reg(m68k_register_t r);
+void native_sync();
+void cpu_reset();
+#else
+void cpu_reset() { m68k_pulse_reset(); }            // (without the translator, Musashi's own)
+#endif
+
 // Refilling the planes after widescreen is switched on during level play. The game streams
 // one block column (16 pixels) whenever a camera's X crosses a multiple of 16, keeping each
 // plane loaded with the 32 block columns from X/16 - 7 to X/16 + 24 (block b in plane
@@ -967,11 +1718,66 @@ void refill_planes_if_due()
     }
 }
 
+// Smooth Water: the tiles that draw water as a dithered pattern on plane A, by the game's
+// stage index ($FFFF42), and the pixel values (bit p for value p) in them that are water.
+// All are drawn with high priority, in front of the sprites.
+// Smooth Glass uses the same drawing for the library's glass jars, under its own setting.
+struct WaterTiles {
+    uint8_t first_stage, last_stage;
+    uint16_t first, last;
+    uint32_t values;                                // Vdp::water_tiles: water, and (<< 16) behind it
+    bool glass;                                     // Smooth Glass rather than Smooth Water
+};
+constexpr WaterTiles kWaterTiles[] = {
+    {5, 8, 756, 796, 1 << 10, false},               // stages 6-9: the jello pits (value 10: a checkerboard
+                                                    // in the middle, solid at the rims)
+    {9, 9, 491, 502, 1 << 10, false},               // stage 10: foam where the cave falls land (checkerboard)
+    {10, 12, 330, 345, 0xFFFE, false},              // stages 11-13: waterfalls (streaks with gaps), and
+    {10, 12, 346, 357, 0xFF0000FE, false},          // where they cross or end a ledge (streaks in values
+                                                    // 1-7, the ledge in 8-15)
+    {13, 17, 480, 482, 1 << 14, true},              // stages 14 and 16-19: the glass jars (value 14,
+    {13, 17, 485, 486, 1 << 14, true},              // a checkerboard in the middle, solid at the rim)
+    {13, 17, 490, 490, 1 << 14, true},
+    {18, 20, 640, 643, 1 << 2, false},              // stages 20-22: swimming in the tea (checkerboard
+                                                    // over the whole picture)
+    {23, 24, 410, 413, 1 << 4, false},              // stages 24-25: the flooded castle (checkerboard)
+    {23, 24, 418, 421, 1 << 7, false},
+};
+
+// Sets g_vdp.water_tiles for the stage being played (empty outside level play, in stages
+// without water or glass, or with Smooth Water and Smooth Glass off).
+void update_water_tiles(bool water, bool glass, uint16_t state)
+{
+    const int stage = state == 0x0E ? g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43] : -1;
+    const int key = stage * 4 + water * 2 + glass;
+    static int shown = -2;
+    if (key == shown)
+        return;
+    shown = key;
+    g_vdp.water_tiles.clear();
+    for (const WaterTiles& w : kWaterTiles)
+        if (stage >= w.first_stage && stage <= w.last_stage && (w.glass ? glass : water)) {
+            g_vdp.water_tiles.resize(2048);
+            for (int t = w.first; t <= w.last; t++)
+                g_vdp.water_tiles[t] = w.values;
+        }
+}
+
 void run_frame(uint32_t* pixels)
 {
+#ifdef COI_NATIVE
+    native_poll();                                  // a ROM image translated meanwhile (--jit)
+#endif
     refill_planes_if_due();
     g_audio.clear();
     g_vdp.start_frame();
+    const uint16_t state = g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301];
+    const int stage_index = g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43];
+    bool cycling = false;
+    for (WaterCycle& cycle : g_water_cycles) {
+        cycle.update(g_smooth_water && state == 0x0E && stage_index >= 10 && stage_index <= 12, g_vdp.cram);
+        cycling |= cycle.on;
+    }
     if (g_smooth_fades) {                           // CRAM holds this frame's colours by now
         g_fade.update(g_vdp.cram);
         g_fade.fill(g_fade_palette);
@@ -979,8 +1785,14 @@ void run_frame(uint32_t* pixels)
     } else {
         g_fade.reset();
         g_vdp.palette = nullptr;
+        if (cycling) {
+            fill_plain_palette(g_fade_palette, g_vdp.cram);
+            g_vdp.palette = &g_fade_palette;
+        }
     }
-    const uint16_t state = g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301];
+    if (g_vdp.palette)
+        for (const WaterCycle& cycle : g_water_cycles)
+            cycle.apply(g_fade_palette, 0.0);
     const uint16_t level = g_bus.ram[0xFF44] << 8 | g_bus.ram[0xFF45];
     const uint16_t act = g_bus.ram[0xFF46] << 8 | g_bus.ram[0xFF47];
     const bool wide = g_widescreen && is_wide_state(state, level, g_bus.ram);
@@ -1026,6 +1838,13 @@ void run_frame(uint32_t* pixels)
     g_vdp.extend_plane_b_inside = wide && g_strip_rule == StripRule::TheatreFill;
     g_vdp.strip_b_priority_right = g_strip_rule == StripRule::StoryFill;
     g_vdp.clean_black_edges = g_clean_rock_edges && state == 0x0E && level == 0;   // forest stages
+    update_water_tiles(g_smooth_water, g_smooth_glass, state);
+    update_spouts(g_smooth_water, state);
+    spout_overlays(g_vdp, 0.0);
+    update_flows(g_smooth_water, state);
+    set_flow_colours(g_vdp, g_flow_rgb, 0.0);
+    update_tile_swaps(g_smooth_water, state);
+    set_tile_swaps(g_vdp, 0.0);
     for (int i = 0; i < 64; i++)
         g_vdp.edge_palette[i] = g_bus.ram[0xF800 + i * 2] << 8 | g_bus.ram[0xF801 + i * 2];
     // Stage 15's building tops (objects $BE and $BF) are sprites the game moves with plane
@@ -1062,7 +1881,15 @@ void run_frame(uint32_t* pixels)
         }
         if (g_vdp.hint_line() && g_vdp.hint_enabled())
             raise_irq(4);
+#ifdef COI_NATIVE
+        const Uint64 cpu_start = SDL_GetTicksNS();
+#endif
+#ifdef COI_NATIVE
+        TIMED(g_time_cpu, g_cpu_cycles += cpu_execute(kCyclesPerLine));
+        g_cpu_time += SDL_GetTicksNS() - cpu_start;
+#else
         TIMED(g_time_cpu, m68k_execute(kCyclesPerLine));
+#endif
         TIMED(g_time_sound, g_sound.run(kZ80CyclesPerLine, g_audio));
     }
 }
@@ -1104,8 +1931,8 @@ void power_on()
     g_fade.reset();
     g_sound.power_on();
     g_irq_pending = 0;
-    m68k_set_irq(0);
-    m68k_pulse_reset();
+    set_irq(0);
+    cpu_reset();
 }
 
 // Moves the live camera limits between their original and widescreen values, so switching
@@ -1140,24 +1967,338 @@ void retune_camera_limits(bool wide)
     }
 }
 
+// The settings that patch the ROM, and the image they make. `report`: patches skipped go to
+// stderr (the image running; not the ones translated ahead).
+RomSettings current_rom_settings()
+{
+    return {g_widescreen, g_smooth_swing, g_cheats};
+}
+
+std::vector<uint8_t> make_rom(const RomSettings& s, bool report)
+{
+    return make_rom_image(g_rom_original, s, report);
+}
+
+// --save-rom FILE: the ROM as this run's settings patch it; --save-rom-family DIR: the image
+// family the readable C is generated from (rom_family.h; the build's coi_family does the same).
+std::string g_save_rom_path, g_save_rom_family;
+
+#ifdef COI_NATIVE_C
+}  // namespace (the C translation's symbols are the generated C's own)
+extern "C" {
+// The C translation linked in (-DCOI_NATIVE=ON, or the readable C with COI_READABLE): its code,
+// and for the readable C the hashes of its image family (the image with no setting on, then each
+// setting's image alone, in kRomSettings' order; none for a translation of one image).
+extern const CoiNativeCode coi_native_c;
+extern const uint64_t coi_native_family[];
+extern const int coi_native_family_count;
+uint32_t coi_native_settings = 0;       // (readable_rt.h) the readable C's settings bits
+}
+namespace {
+
+#define COI_NATIVE_BUILT_IN (&coi_native_c)
+
+uint64_t rom_hash(const std::vector<uint8_t>& rom);
+uint64_t running_rom_hash();
+
+// The family's code fits the ROM as patched now if the image with no settings is the one it came
+// from and so is each setting's on its own (the settings never touch the same bytes, so any mix
+// of them is these together); coi_native_settings then picks the variants. Each image is built
+// and hashed once.
+bool native_family_matches()
+{
+    static std::vector<int> known;              // per image: 0 not yet, 1 the same, -1 not
+    if (known.empty()) known.assign(size_t(coi_native_family_count), 0);
+    auto same = [&](size_t k, const RomSettings& s) {
+        if (k >= known.size()) return false;
+        if (!known[k]) known[k] = rom_hash(make_rom(s, false)) == coi_native_family[k] ? 1 : -1;
+        return known[k] > 0;
+    };
+    if (!same(0, RomSettings{})) return false;
+    const RomSettings now = current_rom_settings();
+    const uint32_t mask = rom_settings_mask(now);
+    for (size_t k = 0; k < kRomSettingCount; k++)
+        if (mask & (1u << k)) {
+            RomSettings one{};
+            kRomSettings[k].field(one) = true;
+            if (!same(k + 1, one)) return false;
+        }
+    // (and the ROM running is that image: nothing else, an MD+ pack's hooks say, patched it)
+    static std::map<uint32_t, uint64_t> composed;
+    if (!composed.count(mask)) composed[mask] = rom_hash(make_rom(now, false));
+    if (running_rom_hash() != composed[mask]) return false;
+    coi_native_settings = mask;
+    return true;
+}
+#endif
+
+#ifdef COI_NATIVE_DEV
+#include "native_dev.inc"           // (local development builds: port/native_dev.cmake)
+#endif
+
+#ifdef COI_NATIVE
+// COI_NO_INTERPRETER: translated code is the only CPU (no Musashi linked): always --native --jit,
+// translated at once, CPU state only ever ours, and anything it can't run stops the game with a
+// message (native_fatal).
+#ifdef COI_NO_INTERPRETER
+constexpr bool kNoInterpreter = true;
+#else
+constexpr bool kNoInterpreter = false;
+#endif
+// The 68000's cycle tables as Musashi counts them (recomp/cycles68000.c, written by a development
+// build with --write-cycles and checked against Musashi's at start-up there).
+extern "C" const uint8_t coi_exception_cycles_68000[256];
+extern "C" void coi_cycles_68000(uint8_t* out);
+// The translated code the port runs: the app's own (--jit, always on), unless a development
+// build links a translation in.
+#ifdef COI_NATIVE_BUILT_IN
+const CoiNativeCode* g_native_code = COI_NATIVE_BUILT_IN;
+bool g_native_jit = false;
+#else
+const CoiNativeCode* g_native_code = nullptr;
+bool g_native_jit = true;
+#endif
+bool g_native_rom_ok = false;       // the ROM as patched now is the one the code was translated from
+const bool g_native_strict = kNoInterpreter        // (without an interpreter, as strict as can be)
+    || (std::getenv("COI_NATIVE_STRICT") && std::atoi(std::getenv("COI_NATIVE_STRICT")));  // (see strict_check)
+std::map<uint32_t, double> g_on_demand;     // translated on demand (native_on_demand): address -> ms
+std::set<uint32_t> g_on_demand_failed;      // addresses that couldn't be translated on demand
+
+// An image's hash, for matching it with translations: hashing takes a few milliseconds on a
+// phone, so the image running is hashed once each time it's built (build_rom clears it).
+uint64_t rom_hash(const std::vector<uint8_t>& rom)
+{
+    return coi_native_hash(rom.data(), uint32_t(rom.size()));
+}
+bool g_rom_hash_known = false;
+uint64_t g_rom_hash = 0;
+
+uint64_t running_rom_hash()
+{
+    if (!g_rom_hash_known) {
+        g_rom_hash = rom_hash(g_bus.rom);
+        g_rom_hash_known = true;
+    }
+    return g_rom_hash;
+}
+
+bool native_rom_matches(const CoiNativeCode* code, size_t size, uint64_t hash)
+{
+#ifdef COI_NATIVE_C
+    if (code == &coi_native_c && coi_native_family_count > 0)     // (the readable C: by its images)
+        return native_family_matches();
+#endif
+    return code && size == code->rom_size && hash == code->rom_hash;
+}
+
+bool native_rom_matches(const CoiNativeCode* code)
+{
+    return native_rom_matches(code, g_bus.rom.size(), running_rom_hash());
+}
+
+// --jit: the configuration and the tracer's lists (read once, at start-up), and a translation
+// of a ROM image with them.
+struct JitInput {
+    recomp::Config config;
+    std::vector<uint32_t> list;
+    bool trace = false;
+};
+JitInput g_jit_input;
+struct JitResult {
+    const CoiNativeCode* code = nullptr;
+    size_t functions = 0;
+    std::string error;
+    std::map<uint32_t, std::string> failed;     // functions left out, and why
+    std::set<uint32_t> unresolved;              // computed jumps and calls left to the interpreter
+    double ms = 0;                              // how long translating took
+    bool known = false;                         // (ahead) the image has a translation already
+};
+
+JitResult jit_translate(const JitInput& input, const std::vector<uint8_t>& bytes, bool arm64, uint32_t frame = 0)
+{
+    const Uint64 t0 = SDL_GetTicksNS();
+    JitResult r;
+    try {
+        const recomp::Rom rom{bytes};
+        recomp::Program program(rom, input.config);
+        program.add_all(input.list, nullptr);
+        r.functions = program.functions().size();
+        r.failed = program.failed();
+        r.unresolved = program.unresolved();
+        r.code = arm64 ? recomp::translate_arm64(program, input.trace, &r.error, frame)
+                       : recomp::translate_x64(program, input.trace, &r.error, frame);
+    } catch (const std::exception& ex) {
+        r.error = ex.what();
+    }
+    r.ms = (SDL_GetTicksNS() - t0) / 1e6;
+    return r;
+}
+
+// Every translation made so far, one per ROM image (the settings that patch the ROM: widescreen,
+// smooth swinging, cheats). When the player changes one in the game, the new image is
+// translated on a thread while the interpreter runs it, and its code runs from the first frame
+// after that; going back to an image translated before switches at once.
+#if defined(__aarch64__) || defined(_M_ARM64)
+constexpr bool kArm64 = true;
+#else
+constexpr bool kArm64 = false;
+#endif
+std::vector<const CoiNativeCode*> g_native_variants;
+std::future<JitResult> g_native_pending;
+bool g_native_variants_on = false;          // --jit in the game: translate each image met
+
+// Translating ahead: once the image running has its code, every image one setting away from it
+// (widescreen, smooth swinging, each cheat switched) is translated on the thread too, one at a
+// time, so switching a setting in the game finds its code ready (without an interpreter,
+// translating it then would stop the game for a moment). Up to kAheadVariants images are kept.
+constexpr size_t kAheadVariants = 32;
+std::vector<RomSettings> g_native_ahead;    // still to translate, the last first
+const CoiNativeCode* g_native_ahead_for = nullptr;  // the code they're one setting away from
+
+void native_ahead_queue()
+{
+    if (g_native_ahead_for == g_native_code)
+        return;
+    g_native_ahead_for = g_native_code;
+    g_native_ahead.clear();
+    const RomSettings s = current_rom_settings();
+    std::vector<RomSettings> next;
+    for (bool Cheats::* c : {&Cheats::midair_jump, &Cheats::moon_jump, &Cheats::walk_faster, &Cheats::full_power,
+                             &Cheats::infinite_continues, &Cheats::infinite_items, &Cheats::infinite_tries,
+                             &Cheats::infinite_power, &Cheats::invincibility}) {
+        RomSettings t = s;
+        t.cheats.*c = !(t.cheats.*c);
+        if (t.cheats.*c && c == &Cheats::moon_jump)     // (as the Cheats menu: they patch the same code)
+            t.cheats.midair_jump = false;
+        if (t.cheats.*c && c == &Cheats::midair_jump)
+            t.cheats.moon_jump = false;
+        next.push_back(t);
+    }
+    if (g_smooth_swing_available) {
+        RomSettings t = s;
+        t.smooth_swing = !t.smooth_swing;
+        next.push_back(t);
+    }
+    if (g_wide_available) {                     // (the likeliest switch: translated first)
+        RomSettings t = s;
+        t.widescreen = !t.widescreen;
+        next.push_back(t);
+    }
+    g_native_ahead = std::move(next);
+}
+
+// The thread free: the next image ahead not translated yet, if any.
+void native_ahead_next()
+{
+    if (g_native_pending.valid() || g_native_ahead.empty() || g_native_variants.size() >= kAheadVariants)
+        return;
+    std::vector<std::pair<size_t, uint64_t>> known;
+    for (const CoiNativeCode* v : g_native_variants)
+        known.emplace_back(v->rom_size, v->rom_hash);
+    // (Building and hashing the image on the thread too: a few milliseconds each on a phone.)
+    g_native_pending = std::async(std::launch::async, [in = g_jit_input, s = g_native_ahead.back(), known] {
+        const std::vector<uint8_t> rom = make_rom(s, false);
+        const std::pair<size_t, uint64_t> id{rom.size(), rom_hash(rom)};
+        if (std::find(known.begin(), known.end(), id) != known.end()) {
+            JitResult r;
+            r.known = true;
+            return r;
+        }
+        return jit_translate(in, rom, kArm64);
+    });
+    g_native_ahead.pop_back();
+}
+
+// The ROM changed: the code for it, if there is any yet.
+void native_rom_changed()
+{
+#ifdef COI_NATIVE_BUILT_IN
+    // A build with a translation linked in (the readable C) runs it whenever it fits the ROM as
+    // patched now, and otherwise (an MD+ pack's ROM) the app's own translations, as below.
+    // (--jit: only the app's own.)
+    if (!g_native_jit && native_rom_matches(COI_NATIVE_BUILT_IN)) {
+        g_native_code = COI_NATIVE_BUILT_IN;
+        g_native_rom_ok = true;
+        return;
+    }
+#endif
+    g_native_rom_ok = native_rom_matches(g_native_code);
+    if (!g_native_variants_on)
+        return;
+    if (g_native_rom_ok) {
+        native_ahead_queue();
+        return;
+    }
+    for (const CoiNativeCode* v : g_native_variants)
+        if (native_rom_matches(v)) {
+            g_native_code = v;
+            recomp::jit::select(v);
+            g_native_rom_ok = true;
+            native_ahead_queue();
+            return;
+        }
+    if (!g_native_pending.valid())              // (one at a time; the next starts when it's done)
+        g_native_pending = std::async(std::launch::async, [in = g_jit_input, rom = g_bus.rom] { return jit_translate(in, rom, kArm64); });
+    if (g_native_strict) {                      // (COI_NATIVE_STRICT: at once)
+        g_native_pending.wait();
+        native_poll();
+    }
+}
+
+// A translation made (at start-up or on the thread): kept with the others, and reported. The
+// first one also goes to COI_JIT_LIST=FILE: the address of every instruction translated, one a
+// line, then the functions left out and the computed jumps and calls left to the interpreter.
+void native_installed(const JitResult& r)
+{
+    if (const char* path = std::getenv("COI_JIT_LIST"); path && g_native_variants.empty())
+        if (FILE* f = std::fopen(path, "w")) {
+            for (int i = 0; i < r.code->resume_count; i++)
+                std::fprintf(f, "%06X\n", r.code->resume[i].address);
+            for (const auto& [address, why] : r.failed)
+                std::fprintf(f, "# left out: %06X %s\n", address, why.c_str());
+            for (uint32_t address : r.unresolved)
+                std::fprintf(f, "# computed jump or call with no known targets: %06X\n", address);
+            std::fclose(f);
+        }
+    g_native_variants.push_back(r.code);
+    std::printf("jit: %zu functions translated in %.0f ms\n", r.functions, r.ms);
+}
+
+// At each frame's start: a translation that has finished joins the others (and runs, if it's
+// the current ROM's). One that failed leaves the interpreter running.
+void native_poll()
+{
+    if (g_native_pending.valid() && g_native_pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        const JitResult r = g_native_pending.get();
+        if (r.code) {
+            native_installed(r);
+            native_rom_changed();
+        } else if (r.known) {
+            native_rom_changed();                // (the image running may be waiting for the thread)
+        } else {
+            std::fprintf(stderr, "jit: %s\n", r.error.c_str());
+        }
+    }
+    if (g_native_variants_on)
+        native_ahead_next();
+}
+#endif
+
 // Switches widescreen: the ROM code (only the patched bytes differ, so the running code
 // carries on), the camera limits and the frame width. Turned on during level play, the
 // blocks the moved cameras need are refilled once they have moved (refill_planes_if_due).
 void build_rom()
 {
-    std::vector<uint8_t> rom = g_rom_original;
-    if (g_widescreen)
-        apply_widescreen_patches(rom);
-    if (g_smooth_swing)
-        apply_smooth_swing(rom);
-    const std::string rush = apply_boss_rush(rom);
-    if (!rush.empty())
-        std::fprintf(stderr, "%s\n", rush.c_str());
-    const std::string skipped = apply_cheats(rom, g_cheats);
-    if (!skipped.empty())
-        std::fprintf(stderr, "%s\n", skipped.c_str());
-    fix_checksum(rom);
-    g_bus.rom = std::move(rom);
+    g_bus.rom = make_rom(current_rom_settings(), true);
+#ifdef COI_NATIVE
+    g_rom_hash_known = false;
+#endif
+#ifdef COI_NATIVE
+    // Translated code is only right for the ROM it was translated from: with any other patch
+    // set (widescreen, smooth swinging, Boss Rush, cheats) the interpreter runs everything,
+    // until (--jit) that image is translated too.
+    native_rom_changed();
+#endif
 }
 
 void set_widescreen(bool wide)
@@ -1249,7 +2390,8 @@ void save_state(const std::string& ram_path, const std::string& vram_path, const
         }
 }
 
-// --state-hash: FNV-1a over what save_state saves (RAM, VRAM, CRAM, registers, VSRAM).
+// --state-hash: FNV-1a over what save_state saves (RAM, VRAM, CRAM, registers, VSRAM), and the
+// 68000's registers (D0-D7, A0-A7, PC, SR).
 uint64_t machine_hash()
 {
     uint64_t h = 0xCBF29CE484222325ull;
@@ -1262,6 +2404,14 @@ uint64_t machine_hash()
     add(g_vdp.cram, sizeof(g_vdp.cram));
     add(g_vdp.reg, sizeof(g_vdp.reg));
     add(g_vdp.vsram, sizeof(g_vdp.vsram));
+    for (int r = M68K_REG_D0; r <= M68K_REG_SR; r++) {
+#ifdef COI_NATIVE
+        const uint32_t value = cpu_reg(m68k_register_t(r));
+#else
+        const uint32_t value = m68k_get_reg(nullptr, m68k_register_t(r));
+#endif
+        add(&value, 4);
+    }
     return h;
 }
 
@@ -1342,19 +2492,1757 @@ bool keyboard_fast_forward()
 }  // namespace
 
 // Musashi memory and interrupt callbacks.
+#ifdef COI_NATIVE
+// --native-test (builds with COI_NATIVE; see port/recomp): checks recompiled 68000 functions
+// against the interpreter. During a headless run, each call of a function config/recomp.txt
+// lists saves the CPU, RAM and VDP as the call starts (up to --native-test N per function).
+// When the run ends, each saved call is replayed twice from that state: by Musashi alone, one
+// instruction at a time with interrupts held off until the function returns, and by the
+// recompiled C. Both runs log every memory write (VDP port writes included); the logs, the
+// registers and flags, RAM and the VDP's memories must come out the same.
+struct WriteRecord {
+    uint32_t address, size, value;
+    bool operator==(const WriteRecord& o) const { return address == o.address && size == o.size && value == o.value; }
+};
+std::vector<WriteRecord>* g_write_log = nullptr;
+
+struct VdpSnapshot {
+    std::vector<uint8_t> vram;
+    std::vector<uint16_t> cram, vsram;
+    std::vector<uint8_t> reg;
+    Vdp::PortState port;
+};
+
+VdpSnapshot save_vdp()
+{
+    return {{g_vdp.vram, g_vdp.vram + sizeof(g_vdp.vram)}, {g_vdp.cram, g_vdp.cram + 64}, {g_vdp.vsram, g_vdp.vsram + 40},
+            {g_vdp.reg, g_vdp.reg + 32}, g_vdp.port_state()};
+}
+
+void restore_vdp(const VdpSnapshot& s)
+{
+    std::copy(s.vram.begin(), s.vram.end(), g_vdp.vram);
+    std::copy(s.cram.begin(), s.cram.end(), g_vdp.cram);
+    std::copy(s.vsram.begin(), s.vsram.end(), g_vdp.vsram);
+    std::copy(s.reg.begin(), s.reg.end(), g_vdp.reg);
+    g_vdp.set_port_state(s.port);
+}
+
+struct NativeCall {
+    uint32_t entry;
+    int frame;
+    std::vector<uint8_t> context, ram;
+    VdpSnapshot vdp;
+};
+std::vector<NativeCall> g_native_calls;
+std::map<uint32_t, int> g_native_counts;
+int g_native_limit = 0;
+bool g_native_replaying = false;
+int coi_native_tracing = 0;     // (native_rt.h) translated code calls coi_native_trace: replays, checks
+const CoiCpu* g_native_cpu = nullptr;  // translated code running (live or replayed): its state
+int g_native_frame = 0;
+extern "C" int m68ki_initial_cycles, m68ki_remaining_cycles;      // Musashi's slice counters
+extern "C" unsigned int* coi_m68k_registers(void);                 // Musashi's D0-D7, A0-A7 (musashi_regs.c)
+extern "C" unsigned int* coi_m68k_usp(void);                       // its user stack pointer (in supervisor mode)
+// COI_NATIVE_CHECK: each instruction's address, the cycles used before it and the registers
+// (d0-d7, a0-a7, CCR), both ways.
+struct CheckStep {
+    uint32_t pc;
+    int64_t cycles;
+    uint32_t regs[17];
+    bool operator==(const CheckStep& o) const
+    {
+        return pc == o.pc && cycles == o.cycles && std::equal(regs, regs + 17, o.regs);
+    }
+};
+std::vector<CheckStep>* g_cycle_trace = nullptr;
+bool g_native_live = true;              // run translated code in the game (--no-native: the interpreter only)
+
+// Takes the interrupt waiting, as Musashi's m68ki_exception_interrupt (68000) does, on
+// translated code's registers: acknowledged (genesis_int_ack, autovectored), the vector read,
+// then the PC and the SR pushed, the SR's trace bit cleared and the mask set to the level, and
+// the exception's cycles counted. `pc` is the address it returns to; returns the handler's.
+// The caller has checked that one is due: non-maskable (taken once), or above the mask.
+extern "C" void coi_m68k_clear_nmi(void);
+extern "C" unsigned int coi_m68k_exception_cycles(unsigned int vector);
+extern "C" int coi_m68k_halted(void);
+extern "C" int coi_m68k_take_reset_cycles(void);
+extern "C" void coi_m68k_reset_state(void);
+extern "C" int coi_m68k_stopped(void);
+extern "C" void coi_m68k_set_stopped(int stopped);
+bool g_native_acking = false;           // genesis_int_ack called by translated code's interrupt
+
+// Without an interpreter: what translated code can't run ends the game, saying where and why.
+[[noreturn]] void native_fatal(uint32_t pc, const char* why)
+{
+    char msg[300];
+    std::snprintf(msg, sizeof(msg), "The translated 68000 code can't go on at $%06X (frame %d): %s. This build has no "
+                  "interpreter to hand it to.", pc, g_native_frame, why);
+    std::fflush(stdout);
+    std::fprintf(stderr, "%s\n", msg);
+    std::fflush(stderr);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Castle of Illusion", msg, nullptr);
+    std::exit(4);
+}
+
+unsigned int native_exception_cycles(unsigned int vector)
+{
+    return coi_exception_cycles_68000[vector & 0xFF];
+}
+int64_t g_native_interrupts = 0;
+
+extern "C" uint32_t coi_native_interrupt(CoiCpu* c, uint32_t pc)
+{
+    unsigned int level = coi_native_irq_level();
+    if (level == 8) {
+        g_nmi_pending = false;
+#ifndef COI_NO_INTERPRETER
+        coi_m68k_clear_nmi();
+#endif
+        level = 7;
+    }
+    g_native_acking = true;
+    int vector = genesis_int_ack(int(level));
+    g_native_acking = false;
+    if (vector == int(M68K_INT_ACK_AUTOVECTOR))
+        vector = 24 + int(level);
+    else if (vector == int(M68K_INT_ACK_SPURIOUS))
+        vector = 24;
+    else if (vector > 255)
+        return pc;
+    const uint32_t sr = (uint32_t(c->sr_high) << 8) | rt_ccr(c);
+    rt_set_sr(c, sr | 0x2000);              // supervisor mode (the SSP, from user mode)
+    c->sr_high = uint16_t(0x20 | level);    // trace off, supervisor, the mask
+    uint32_t handler = m68k_read_memory_32(uint32_t(vector) << 2);
+    if (handler == 0)
+        handler = m68k_read_memory_32(15 << 2);     // the uninitialised interrupt vector
+    c->a[7] -= 4;
+    m68k_write_memory_32(c->a[7] & 0xFFFFFF, pc);
+    c->a[7] -= 2;
+    m68k_write_memory_16(c->a[7] & 0xFFFFFF, sr);
+    c->cycles += native_exception_cycles(unsigned(vector));
+    c->stopped = 0;                         // (Musashi: CPU_STOPPED &= ~STOP_LEVEL_STOP)
+    g_native_interrupts++;
+    return handler;
+}
+
+// The other exceptions, as Musashi's 68000 takes them (m68ki_exception_trap, _trapN, _illegal,
+// _1010, _1111): trace off and supervisor mode (the mask kept), the PC `pc` (the next
+// instruction for trap, trapv, chk and a divide by zero; the instruction's own for illegal and
+// line A/F) and then the SR pushed, the PC from the vector (no check for an empty one); the
+// exception's cycles in place of the instruction's (Musashi gives those back), so the whole
+// instruction costs CYC_EXCEPTION[vector]. Returns the handler's address.
+int64_t g_native_exceptions = 0;
+
+extern "C" uint32_t coi_native_exception(CoiCpu* c, uint32_t vector, uint32_t pc, uint32_t opcode)
+{
+    const uint32_t sr = (uint32_t(c->sr_high) << 8) | rt_ccr(c);
+    rt_set_sr(c, sr | 0x2000);              // supervisor mode (the SSP, from user mode)
+    c->sr_high = uint16_t((c->sr_high & 0x07) | 0x20);
+    c->a[7] -= 4;
+    m68k_write_memory_32(c->a[7] & 0xFFFFFF, pc);
+    c->a[7] -= 2;
+    m68k_write_memory_16(c->a[7] & 0xFFFFFF, sr);
+    const uint32_t handler = m68k_read_memory_32(vector << 2);
+    c->cycles += int64_t(native_exception_cycles(vector)) - m68ki_cycles[0][opcode & 0xFFFF];
+    g_native_exceptions++;
+    return handler;
+}
+
+// stop #sr, as Musashi's: the SR set, the CPU stopped, and an interrupt the new mask lets in
+// taken at once (which ends the stop); then, as Musashi leaves its cycle count, the slice ends:
+// with at least the instruction's cycles left they're all used, else what's left modulo them
+// (USE_ALL_CYCLES), the instruction's own cycles then counted on top. Returns where the CPU
+// goes on: the next instruction, or the interrupt's handler. While stopped, the native loop
+// spends each slice waiting, as m68k_execute does.
+extern "C" uint32_t coi_native_stop(CoiCpu* c, uint32_t sr, uint32_t next)
+{
+    rt_set_sr(c, sr);
+    c->stopped = 1;
+    uint32_t pc = next;
+    if (((sr >> 8) & 7) < coi_native_irq_level())
+        pc = coi_native_interrupt(c, next);
+    if (c->cycle_limit) {
+        const int64_t own = m68ki_cycles[0][0x4E72];
+        int64_t left = c->cycle_limit - (c->cycles - own);
+        left = left >= own ? own : left % own;
+        c->cycles = c->cycle_limit - (left - own);
+    }
+    return pc;
+}
+
+// COI_NATIVE_STRICT=1 with --native: the interpreter may start a game instruction only where
+// translated code hands over on purpose; anywhere else the run stops, saying where. Each
+// translation is made at once instead of on a thread, so the boot and every image met run
+// translated from their first instruction. The one handover allowed, counted for the report:
+// a computed jsr/jmp whose target isn't one the translation knows.
+// Interrupts are translated code's too (coi_native_interrupt, cpu_execute): Musashi taking one
+// (genesis_int_ack called from Musashi) also stops the run.
+std::map<std::pair<std::string, uint32_t>, int64_t> g_strict_allowed;
+
+// A RAM stub's `jmp (xxx).l` (the stub table InstallRamStubs copies to $FFFF60 at boot), at
+// its 24-bit address or the full one Musashi holds when it's called as `$FFxx.w`.
+bool native_stub_jmp(uint32_t pc)
+{
+    pc &= 0xFFFFFF;
+    return pc >= 0xFFFF60 && pc < 0xFFFF60 + 0x15 * 6 && (pc - 0xFFFF60) % 6 == 0
+        && (g_bus.ram[pc & 0xFFFF] << 8 | g_bus.ram[(pc + 1) & 0xFFFF]) == 0x4EF9;
+}
+
+// The interpreter is about to run the instruction at `pc`, which translated code didn't.
+void strict_check(uint32_t pc, const char* why, const CoiCpu* cpu)
+{
+    if (!g_native_strict)
+        return;
+    auto allow = [&](const char* reason) { g_strict_allowed[{reason, pc & 0xFFFFFF}]++; };
+    const uint32_t a = pc & 0xFFFFFF;
+    const uint16_t op = a + 1 < g_bus.rom.size() ? uint16_t(g_bus.rom[a] << 8 | g_bus.rom[a + 1]) : 0;
+    if (!why[0]) {
+        // Translated code stopped before its first instruction: why?
+        const uint32_t sr = (uint32_t(cpu->sr_high) << 8) | rt_ccr(cpu);
+        const int ea = op & 0x3F;
+        int new_sr = -1;
+        const uint16_t ext = a + 3 < g_bus.rom.size() ? uint16_t(g_bus.rom[a + 2] << 8 | g_bus.rom[a + 3]) : 0;
+        if ((op & 0xFFC0) == 0x46C0 && ea == 0x3C) new_sr = ext;
+        else if ((op & 0xFFF8) == 0x46C0) new_sr = cpu->d[op & 7] & 0xFFFF;
+        else if (op == 0x027C) new_sr = sr & ext;
+        else if (op == 0x007C) new_sr = sr | ext;
+        else if (op == 0x0A7C) new_sr = sr ^ ext;
+        else if (op == 0x4E73) new_sr = m68k_read_memory_16(cpu->a[7]);
+        const int mode = ea >> 3;
+        if (((op & 0xFFC0) == 0x4E80 || (op & 0xFFC0) == 0x4EC0)
+            && (mode == 2 || mode == 5 || mode == 6 || ea == 0x3B))
+            return allow("computed jsr/jmp to a target not translated");
+        // The exceptions other than interrupts are Musashi's (none happens in play): named.
+        if (new_sr >= 0) why = "SR write translated code doesn't do (leaving supervisor mode, or tracing)";
+        else if ((op & 0xFFF0) == 0x4E40) why = "trap (an exception translated code didn't take)";
+        else if (op == 0x4E76) why = "trapv (an exception translated code didn't take)";
+        else if (op == 0x4AFC || (op & 0xF000) == 0xA000 || (op & 0xF000) == 0xF000)
+            why = "illegal instruction, line A or line F (an exception translated code didn't take)";
+        else if ((op & 0xF0C0) == 0x80C0) why = "divu/divs: a divide by zero, or one from (An)+ or -(An) (an exception translated code didn't take)";
+        else if ((op & 0xF1C0) == 0x4180) why = "chk (an exception translated code didn't take)";
+        else if (op == 0x4E72) why = "stop translated code didn't do (leaving supervisor mode, or tracing)";
+        else if (op == 0x4E70) why = "reset";
+        else if (op == 0x4E77) why = "rtr";
+        else why = "instruction translated code stopped at";
+    }
+    if (kNoInterpreter)
+        native_fatal(pc, why);
+    std::fflush(stdout);
+    std::fprintf(stderr, "native strict: frame %d: the interpreter ran $%06X (opcode $%04X): %s\n",
+                 g_native_frame, pc, op, why);
+    std::fflush(stderr);
+    std::_Exit(3);
+}
+
+void strict_report()
+{
+    if (!g_on_demand.empty()) {
+        double ms = 0;
+        for (const auto& [a, t] : g_on_demand)
+            ms += t;
+        std::printf("jit: %zu translated on demand, in %.1f ms:", g_on_demand.size(), ms);
+        int shown = 0;
+        for (const auto& [a, t] : g_on_demand)
+            if (shown++ < 12)
+                std::printf(" $%06X", a);
+        std::printf("%s\n", g_on_demand.size() > 12 ? " ..." : "");
+    }
+    if (!g_native_strict)
+        return;
+    std::printf("native strict: the interpreter ran only where allowed (interrupts taken by translated code: %lld, "
+                "other exceptions: %lld):\n", (long long)g_native_interrupts, (long long)g_native_exceptions);
+    for (const auto& [k, n] : g_strict_allowed)
+        std::printf("  %lld times at $%06X: %s\n", (long long)n, k.second, k.first.c_str());
+}
+
+// One scanline's slice of 68000 time, as m68k_execute gives it. With translated code running
+// (--native) the slice is run here, as Musashi's m68k_execute would run it: an interrupt due at
+// its start (one raised between slices) taken first, by the code translated code takes one
+// with, its cycles out of the slice; then translated code, entered again wherever it stops,
+// until the slice's cycles are used (at least one instruction, as Musashi's do-while). Musashi
+// runs only where translated code can't go on (a computed jump to a target it doesn't know,
+// code not translated, the ROM image not translated yet): it is given the rest of the slice,
+// and its instruction hook brings translated code back as soon as it can.
+extern "C" int coi_native_enter(unsigned int pc, int cycles_left);
+int native_run(CoiCpu& cpu, uint32_t pc, int cycles_left, uint32_t& next);
+
+namespace {
+// The CPU between slices, while the native loop runs: translated code's registers, and the PC.
+// Musashi's copy is brought up to date only when it has to run (native_sync) or something reads
+// it; while `ours` is set, it's stale.
+struct NativeState {
+    CoiCpu cpu{};
+    uint32_t pc = 0;
+    bool ours = kNoInterpreter;     // (without Musashi, always: it starts as m68k_init leaves it)
+};
+NativeState g_ns;
+int g_native_check_from = std::getenv("COI_NATIVE_CHECK") ? std::atoi(std::getenv("COI_NATIVE_CHECK")) : -1;
+
+// Musashi's registers into ours (the native loop takes over).
+void native_take()
+{
+#ifndef COI_NO_INTERPRETER
+    if (g_ns.ours)
+        return;
+    const unsigned int* dar = coi_m68k_registers();
+    std::memcpy(g_ns.cpu.d, dar, sizeof(g_ns.cpu.d));
+    std::memcpy(g_ns.cpu.a, dar + 8, sizeof(g_ns.cpu.a));
+    g_ns.cpu.usp = *coi_m68k_usp();
+    const uint32_t sr = m68k_get_reg(nullptr, M68K_REG_SR);
+    rt_set_ccr(&g_ns.cpu, sr & 0x1F);
+    g_ns.cpu.sr_high = uint16_t(sr >> 8);
+    g_ns.pc = m68k_get_reg(nullptr, M68K_REG_PC);
+    g_ns.cpu.stopped = uint8_t(coi_m68k_stopped());
+    g_ns.ours = true;
+#endif
+}
+
+// Ours into Musashi's, which is then the one that counts (until native_take).
+void native_sync()
+{
+#ifndef COI_NO_INTERPRETER
+    if (!g_ns.ours)
+        return;
+    // The SR first: from user mode (Musashi never reset, after m68k_init) it swaps Musashi's
+    // stack pointers, before ours are written.
+    m68k_set_reg(M68K_REG_SR, (uint32_t(g_ns.cpu.sr_high) << 8) | rt_ccr(&g_ns.cpu));
+    unsigned int* dar = coi_m68k_registers();
+    std::memcpy(dar, g_ns.cpu.d, sizeof(g_ns.cpu.d));
+    std::memcpy(dar + 8, g_ns.cpu.a, sizeof(g_ns.cpu.a));
+    *coi_m68k_usp() = g_ns.cpu.usp;
+    m68k_set_reg(M68K_REG_PC, g_ns.pc);
+    m68k_set_reg(M68K_REG_PPC, g_ns.pc);            // as m68k_execute leaves it
+    coi_m68k_set_stopped(g_ns.cpu.stopped);
+    g_ns.ours = false;
+#endif
+}
+
+// A reset (start-up, the menu's): Musashi's registers are the ones that count.
+void native_reset()
+{
+    g_ns.ours = kNoInterpreter;
+}
+
+int g_reset_cycles = 0;     // a reset's cycles, eaten at the next slice's start as m68k_execute does
+
+// A 68000 reset, as Musashi's m68k_pulse_reset does it: the SSP from vector 0 and the PC from
+// vector 1; trace off, supervisor mode, the interrupt mask at 7, the condition codes, D0-A6 and
+// the USP kept (from user mode, the A7 in use becomes the USP); the reset's cycles (Musashi's
+// exception table) taken from the next slice. With translated code running (--native) the port
+// does it on its own registers; otherwise Musashi does.
+void cpu_reset()
+{
+#ifndef COI_NO_INTERPRETER
+    if (!g_native_live) {
+        m68k_pulse_reset();
+        native_reset();
+        return;
+    }
+#endif
+    native_take();
+    CoiCpu& cpu = g_ns.cpu;
+    if (!(cpu.sr_high & 0x20))
+        cpu.usp = cpu.a[7];
+    cpu.sr_high = 0x27;
+    cpu.a[7] = m68k_read_memory_32(0);
+    g_ns.pc = m68k_read_memory_32(4);
+    g_reset_cycles = int(native_exception_cycles(0));
+#ifndef COI_NO_INTERPRETER
+    coi_m68k_reset_state();
+#endif
+}
+
+// A register as it stands between slices (D0-D7, A0-A7, PC, SR), wherever it's kept.
+uint32_t cpu_reg(m68k_register_t r)
+{
+#ifndef COI_NO_INTERPRETER
+    if (!g_ns.ours)
+        return m68k_get_reg(nullptr, r);
+#endif
+    if (r >= M68K_REG_D0 && r <= M68K_REG_D7) return g_ns.cpu.d[r - M68K_REG_D0];
+    if (r >= M68K_REG_A0 && r <= M68K_REG_A7) return g_ns.cpu.a[r - M68K_REG_A0];
+    if (r == M68K_REG_PC || r == M68K_REG_PPC) return g_ns.pc;
+    if (r == M68K_REG_SR) return (uint32_t(g_ns.cpu.sr_high) << 8) | rt_ccr(&g_ns.cpu);
+    if (r == M68K_REG_USP) return g_ns.cpu.sr_high & 0x20 ? g_ns.cpu.usp : g_ns.cpu.a[7];
+#ifndef COI_NO_INTERPRETER
+    native_sync();
+    return m68k_get_reg(nullptr, r);
+#else
+    return 0;
+#endif
+}
+}  // namespace
+
+uint32_t g_native_skip = ~0u;               // coi_native_enter hands this PC to Musashi at once
+int64_t g_native_fallbacks = 0;             // slices finished by m68k_execute in the native loop
+int g_slice_used = 0;                       // (traces: the slice's cycles used before this native_run)
+namespace {
+int native_interrupt();
+
+int cpu_execute(int cycles)
+{
+    if (const int rc = g_reset_cycles) {            // as m68k_execute: not counted as used
+        g_reset_cycles = 0;
+        cycles -= rc;
+        if (cycles <= 0)
+            return rc;
+    }
+#ifdef COI_NO_INTERPRETER
+    if (!g_native_rom_ok)
+        native_fatal(g_ns.pc, "the ROM image running isn't translated");
+#else
+    if (!g_native_live || !g_native_rom_ok || coi_m68k_halted() || g_native_check_from >= 0) {
+        native_sync();
+        if (g_native_live && g_native_check_from < 0) {
+            g_native_fallbacks++;
+            strict_check(m68k_get_reg(nullptr, M68K_REG_PC), g_native_rom_ok ? "Musashi stopped" : "the ROM image running isn't the one translated", nullptr);
+        }
+        return m68k_execute(cycles);
+    }
+#endif
+    native_take();
+    int used = native_interrupt();
+    if (g_ns.cpu.stopped)                   // waiting at a stop: the slice goes by (m68k_execute)
+        return cycles;
+    do {
+        uint32_t next = 0;
+        // (An interrupt at the slice's start can use more than the slice: Musashi's do-while
+        // still runs one instruction, which a budget of 1 gives.)
+        g_slice_used = used;
+        const int r = native_run(g_ns.cpu, g_ns.pc, cycles - used > 0 ? cycles - used : 1, next);
+        if (r < 0) {
+#ifdef COI_NO_INTERPRETER
+            native_fatal(g_ns.pc, "code translated code can't run (or a computed jump to an address it can't translate)");
+#else
+            g_native_fallbacks++;
+            g_native_skip = g_ns.pc;        // (counted and checked already)
+            native_sync();
+            return used + m68k_execute(cycles - used);
+#endif
+        }
+        g_ns.pc = next;
+        used += r;
+    } while (used < cycles);
+    return used;
+}
+
+// An interrupt due at a slice's start, taken as Musashi's m68k_execute would take it: the
+// cycles it used.
+int native_interrupt()
+{
+    CoiCpu& cpu = g_ns.cpu;
+    if (coi_native_irq_level() <= (cpu.sr_high & 7u))
+        return 0;
+    cpu.cycles = 0;
+    g_ns.pc = coi_native_interrupt(&cpu, g_ns.pc);
+    const int used = int(cpu.cycles);
+    g_native_cycles += used;
+    return used;
+}
+}  // namespace
+
+// --native: Musashi's instruction hook (musashi_conf.h) calls this before each instruction.
+// Where translated code covers `pc`, it runs it, chaining from function to function, until
+// the cycles left in this slice are used up or it reaches code not translated, and returns the
+// cycles it used (the interpreter then carries on from where it stopped); otherwise -1.
+// Translating on demand: code translated code reaches without having it (a computed jump to a
+// target no list names, a handler returning into code not in the lists, the lists left out) is
+// translated on the spot, from that address, with the current translation's settings and frame,
+// and joins it (jit::merge), so it's there from then on. Only a JIT translation grows so.
+
+bool native_on_demand(uint32_t pc)
+{
+    uint32_t frame = 0;
+    bool trace = false;
+    if ((pc & 1) || pc >= g_bus.rom.size() || g_on_demand_failed.count(pc)
+        || !recomp::jit::shape(g_native_code, &frame, &trace))
+        return false;
+    JitInput in;
+    in.config = g_jit_input.config;
+    in.config.functions.clear();
+    in.list = {pc};
+    in.trace = trace;
+    const JitResult r = jit_translate(in, g_bus.rom, kArm64, frame);
+    if (!r.code || r.failed.count(pc)) {
+        g_on_demand_failed.insert(pc);
+        if (!r.code)
+            std::fprintf(stderr, "jit: translating $%06X on demand: %s\n", pc, r.error.c_str());
+        return false;
+    }
+    recomp::jit::merge(g_native_code, r.code);
+    g_on_demand[pc] = r.ms;
+    if (std::getenv("COI_ON_DEMAND_LOG"))
+        std::printf("jit: $%06X translated on demand (%zu functions)\n", pc, r.functions);
+    return true;
+}
+
+// Runs translated code on `cpu` from `pc` (as the hook or the native loop has it), chaining
+// until the budget is spent or it reaches code it can't run: the cycles used, with `next` where
+// it stopped, or -1 if it can't start here (counted, and checked in strict mode).
+int native_run(CoiCpu& cpu, uint32_t pc, int cycles_left, uint32_t& next)
+{
+    static std::vector<CoiNativeFn> at;              // per ROM word: a function that runs from here
+    static const CoiNativeCode* at_for = nullptr;
+    static int at_count = 0;                         // (resumes it holds: more after on-demand code)
+    if (!g_native_rom_ok) {
+        strict_check(pc, "the ROM image running isn't the one translated", &cpu);
+        return -1;
+    }
+    auto tables = [&] {
+        if (at_for == g_native_code && at_count == g_native_code->resume_count)
+            return;
+        if (at_for != g_native_code)
+            at.assign(g_bus.rom.size() / 2 + 1, nullptr);
+        for (int i = at_for == g_native_code ? at_count : 0; i < g_native_code->resume_count; i++)
+            if (g_native_code->resume[i].address / 2 < at.size())
+                at[g_native_code->resume[i].address / 2] = g_native_code->resume[i].fn;
+        at_for = g_native_code;
+        at_count = g_native_code->resume_count;
+    };
+    tables();
+    auto lookup = [](uint32_t a) { return a / 2 < at.size() && !(a & 1) ? at[a / 2] : nullptr; };   // (odd: never code)
+    // A RAM stub's jmp, reached when a slice's budget ran out just before it (translated code
+    // calling through a stub with budget left does the jmp itself): done here, as translated
+    // code would, its cycles and then the routine, at the address the stub holds.
+    uint32_t stub_target = 0;
+    if (native_stub_jmp(pc)) {
+        const uint8_t* s = g_bus.ram + ((pc + 2) & 0xFFFF);
+        stub_target = uint32_t(s[0]) << 24 | uint32_t(s[1]) << 16 | uint32_t(s[2]) << 8 | s[3];
+    }
+    const uint32_t start = stub_target ? stub_target : pc;
+    if (start > 0xFFFFFF) {                         // a PC with its top byte set: Musashi keeps it
+        strict_check(pc, "a PC with its top byte set", &cpu);
+        return -1;
+    }
+    CoiNativeFn fn = lookup(start);
+    if (!fn && native_on_demand(start)) {
+        tables();
+        fn = lookup(start);
+    }
+    if (!fn) {
+        g_interpreted[pc]++;
+        strict_check(pc, "not translated", &cpu);
+        return -1;
+    }
+    if (cpu.stopped)
+        return -1;
+    cpu.cycles = 0;
+    cpu.cycle_limit = cycles_left;
+    cpu.fail = cpu.missing = 0;
+    cpu.jump = 0;
+    g_native_cpu = &cpu;
+    next = pc;
+    if (stub_target) {
+        RT_TRACE(&cpu, pc);
+        RT_CYCLES(&cpu, 0x4EF9);                    // jmp (xxx).l
+        next = stub_target;
+    }
+    if (!stub_target || cpu.cycles < cycles_left) for (;;) {
+        const uint32_t r = g_native_code->run(&cpu, fn, next);
+        if (cpu.fail) {
+            next = cpu.fail;
+            break;
+        }
+        next = r;                                   // all 32 bits, as the PC holds them
+        if (cpu.cycles >= cycles_left || !(fn = lookup(next)))
+            break;
+    }
+    g_native_cpu = nullptr;
+    if (next == pc && cpu.cycles == 0) {
+        g_interpreted[pc]++;
+        strict_check(pc, cpu.missing ? "a call to code not translated" : "", &cpu);
+        return -1;
+    }
+    g_native_cycles += cpu.cycles;
+    return int(cpu.cycles);
+}
+
+#ifndef COI_NO_INTERPRETER
+// --native, Musashi running: its instruction hook (musashi_conf.h) calls this before each
+// instruction; translated code runs from there on Musashi's registers (native_run), and the
+// cycles it used are handed back (the interpreter then carries on from where it stopped), or -1.
+extern "C" int coi_native_enter(unsigned int pc, int cycles_left)
+{
+    if (!g_native_live)
+        return -1;
+    if (pc == g_native_skip) {                      // the native loop gave Musashi this instruction
+        g_native_skip = ~0u;
+        return -1;
+    }
+    static unsigned int* const dar = coi_m68k_registers();
+    const uint32_t sr = m68k_get_reg(nullptr, M68K_REG_SR);
+    CoiCpu cpu{};
+    std::memcpy(cpu.d, dar, sizeof(cpu.d));
+    std::memcpy(cpu.a, dar + 8, sizeof(cpu.a));
+    cpu.usp = *coi_m68k_usp();
+    rt_set_ccr(&cpu, sr & 0x1F);
+    cpu.sr_high = uint16_t(sr >> 8);
+
+    // COI_NATIVE_CHECK=F: from frame F on, each run here is checked against the interpreter
+    // running the same cycles from the same state; the first difference is reported.
+    const bool check = g_native_check_from >= 0 && g_native_frame >= g_native_check_from;
+    std::vector<uint8_t> context0;
+    std::vector<uint8_t> ram0;
+    VdpSnapshot vdp0;
+    // The bus state the 68000 can change besides RAM: the controller ports (their select line
+    // decides which half of the pad a read returns) and the Z80's RAM and bus.
+    Bus::IoState io0{};
+    std::vector<uint8_t> z80_0;
+    if (check) {
+        context0.resize(m68k_context_size());
+        m68k_get_context(context0.data());
+        ram0.assign(g_bus.ram, g_bus.ram + 0x10000);
+        vdp0 = save_vdp();
+        io0 = g_bus.io_state();
+        z80_0.assign(g_bus.z80_ram, g_bus.z80_ram + sizeof(g_bus.z80_ram));
+    }
+
+    std::vector<CheckStep> native_steps;
+    const int tracing0 = coi_native_tracing;        // (a probe may be tracing already)
+    if (check) {
+        g_cycle_trace = &native_steps;
+        coi_native_tracing = 1;
+    }
+    uint32_t next = pc;
+    const int ran = native_run(cpu, pc, cycles_left, next);
+    g_cycle_trace = nullptr;
+    coi_native_tracing = tracing0;
+    if (ran < 0)
+        return -1;
+    if (cpu.stopped)                                // translated code ran a stop: Musashi waits
+        coi_m68k_set_stopped(1);
+    m68k_set_reg(M68K_REG_SR, (uint32_t(cpu.sr_high) << 8) | rt_ccr(&cpu));     // (first: it may swap the SPs)
+    std::memcpy(dar, cpu.d, sizeof(cpu.d));
+    std::memcpy(dar + 8, cpu.a, sizeof(cpu.a));
+    *coi_m68k_usp() = cpu.usp;
+    m68k_set_reg(M68K_REG_PC, next);
+    if (check) {
+        std::vector<uint8_t> context1(m68k_context_size());
+        m68k_get_context(context1.data());
+        const std::vector<uint8_t> ram1(g_bus.ram, g_bus.ram + 0x10000);
+        const VdpSnapshot vdp1 = save_vdp();
+        const int initial = m68ki_initial_cycles, remaining = m68ki_remaining_cycles;
+        const std::vector<uint8_t> z80_1(g_bus.z80_ram, g_bus.z80_ram + sizeof(g_bus.z80_ram));
+        const Bus::IoState io1 = g_bus.io_state();
+        m68k_set_context(context0.data());
+        std::copy(ram0.begin(), ram0.end(), g_bus.ram);
+        restore_vdp(vdp0);
+        g_bus.set_io_state(io0);
+        std::copy(z80_0.begin(), z80_0.end(), g_bus.z80_ram);
+        g_native_live = false;
+        int64_t used = 0;
+        std::vector<CheckStep> steps;
+        while (used < cpu.cycles) {
+            CheckStep st{m68k_get_reg(nullptr, M68K_REG_PC) & 0xFFFFFF, used, {}};
+            for (int i = 0; i < 16; i++)
+                st.regs[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+            st.regs[16] = m68k_get_reg(nullptr, M68K_REG_SR) & 0x1F;
+            steps.push_back(st);
+            used += m68k_execute(1);
+        }
+        g_native_live = true;
+        char why[160] = "";
+        const uint32_t ipc = m68k_get_reg(nullptr, M68K_REG_PC);   // (all 32 bits, as translated code keeps them)
+        if (ipc != next || used != cpu.cycles)
+            std::snprintf(why, sizeof(why), "stopped at $%06X after %lld cycles, interpreter $%06X after %lld",
+                          next, (long long)cpu.cycles, ipc, (long long)used);
+        for (int i = 0; i < 16 && !why[0]; i++) {
+            const uint32_t v = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+            const uint32_t n = i < 8 ? cpu.d[i] : cpu.a[i - 8];
+            if (v != n)
+                std::snprintf(why, sizeof(why), "%c%d = %08X, interpreter %08X", i < 8 ? 'd' : 'a', i & 7, n, v);
+        }
+        const uint32_t isr = m68k_get_reg(nullptr, M68K_REG_SR) & 0xA71F;
+        if (!why[0] && isr != ((uint32_t(cpu.sr_high) << 8 | rt_ccr(&cpu)) & 0xA71F))
+            std::snprintf(why, sizeof(why), "SR = %04X, interpreter %04X", (uint32_t(cpu.sr_high) << 8) | rt_ccr(&cpu), isr);
+        for (int a = 0; a < 0x10000 && !why[0]; a++)
+            if (ram1[a] != g_bus.ram[a])
+                std::snprintf(why, sizeof(why), "RAM $FF%04X = %02X, interpreter %02X", a, ram1[a], g_bus.ram[a]);
+        const VdpSnapshot vi = save_vdp();
+        if (!why[0] && (vi.vram != vdp1.vram || vi.cram != vdp1.cram || vi.vsram != vdp1.vsram || vi.reg != vdp1.reg))
+            std::snprintf(why, sizeof(why), "VDP differs");
+        if (!why[0] && !(g_bus.io_state() == io1))
+            std::snprintf(why, sizeof(why), "controller ports or Z80 bus differ");
+        if (!why[0] && !std::equal(z80_1.begin(), z80_1.end(), g_bus.z80_ram))
+            std::snprintf(why, sizeof(why), "Z80 RAM differs");
+        if (why[0]) {
+            std::printf("native check, frame %d: from $%06X: %s\n", g_native_frame, pc, why);
+            size_t k = 0;
+            while (k < steps.size() && k < native_steps.size() && steps[k] == native_steps[k])
+                k++;
+            std::printf("  %zu instructions agree (of %zu/%zu)\n", k, native_steps.size(), steps.size());
+            for (size_t j = k > 1 ? k - 1 : 0; j < k + 1; j++)
+                for (const auto* tr : {&native_steps, &steps})
+                    if (j < tr->size()) {
+                        const CheckStep& st = (*tr)[j];
+                        std::printf("  #%zu %s $%06X @%lld ccr %02X d:", j, tr == &steps ? "interpreter" : "native     ",
+                                    st.pc, (long long)st.cycles, st.regs[16]);
+                        for (int r = 0; r < 16; r++)
+                            std::printf(r == 8 ? " a: %08X" : " %08X", st.regs[r]);
+                        std::printf("\n");
+                    }
+            std::fflush(stdout);
+            std::exit(2);
+        }
+        m68k_set_context(context1.data());
+        std::copy(ram1.begin(), ram1.end(), g_bus.ram);
+        restore_vdp(vdp1);
+        m68ki_initial_cycles = initial;
+        m68ki_remaining_cycles = remaining;
+    }
+    return int(cpu.cycles);
+}
+#endif  // COI_NO_INTERPRETER
+
+// The instruction traces of the replay being compared: the address and registers (d0-d7,
+// a0-a7, CCR) as each instruction starts.
+struct TraceStep {
+    uint32_t pc, regs[17];
+    int64_t cycles = 0;     // (probes: the slice's cycles used before it; not compared here)
+    bool operator==(const TraceStep& o) const { return pc == o.pc && std::equal(regs, regs + 17, o.regs); }
+};
+std::vector<TraceStep>* g_trace = nullptr;
+std::vector<uint8_t>* g_probe_seen = nullptr;  // (COI_PROBE_SEEN: each instruction the interpreter ran)
+int64_t g_probe_slice_used = 0;     // (probes: cycles used by the slices before this one)
+
+extern "C" void coi_native_trace(const CoiCpu* c, uint32_t address)
+{
+    if (g_cycle_trace) {
+        CheckStep st{address, c->cycles, {}};
+        for (int i = 0; i < 8; i++) {
+            st.regs[i] = c->d[i];
+            st.regs[8 + i] = c->a[i];
+        }
+        st.regs[16] = rt_ccr(c);
+        g_cycle_trace->push_back(st);
+    }
+    if (!g_trace)
+        return;
+    TraceStep s{address, {}};
+    for (int i = 0; i < 8; i++) {
+        s.regs[i] = c->d[i];
+        s.regs[8 + i] = c->a[i];
+    }
+    s.regs[16] = rt_ccr(c);
+    s.cycles = g_probe_slice_used + g_slice_used + c->cycles;
+    g_trace->push_back(s);
+}
+
+#ifndef COI_NO_INTERPRETER
+void native_hook(unsigned int pc)
+{
+    pc &= 0xFFFFFF;
+    if (g_probe_seen && pc < g_probe_seen->size())
+        (*g_probe_seen)[pc] = 1;
+    if (g_native_replaying) {
+        if (g_trace) {
+            TraceStep s{pc, {}};
+            for (int i = 0; i < 16; i++)
+                s.regs[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+            s.regs[16] = m68k_get_reg(nullptr, M68K_REG_SR) & 0x1F;
+            s.cycles = g_probe_slice_used + m68k_cycles_run();
+            g_trace->push_back(s);
+        }
+        return;
+    }
+    static std::vector<uint8_t> is_entry;           // per ROM word: a listed function starts here
+    if (is_entry.empty()) {
+        is_entry.assign(0x40000, 0);
+        for (int i = 0; i < g_native_code->entry_count; i++)
+            is_entry[(g_native_code->entries[i] >> 1) & 0x3FFFF] = 1;
+    }
+    if (pc >= 0x80000 || !is_entry[pc >> 1])
+        return;
+    if (g_native_counts[pc]++ >= g_native_limit)
+        return;
+    NativeCall call{pc, g_native_frame, std::vector<uint8_t>(m68k_context_size()), {g_bus.ram, g_bus.ram + 0x10000}, save_vdp()};
+    m68k_get_context(call.context.data());
+    g_native_calls.push_back(std::move(call));
+}
+
+struct NativeResult {
+    std::vector<WriteRecord> writes;
+    uint32_t regs[16], ccr, returned;
+    int64_t cycles = 0;
+    std::vector<uint8_t> ram;
+    VdpSnapshot vdp;
+    std::string error;
+};
+
+// Replays every saved call both ways; returns the number that differed.
+int native_report()
+{
+    g_native_replaying = true;
+    coi_native_tracing = 1;
+    int failed = 0, waited = 0, stopped = 0;
+    // COI_NATIVE_PAUSE: give each call a budget that runs out partway, as an interrupt would.
+    const bool pause = std::getenv("COI_NATIVE_PAUSE") != nullptr;
+    std::map<uint32_t, std::pair<int, int>> tally;      // entry -> (calls, matching)
+    std::map<uint32_t, int> stops;                      // untranslated code it stopped at -> times
+    std::map<uint32_t, std::string> differs;            // entry -> its first mismatch
+    for (const NativeCall& call : g_native_calls) {
+        auto restore = [&] {
+            m68k_set_context(const_cast<uint8_t*>(call.context.data()));
+            std::copy(call.ram.begin(), call.ram.end(), g_bus.ram);
+            restore_vdp(call.vdp);
+        };
+        auto capture = [&](NativeResult& r) {
+            r.ram.assign(g_bus.ram, g_bus.ram + 0x10000);
+            r.vdp = save_vdp();
+        };
+        NativeResult ref, nat;
+        std::vector<TraceStep> ref_trace, nat_trace;
+
+        // The interpreter.
+        restore();
+        const uint32_t sp0 = m68k_get_reg(nullptr, M68K_REG_A7);
+        const uint32_t ret = m68k_read_memory_32(sp0) & 0xFFFFFF;
+        const uint32_t sr = m68k_get_reg(nullptr, M68K_REG_SR);
+        m68k_set_reg(M68K_REG_SR, sr | 0x0700);
+        g_write_log = &ref.writes;
+        g_trace = &ref_trace;
+        long steps = 0;
+        while (steps++ < 2'000'000) {
+            ref.cycles += m68k_execute(1);
+            if ((m68k_get_reg(nullptr, M68K_REG_PC) & 0xFFFFFF) == ret && m68k_get_reg(nullptr, M68K_REG_A7) == sp0 + 4)
+                break;
+        }
+        g_write_log = nullptr;
+        g_trace = nullptr;
+        for (int i = 0; i < 16; i++)
+            ref.regs[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+        ref.ccr = m68k_get_reg(nullptr, M68K_REG_SR) & 0xA71F;
+        ref.returned = m68k_get_reg(nullptr, M68K_REG_PC) & 0xFFFFFF;
+        capture(ref);
+        if (ref.returned != ret) {          // didn't return (waits for an interrupt, or wasn't called)
+            waited++;
+            continue;
+        }
+
+        // The recompiled code.
+        restore();
+        CoiCpu cpu{};
+        for (int i = 0; i < 8; i++) {
+            cpu.d[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+            cpu.a[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_A0 + i));
+        }
+        rt_set_ccr(&cpu, sr & 0x1F);
+        cpu.sr_high = uint16_t((sr | 0x0700) >> 8);    // interrupts held off, as for the interpreter
+        cpu.usp = *coi_m68k_usp();
+        cpu.cycle_limit = pause ? 1 + int64_t((uint64_t(&call - g_native_calls.data()) * 7919) % uint64_t(ref.cycles))
+                                : ref.cycles + 64;
+        if (std::getenv("COI_NATIVE_VERBOSE"))
+            std::fprintf(stderr, "replaying $%06X (frame %d)\n", call.entry, call.frame), std::fflush(stderr);
+        g_write_log = &nat.writes;
+        g_trace = &nat_trace;
+        g_native_cpu = &cpu;
+        nat.returned = g_native_code->run(&cpu, g_native_code->lookup(call.entry), 0);
+        g_native_cpu = nullptr;
+        nat.cycles = cpu.cycles;
+        if (cpu.fail) {
+            // Stopped partway: the interpreter carries on from there, as in the live game.
+            stopped++;
+            if (cpu.missing)
+                stops[cpu.missing]++;
+            m68k_set_reg(M68K_REG_SR, (uint32_t(cpu.sr_high) << 8) | rt_ccr(&cpu));
+            for (int i = 0; i < 8; i++) {
+                m68k_set_reg(m68k_register_t(M68K_REG_D0 + i), cpu.d[i]);
+                m68k_set_reg(m68k_register_t(M68K_REG_A0 + i), cpu.a[i]);
+            }
+            m68k_set_reg(M68K_REG_PC, cpu.fail);
+            *coi_m68k_usp() = cpu.usp;
+            for (long n = 0; n < 2'000'000; n++) {
+                if ((m68k_get_reg(nullptr, M68K_REG_PC) & 0xFFFFFF) == ret && m68k_get_reg(nullptr, M68K_REG_A7) == sp0 + 4)
+                    break;
+                nat.cycles += m68k_execute(1);
+            }
+            nat.returned = m68k_get_reg(nullptr, M68K_REG_PC) & 0xFFFFFF;
+            for (int i = 0; i < 8; i++) {
+                cpu.d[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+                cpu.a[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_A0 + i));
+            }
+            const uint32_t s = m68k_get_reg(nullptr, M68K_REG_SR);
+            rt_set_ccr(&cpu, s & 0x1F);
+            cpu.sr_high = uint16_t(s >> 8);
+        }
+        g_write_log = nullptr;
+        g_trace = nullptr;
+        for (int i = 0; i < 8; i++) {
+            nat.regs[i] = cpu.d[i];
+            nat.regs[8 + i] = cpu.a[i];
+        }
+        nat.ccr = (uint32_t(cpu.sr_high) << 8) | rt_ccr(&cpu);
+        capture(nat);
+
+        // Compare.
+        char buf[200] = "";
+        if (nat.returned != ref.returned)
+            std::snprintf(buf, sizeof(buf), "returned to $%06X, interpreter $%06X", nat.returned, ref.returned);
+        else if (nat.writes.size() != ref.writes.size() || !std::equal(nat.writes.begin(), nat.writes.end(), ref.writes.begin())) {
+            size_t i = 0;
+            while (i < nat.writes.size() && i < ref.writes.size() && nat.writes[i] == ref.writes[i])
+                i++;
+            std::snprintf(buf, sizeof(buf), "writes differ at #%zu of %zu/%zu", i, nat.writes.size(), ref.writes.size());
+            if (failed < 1)
+                for (size_t k = i; k < i + 6; k++)
+                    std::printf("  #%zu native %06X/%u=%08X  interpreter %06X/%u=%08X\n", k,
+                                k < nat.writes.size() ? nat.writes[k].address : 0, k < nat.writes.size() ? nat.writes[k].size : 0,
+                                k < nat.writes.size() ? nat.writes[k].value : 0, k < ref.writes.size() ? ref.writes[k].address : 0,
+                                k < ref.writes.size() ? ref.writes[k].size : 0, k < ref.writes.size() ? ref.writes[k].value : 0);
+        } else {
+            for (int i = 0; i < 16 && !buf[0]; i++)
+                if (nat.regs[i] != ref.regs[i])
+                    std::snprintf(buf, sizeof(buf), "%c%d = %08X, interpreter %08X", i < 8 ? 'd' : 'a', i & 7, nat.regs[i], ref.regs[i]);
+            if (!buf[0] && nat.cycles != ref.cycles)
+                std::snprintf(buf, sizeof(buf), "%lld cycles, interpreter %lld", (long long)nat.cycles, (long long)ref.cycles);
+            if (!buf[0] && nat.ccr != ref.ccr)
+                std::snprintf(buf, sizeof(buf), "SR = %04X, interpreter %04X", nat.ccr, ref.ccr);
+            if (!buf[0] && nat.ram != ref.ram)
+                std::snprintf(buf, sizeof(buf), "RAM differs");
+            if (!buf[0] && (nat.vdp.vram != ref.vdp.vram || nat.vdp.cram != ref.vdp.cram || nat.vdp.vsram != ref.vdp.vsram))
+                std::snprintf(buf, sizeof(buf), "VDP memory differs");
+        }
+        auto& t = tally[call.entry];
+        t.first++;
+        if (buf[0] && failed == 0) {        // the first failure: where the two runs part
+            size_t i = 0;
+            while (i < nat_trace.size() && i < ref_trace.size() && nat_trace[i] == ref_trace[i])
+                i++;
+            std::printf("  traces agree for %zu instructions (of %zu/%zu)\n", i, nat_trace.size(), ref_trace.size());
+            for (size_t k = i > 0 ? i - 1 : 0; k <= i; k++)
+                for (const auto* tr : {&nat_trace, &ref_trace})
+                    if (k < tr->size()) {
+                        const TraceStep& s = (*tr)[k];
+                        std::printf("  %s #%zu $%06X ccr %02X d:", tr == &nat_trace ? "native     " : "interpreter", k, s.pc, s.regs[16]);
+                        for (int r = 0; r < 16; r++)
+                            std::printf(r == 8 ? " a: %08X" : " %08X", s.regs[r]);
+                        std::printf("\n");
+                    }
+        }
+        if (buf[0]) {
+            failed++;
+            if (!differs.count(call.entry))
+                differs[call.entry] = buf;
+        } else {
+            t.second++;
+        }
+    }
+    int functions_ok = 0, calls = 0, matched = 0;
+    for (const auto& [entry, t] : tally) {
+        calls += t.first;
+        matched += t.second;
+        if (t.second == t.first && t.first)
+            functions_ok++;
+        if (tally.size() <= 20)
+            std::printf("native $%06X: %d of %d calls match the interpreter\n", entry, t.second, t.first);
+    }
+    for (const auto& [entry, why] : differs)
+        std::printf("native $%06X differs: %s\n", entry, why.c_str());
+    std::vector<std::pair<int, uint32_t>> top;
+    for (const auto& [a, n] : stops)
+        top.push_back({n, a});
+    std::sort(top.rbegin(), top.rend());
+    for (size_t i = 0; i < top.size() && i < 12; i++)
+        std::printf("native: stopped %d times at a call to $%06X (not translated yet)\n", top[i].first, top[i].second);
+    std::printf("native: %zu calls saved; %d replayed: %d match, %d differ (%d stopped partway, finished by the interpreter); "
+                "%d didn't return without interrupts. %d of %zu functions match on every call.\n",
+                g_native_calls.size(), calls, matched, failed, stopped, waited, functions_ok, tally.size());
+    g_native_replaying = false;
+    coi_native_tracing = 0;
+    return failed;
+}
+
+// --native-probe F1,F2,...: translated code tried from every instruction it has, not only from
+// where play reaches it. The machine is saved at the start of each frame listed; from each such
+// state and each translated instruction, with two sets of registers (the state's own, and small
+// data with address registers into the object RAM), a few scanlines' slices run interpreted
+// (Musashi) and then translated (the native loop, as in play), interrupts held off (SR $27xx).
+// Every slice's cycles, the registers, SR, PC, the stopped state, the writes, RAM, Z80 RAM and
+// VDP memory must match. Code started out of its context does odd things (stray pointers,
+// returns to wherever the stack says), and both must do the same odd things: that reaches the
+// branches and states play doesn't. COI_PROBE_SLICES=N (8), COI_PROBE_STEP=N (every Nth
+// instruction, 1), COI_PROBE_LIST=FILE (each address and its result), COI_PROBE_ONLY=ADDR (one,
+// with instruction traces of the first difference). Exits 0 if all match.
+struct ProbeState {
+    int frame;
+    std::vector<uint8_t> context;
+    Bus bus;                                    // (its ROM left out: it doesn't change)
+    VdpSnapshot vdp;
+    int irq_pending, irq_level;
+    bool nmi;
+};
+std::vector<int> g_probe_frames;
+std::vector<ProbeState> g_probe_states;
+
+void probe_capture(int frame)
+{
+    ProbeState s{frame, std::vector<uint8_t>(m68k_context_size()), Bus{}, save_vdp(), g_irq_pending, g_irq_level, g_nmi_pending};
+    native_sync();
+    m68k_get_context(s.context.data());
+    std::vector<uint8_t> rom = std::move(g_bus.rom);
+    s.bus = g_bus;
+    g_bus.rom = std::move(rom);
+    g_probe_states.push_back(std::move(s));
+}
+
+struct ProbeRun {
+    std::vector<int> slices;
+    std::vector<uint32_t> pcs;
+    uint32_t regs[20] = {};                     // D0-D7, A0-A7, PC, SR, USP, ISP
+    bool stopped = false;
+    std::vector<WriteRecord> writes;
+    std::vector<uint8_t> ram, z80;
+    VdpSnapshot vdp;
+    int64_t fallbacks = 0, native = 0;
+};
+
+int native_probe()
+{
+    JitInput in = g_jit_input;
+    const uint32_t only = std::getenv("COI_PROBE_ONLY") ? std::strtoul(std::getenv("COI_PROBE_ONLY"), nullptr, 16) : 0;
+    in.trace = only != 0;
+    const JitResult tr = jit_translate(in, g_bus.rom, kArm64);
+    if (!tr.code) {
+        std::printf("probe: translating failed: %s\n", tr.error.c_str());
+        return 1;
+    }
+    g_native_code = tr.code;
+    recomp::jit::select(tr.code);
+    g_native_rom_ok = true;
+    const bool self_test = std::getenv("COI_PROBE_SELF") != nullptr;   // (the harness: interpreter twice)
+    const bool native_twice = std::getenv("COI_PROBE_NATIVE_TWICE") != nullptr;     // (translated twice)
+    const int nslices = std::getenv("COI_PROBE_SLICES") ? std::atoi(std::getenv("COI_PROBE_SLICES")) : 8;
+    const int step = std::getenv("COI_PROBE_STEP") ? std::max(1, std::atoi(std::getenv("COI_PROBE_STEP"))) : 1;
+    std::vector<uint32_t> targets;
+    for (int i = 0; i < tr.code->resume_count; i++)
+        if (tr.code->resume[i].address < 0x80000 && (only ? tr.code->resume[i].address == only : i % step == 0))
+            targets.push_back(tr.code->resume[i].address);
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    if (only) {
+        coi_native_tracing = 1;
+        g_native_replaying = true;
+        m68k_set_instr_hook_callback(native_hook);
+    }
+    // COI_PROBE_SEEN=FILE: the address of every instruction the interpreter ran in the probes,
+    // one a line (what they reached, to set beside what play reaches).
+    std::vector<uint8_t> seen;
+    const char* seen_path = std::getenv("COI_PROBE_SEEN");
+    if (seen_path) {
+        seen.assign(0x80000, 0);
+        g_native_replaying = true;
+    }
+    const bool hook = only || seen_path;
+
+    auto run = [&](const ProbeState& st, uint32_t at, int seed, bool native, std::vector<TraceStep>* trace) {
+        ProbeRun out;
+        m68k_set_context(const_cast<uint8_t*>(st.context.data()));
+        if (hook)                               // (the context holds Musashi's callbacks too)
+            m68k_set_instr_hook_callback(native_hook);
+        g_probe_seen = seen_path && !native ? &seen : nullptr;
+        std::vector<uint8_t> rom = std::move(g_bus.rom);
+        g_bus = st.bus;
+        g_bus.rom = std::move(rom);
+        restore_vdp(st.vdp);
+        g_irq_pending = st.irq_pending;
+        g_irq_level = st.irq_level;
+        g_nmi_pending = st.nmi;
+        g_ns.ours = false;
+        g_reset_cycles = 0;
+        if (seed) {                             // small data, address registers into the object RAM
+            uint32_t h = at * 2654435761u + uint32_t(seed) * 40503u;
+            auto next = [&] { h ^= h << 13; h ^= h >> 17; h ^= h << 5; return h; };
+            for (int i = 0; i < 8; i++)
+                m68k_set_reg(m68k_register_t(M68K_REG_D0 + i), next() % 0x40);
+            for (int i = 0; i < 7; i++)
+                m68k_set_reg(m68k_register_t(M68K_REG_A0 + i), 0xFFD000u + (next() % 0x60) * 0x40);
+        }
+        m68k_set_reg(M68K_REG_SR, (m68k_get_reg(nullptr, M68K_REG_SR) & 0x1F) | 0x2700);
+        m68k_set_reg(M68K_REG_PC, at);
+        m68k_set_reg(M68K_REG_PPC, at);
+        coi_m68k_set_stopped(0);
+        g_native_live = native;
+        const int64_t fallbacks0 = g_native_fallbacks, native0 = g_native_cycles;
+        g_write_log = &out.writes;
+        g_trace = trace;
+        g_probe_slice_used = 0;
+        for (int s = 0; s < nslices; s++) {
+            out.slices.push_back(cpu_execute(488));
+            out.pcs.push_back(cpu_reg(M68K_REG_PC));
+            g_probe_slice_used += out.slices.back();
+        }
+        g_write_log = nullptr;
+        g_trace = nullptr;
+        g_probe_seen = nullptr;
+        native_sync();
+        g_native_live = false;
+        for (int i = 0; i < 16; i++)
+            out.regs[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+        out.regs[16] = m68k_get_reg(nullptr, M68K_REG_PC);
+        out.regs[17] = m68k_get_reg(nullptr, M68K_REG_SR);
+        out.regs[18] = m68k_get_reg(nullptr, M68K_REG_USP);
+        out.regs[19] = m68k_get_reg(nullptr, M68K_REG_ISP);
+        out.stopped = coi_m68k_stopped();
+        out.ram.assign(g_bus.ram, g_bus.ram + 0x10000);
+        out.z80.assign(g_bus.z80_ram, g_bus.z80_ram + 0x2000);
+        out.vdp = save_vdp();
+        out.fallbacks = g_native_fallbacks - fallbacks0;
+        out.native = g_native_cycles - native0;
+        return out;
+    };
+    auto compare = [](const ProbeRun& n, const ProbeRun& r) -> std::string {
+        char b[160];
+        for (size_t s = 0; s < r.slices.size(); s++)
+            if (n.slices[s] != r.slices[s] || n.pcs[s] != r.pcs[s]) {
+                std::snprintf(b, sizeof(b), "slice %zu: %d cycles to $%06X, interpreter %d to $%06X", s, n.slices[s], n.pcs[s],
+                              r.slices[s], r.pcs[s]);
+                return b;
+            }
+        static const char* names[20] = {"d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "a0", "a1",
+                                        "a2", "a3", "a4", "a5", "a6", "a7", "pc", "sr", "usp", "isp"};
+        for (int i = 0; i < 20; i++)
+            if (n.regs[i] != r.regs[i]) {
+                std::snprintf(b, sizeof(b), "%s = %08X, interpreter %08X", names[i], n.regs[i], r.regs[i]);
+                return b;
+            }
+        if (n.stopped != r.stopped)
+            return "stopped state";
+        if (n.writes != r.writes) {
+            size_t i = 0;
+            while (i < n.writes.size() && i < r.writes.size() && n.writes[i] == r.writes[i])
+                i++;
+            std::snprintf(b, sizeof(b), "write #%zu: $%06X/%u=%X, interpreter $%06X/%u=%X", i,
+                          i < n.writes.size() ? n.writes[i].address : 0, i < n.writes.size() ? n.writes[i].size : 0,
+                          i < n.writes.size() ? n.writes[i].value : 0, i < r.writes.size() ? r.writes[i].address : 0,
+                          i < r.writes.size() ? r.writes[i].size : 0, i < r.writes.size() ? r.writes[i].value : 0);
+            return b;
+        }
+        if (n.ram != r.ram)
+            return "RAM";
+        if (n.z80 != r.z80)
+            return "Z80 RAM";
+        if (n.vdp.vram != r.vdp.vram || n.vdp.cram != r.vdp.cram || n.vdp.vsram != r.vdp.vsram || n.vdp.reg != r.vdp.reg)
+            return "VDP";
+        return "";
+    };
+
+    FILE* list = std::getenv("COI_PROBE_LIST") ? std::fopen(std::getenv("COI_PROBE_LIST"), "w") : nullptr;
+    int64_t probes = 0, differ = 0, handed = 0, untranslated = 0;
+    std::map<uint32_t, std::string> first;      // address -> its first difference
+    std::map<std::string, int> kinds;
+    for (uint32_t at : targets) {
+        std::string result;
+        bool any_native = false;
+        for (const ProbeState& st : g_probe_states)
+            for (int seed = 0; seed < 2; seed++) {
+                std::vector<TraceStep> rt, nt;      // (COI_PROBE_ONLY: the compared runs' traces)
+                const ProbeRun r = run(st, at, seed, native_twice, only ? &rt : nullptr);
+                const ProbeRun n = run(st, at, seed, !self_test, only ? &nt : nullptr);
+                probes++;
+                handed += n.fallbacks != 0;
+                any_native |= n.native != 0;
+                const std::string why = compare(n, r);
+                if (!why.empty()) {
+                    differ++;
+                    if (result.empty()) {
+                        char b[64];
+                        std::snprintf(b, sizeof(b), "frame %d, seed %d: ", st.frame, seed);
+                        result = b + why;
+                        kinds[why.substr(0, why.find_first_of(" :="))]++;
+                    }
+                    if (only) {
+                        // (Translated code reports an instruction, then may stop before it at the
+                        // slice's end and report it again when the next slice resumes there.)
+                        nt.erase(std::unique(nt.begin(), nt.end()), nt.end());
+                        size_t i = 0;
+                        while (i < nt.size() && i < rt.size() && nt[i] == rt[i])
+                            i++;
+                        if (const char* dump = std::getenv("COI_PROBE_DUMP"))   // FILE: both traces, in full
+                            if (FILE* d = std::fopen(dump, "w")) {
+                                for (size_t k = 0; k < std::max(nt.size(), rt.size()); k++)
+                                    std::fprintf(d, "%5zu  %06X %6lld   %06X %6lld\n", k, k < nt.size() ? nt[k].pc : 0,
+                                                 k < nt.size() ? (long long)nt[k].cycles : -1, k < rt.size() ? rt[k].pc : 0,
+                                                 k < rt.size() ? (long long)rt[k].cycles : -1);
+                                std::fclose(d);
+                            }
+                        size_t c = 0;                   // the first instruction started at another cycle
+                        while (c < i && nt[c].cycles == rt[c].cycles)
+                            c++;
+                        if (c < i)
+                            std::printf("probe $%06X: cycles part before #%zu: $%06X at %lld natively, %lld interpreted "
+                                        "(the one before: $%06X)\n", at, c, nt[c].pc, (long long)nt[c].cycles,
+                                        (long long)rt[c].cycles, c ? nt[c - 1].pc : 0);
+                        std::printf("probe $%06X frame %d seed %d: %s; traces agree for %zu instructions (of %zu/%zu)\n", at,
+                                    st.frame, seed, why.c_str(), i, nt.size(), rt.size());
+                        for (size_t k = i > 2 ? i - 2 : 0; k <= i + 1; k++)
+                            for (const auto* t : {&nt, &rt})
+                                if (k < t->size()) {
+                                    const TraceStep& s = (*t)[k];
+                                    std::printf("  %s #%zu $%06X at %lld ccr %02X d:", t == &nt ? "native     " : "interpreter", k,
+                                                s.pc, (long long)s.cycles, s.regs[16]);
+                                    for (int q = 0; q < 16; q++)
+                                        std::printf(q == 8 ? " a: %08X" : " %08X", s.regs[q]);
+                                    std::printf("\n");
+                                }
+                    }
+                }
+            }
+        if (!any_native)
+            untranslated++;
+        if (!result.empty())
+            first[at] = result;
+        if (list)
+            std::fprintf(list, "%06X %s\n", at, result.empty() ? (any_native ? "ok" : "not run natively") : result.c_str());
+    }
+    if (list)
+        std::fclose(list);
+    if (seen_path)
+        if (FILE* f = std::fopen(seen_path, "w")) {
+            for (uint32_t a = 0; a < seen.size(); a++)
+                if (seen[a])
+                    std::fprintf(f, "%06X\n", a);
+            std::fclose(f);
+        }
+    g_native_replaying = false;
+    coi_native_tracing = 0;
+    int shown = 0;
+    for (const auto& [a, why] : first)
+        if (shown++ < 40)
+            std::printf("probe $%06X differs: %s\n", a, why.c_str());
+    for (const auto& [k, n] : kinds)
+        std::printf("probe: %d addresses first differ in %s\n", n, k.c_str());
+    std::printf("probe: %zu instructions from %zu states, %lld runs: %lld differ (%zu addresses), %lld handed part of a slice "
+                "to Musashi, %lld addresses never ran translated\n",
+                targets.size(), g_probe_states.size(), (long long)probes, (long long)differ, first.size(), (long long)handed,
+                (long long)untranslated);
+    return first.empty() ? 0 : 1;
+}
+#endif  // COI_NO_INTERPRETER
+#endif
+
+#if defined(COI_NATIVE) && !defined(COI_NO_INTERPRETER)
+namespace {
+bool g_native_selftest = false;     // --native-selftest
+
+// --native-selftest: the exceptions the game never takes (trap, trapv, chk, a divide by zero,
+// illegal, line A/F, stop), each checked against Musashi on a small image of our own, not the
+// game's: vectors, a handler per exception that records what it was given (the frame's SR and
+// PC, A7, its own SR, a count) in RAM and returns (past the instruction, for illegal and line
+// A/F), and short routines that raise them, mid-block too. Each test runs interpreted (Musashi
+// alone) and then translated (the native loop), slice by slice as the game runs, at several
+// slice sizes so the budget runs out at many points: every slice's cycles, then the registers,
+// SR, PC, the stopped state and RAM must match, and the translated run must hand nothing to
+// Musashi. Translated with the JIT for the CPU it runs on. Exits 0 if all match.
+struct SelfAsm {
+    std::vector<uint8_t>& m;
+    uint32_t pc;
+    std::vector<uint32_t>* entries;
+    void w(uint32_t v) { m[pc] = uint8_t(v >> 8); m[pc + 1] = uint8_t(v); pc += 2; }
+    void l(uint32_t v) { w(v >> 16); w(v & 0xFFFF); }
+    void resume() { entries->push_back(pc); }   // code reached only from a handler's rte
+    void mark() { w(0x5279); l(0xFF0000); }     // addq.w #1,($FF0000).l: a step done
+};
+
+struct SelfRun {
+    std::vector<int> slices;
+    std::vector<uint32_t> pcs;                  // where each slice ended
+    uint32_t regs[20] = {};                     // D0-D7, A0-A7, PC, SR, USP, SSP
+    bool stopped = false;
+    std::vector<uint8_t> ram;
+    int64_t fallbacks = 0;
+};
+
+int native_selftest()
+{
+    std::vector<uint8_t> img(0x4000, 0);
+    std::vector<uint32_t> entries;
+    SelfAsm a{img, 0, &entries};
+    // Vectors: the SSP, then every exception to a handler that records what it saw.
+    const uint32_t kBad = 0x3F00;
+    a.pc = 0; a.l(0x00FFFE00); a.l(0x1000);
+    for (int v = 2; v < 64; v++) a.l(kBad);
+    a.pc = kBad; a.w(0x60FE);                   // bra.s * (an exception no test expects)
+    entries.push_back(kBad);
+    const int vectors[] = {4, 5, 6, 7, 8, 10, 11, 30, 32, 33, 34, 35, 39, 47};
+    uint32_t h = 0x200;
+    for (int v : vectors) {
+        a.pc = uint32_t(v) * 4; a.l(h);
+        a.pc = h;
+        entries.push_back(h);
+        const uint32_t slot = 0xFF0100 + uint32_t(v) * 16;
+        a.w(0x33D7); a.l(slot);                 // move.w (a7),slot.l: the frame's SR
+        a.w(0x23EF); a.w(2); a.l(slot + 2);     // move.l 2(a7),slot+2.l: the frame's PC
+        a.w(0x23CF); a.l(slot + 6);             // move.l a7,slot+6.l
+        a.w(0x40F9); a.l(slot + 10);            // move.w sr,slot+10.l: the handler's SR
+        a.w(0x5279); a.l(slot + 12);            // addq.w #1,slot+12.l
+        if (v == 4 || v == 10 || v == 11) { a.w(0x54AF); a.w(2); }     // addq.l #2,2(a7): past it
+        if (v == 8) { a.w(0x58AF); a.w(2); }    // addq.l #4,2(a7): past a privileged 4 bytes
+        a.w(0x4E73);                            // rte
+        h = a.pc + 2;
+    }
+    // handover: what the translator doesn't take (movep, a branch to an odd address) is the
+    // interpreter's: those slices may go to Musashi, and everything must still match.
+    struct Test { const char* name; uint32_t entry; int irq_at[2]; bool handover = false; };
+    std::vector<Test> tests;
+    auto begin = [&](const char* name, uint32_t at, int irq0 = -1, int irq1 = -1) {
+        a.pc = at;
+        entries.push_back(at);
+        tests.push_back({name, at, {irq0, irq1}});
+    };
+    auto addq_d0 = [&](int n) { for (int i = 0; i < n; i++) a.w(0x5280); };   // addq.l #1,d0
+
+    begin("trap #0, #1, #7, #15", 0x1000);
+    a.w(0x7005);                                // moveq #5,d0
+    a.w(0x4E40); a.resume();                    // trap #0
+    addq_d0(1); a.w(0x4E4F); a.resume();        // trap #15
+    a.w(0x4E71); a.w(0x4E47); a.resume();       // nop; trap #7
+    a.w(0x4E41); a.resume();                    // trap #1
+    a.mark(); a.w(0x60FE);
+
+    begin("divu/divs by zero", 0x1100);
+    a.w(0x203C); a.l(1234);                     // move.l #1234,d0
+    a.w(0x7200);                                // moveq #0,d1
+    a.w(0x80C1); a.mark();                      // divu.w d1,d0
+    a.w(0x81C1);                                // divs.w d1,d0
+    a.w(0x41F9); a.l(0xFF8000);                 // lea $FF8000,a0 (a zero word)
+    a.w(0x80D0);                                // divu.w (a0),d0
+    a.w(0x80D8);                                // divu.w (a0)+,d0
+    a.w(0x81E0);                                // divs.w -(a0),d0
+    a.w(0x80FC); a.w(0);                        // divu.w #0,d0
+    a.w(0x80FC); a.w(7);                        // divu.w #7,d0 (no exception)
+    a.w(0x81F8); a.w(0x8000);                   // divs.w ($FFFF8000).w,d0
+    a.mark(); a.w(0x60FE);
+
+    begin("chk below 0, above, within", 0x1200);
+    a.w(0x303C); a.w(0xFFFF);                   // move.w #-1,d0
+    a.w(0x41BC); a.w(10);                       // chk.w #10,d0: below 0
+    a.w(0x303C); a.w(11);                       // move.w #11,d0
+    a.w(0x41BC); a.w(10);                       // chk.w #10,d0: above
+    a.w(0x303C); a.w(5);                        // move.w #5,d0
+    a.w(0x41BC); a.w(10);                       // chk.w #10,d0: within
+    a.w(0x323C); a.w(10);                       // move.w #10,d1
+    a.w(0x4181);                                // chk.w d1,d0
+    a.w(0x303C); a.w(0);                        // move.w #0,d0
+    a.w(0x44FC); a.w(0x0F);                     // move #$0F,ccr
+    a.w(0x41BC); a.w(0xFFFD);                   // chk.w #-3,d0: a negative bound
+    a.w(0x41F9); a.l(0xFF8000);                 // lea $FF8000,a0
+    a.w(0x4198);                                // chk.w (a0)+,d0: bound 0, within
+    a.mark(); a.w(0x60FE);
+
+    begin("trapv with V clear and set", 0x1300);
+    a.w(0x44FC); a.w(0x00); a.w(0x4E76);        // move #0,ccr; trapv
+    a.w(0x44FC); a.w(0x02); a.w(0x4E76);        // move #2,ccr; trapv
+    a.w(0x44FC); a.w(0x1F); a.w(0x4E76);        // move #$1F,ccr; trapv
+    a.mark(); a.w(0x60FE);
+
+    begin("illegal, line A, line F", 0x1400);
+    a.w(0x7001);                                // moveq #1,d0
+    a.w(0x4AFC); a.resume();                    // illegal
+    a.w(0xA123); a.resume();                    // line A
+    a.w(0xF456); a.resume();                    // line F
+    a.mark(); a.w(0x60FE);
+
+    begin("stop, an interrupt later; stop at mask 7", 0x1500, 3000, 9000);
+    a.w(0x7400);                                // moveq #0,d2
+    a.w(0x4E72); a.w(0x2000); a.resume();       // stop #$2000
+    a.mark();
+    a.w(0x4E72); a.w(0x2700); a.resume();       // stop #$2700: no interrupt gets in
+    a.mark(); a.w(0x60FE);
+
+    begin("stop with an interrupt waiting", 0x1600, 0);
+    a.w(0x7603);                                // moveq #3,d3
+    a.w(0x4E72); a.w(0x2300); a.resume();       // stop #$2300: taken at once
+    a.mark(); a.w(0x60FE);
+
+    begin("exceptions mid-block", 0x1700);
+    a.w(0x7000); a.w(0x7200);                   // moveq #0,d0; moveq #0,d1
+    addq_d0(5); a.w(0x80C1);                    // divu.w d1,d0
+    addq_d0(5); a.w(0x41BC); a.w(2);            // chk.w #2,d0
+    addq_d0(5); a.w(0x44FC); a.w(0x02); a.w(0x4E76);    // trapv
+    addq_d0(5); a.w(0x4E41); a.resume();        // trap #1
+    addq_d0(5); a.w(0x4AFC); a.resume();        // illegal
+    addq_d0(5); a.mark(); a.w(0x60FE);
+
+    begin("rtr", 0x1900);
+    a.w(0x2F3C); a.l(0x1940);                   // move.l #$1940,-(a7)
+    a.w(0x3F3C); a.w(0x0013);                   // move.w #$13,-(a7)
+    a.w(0x4E77);                                // rtr (to code no entry names: on demand)
+    a.pc = 0x1940;
+    a.mark(); a.w(0x60FE);
+
+    begin("the reset instruction", 0x1A00);
+    a.w(0x7001); a.w(0x4E70);                   // moveq #1,d0; reset
+    a.mark(); a.w(0x60FE);
+
+    begin("move to sr from memory", 0x1B00);
+    a.w(0x33FC); a.w(0x2304); a.l(0xFF8002);    // move.w #$2304,($FF8002).l
+    a.w(0x46F9); a.l(0xFF8002);                 // move.w ($FF8002).l,sr
+    a.w(0x41F9); a.l(0xFF8002);                 // lea $FF8002,a0
+    a.w(0x46D8);                                // move.w (a0)+,sr
+    a.w(0x46FC); a.w(0x2711);                   // move #$2711,sr
+    a.mark(); a.w(0x60FE);
+
+    // User mode: entered with move to sr, andi and eori; privileged instructions there (the
+    // violation's handler steps over 4 bytes: each is padded with a nop to 4), a trap and an
+    // interrupt taken from it, and the stack pointers swapped each way.
+    for (int how = 0; how < 3; how++) {
+        static const char* names[] = {"user mode (move to sr), privilege, trap, interrupt",
+                                      "user mode (andi to sr)", "user mode (eori to sr)"};
+        begin(names[how], 0x1C00 + uint32_t(how) * 0x100, 4000);
+        a.w(0x207C); a.l(0xFFC000);             // movea.l #$FFC000,a0
+        a.w(0x4E60);                            // move a0,usp
+        if (how == 0) { a.w(0x46FC); a.w(0x0000); }         // move #0,sr
+        if (how == 1) { a.w(0x027C); a.w(0xD8FF); }         // andi #$D8FF,sr
+        if (how == 2) { a.w(0x0A7C); a.w(0x2700); }         // eori #$2700,sr
+        a.w(0x23CF); a.l(0xFF0020);             // move.l a7,($FF0020).l: the USP
+        a.w(0x4E42); a.resume();                // trap #2 (to supervisor mode and back)
+        a.w(0x46FC); a.w(0x2700);               // move #$2700,sr: privileged
+        a.w(0x027C); a.w(0xDFFF);               // andi #$DFFF,sr: privileged
+        a.w(0x4E69); a.w(0x4E71);               // move usp,a1: privileged; nop
+        a.w(0x4E73); a.w(0x4E71);               // rte: privileged; nop
+        a.w(0x4E70); a.w(0x4E71);               // reset: privileged; nop
+        a.w(0x4E72); a.w(0x2000);               // stop #$2000: privileged
+        a.w(0x2F00);                            // move.l d0,-(a7): on the USP
+        a.w(0x4E43); a.resume();                // trap #3
+        a.mark(); a.w(0x60FE);                  // (the interrupt comes here, in user mode)
+    }
+
+    // movep (the game has none; the decoder doesn't take it): all four forms, mid-block. These
+    // two go in the list as the tracer's functions do (in the game a function the decoder can't
+    // take is left out, and the interpreter runs it), not as entries, which must translate.
+    std::vector<uint32_t> listed;
+    begin("movep (the interpreter's)", 0x2000);
+    tests.back().handover = true;
+    entries.pop_back(); listed.push_back(0x2000);
+    a.w(0x203C); a.l(0x12345678);               // move.l #$12345678,d0
+    a.w(0x41F9); a.l(0xFF8100);                 // lea $FF8100,a0
+    addq_d0(3);
+    a.w(0x01C8); a.w(0x0000);                   // movep.l d0,0(a0)
+    a.w(0x0188); a.w(0x0009);                   // movep.w d0,9(a0)
+    a.w(0x0348); a.w(0x0000);                   // movep.l 0(a0),d1
+    a.w(0x0508); a.w(0x0009);                   // movep.w 9(a0),d2
+    addq_d0(3); a.mark(); a.w(0x60FE);
+
+    // A short branch with displacement $FF: on a 68000 a branch to an odd address (Musashi
+    // emulates no address error and runs on from there). Not taken, then taken.
+    begin("bcc.s/bra.s $FF (the interpreter's)", 0x2100);
+    tests.back().handover = true;
+    entries.pop_back(); listed.push_back(0x2100);
+    a.w(0x7000);                                // moveq #0,d0
+    a.w(0x44FC); a.w(0x00);                     // move #0,ccr
+    a.w(0x67FF);                                // beq.s $FF: not taken
+    addq_d0(2); a.mark();
+    a.w(0x60FF);                                // bra.s $FF: to the odd address after it
+    for (int i = 0; i < 8; i++) a.w(0x4E71);    // nop (what the odd fetches read through)
+    a.w(0x60FE);
+
+    // Code no entry names: reached through registers, so translated on demand.
+    begin("jsr and jmp through a register, on demand", 0x1800);
+    a.w(0x41F9); a.l(0x1880);                   // lea $1880,a0
+    a.w(0x4E90);                                // jsr (a0)
+    a.mark();
+    a.w(0x43F9); a.l(0x18A0);                   // lea $18A0,a1
+    a.w(0x4ED1);                                // jmp (a1)
+    entries.pop_back();                         // (begin listed it: this one isn't)
+    a.pc = 0x1880;
+    a.w(0x7807); a.w(0x5284); a.w(0x4E75);      // moveq #7,d4; addq.l #1,d4; rts
+    a.pc = 0x18A0;
+    a.w(0x7A09); a.mark(); a.w(0x60FE);         // moveq #9,d5; mark; bra.s *
+    entries.push_back(0x1800);
+
+    JitInput in;
+    in.config.functions = entries;
+    in.list = listed;
+    g_jit_input = in;                           // (what on-demand translations use)
+    const JitResult r = jit_translate(in, img, kArm64);
+    if (!r.code) {
+        std::printf("selftest: translating failed: %s\n", r.error.c_str());
+        return 1;
+    }
+    for (const auto& [address, why] : r.failed)
+        std::printf("selftest: left out $%06X: %s\n", address, why.c_str());
+
+    g_bus.rom = img;
+    g_rom_hash_known = false;
+    g_native_code = r.code;
+    recomp::jit::select(r.code);
+    g_native_rom_ok = true;
+
+    auto run = [&](const Test& t, int slice, bool native) {
+        SelfRun out;
+        std::fill(g_bus.ram, g_bus.ram + 0x10000, 0);
+        g_irq_pending = 0;
+        set_irq(0);
+        g_native_live = native;
+        native_reset();
+        m68k_pulse_reset();
+        if (native)
+            g_reset_cycles = coi_m68k_take_reset_cycles();
+        for (int i = 0; i < 8; i++) {
+            m68k_set_reg(m68k_register_t(M68K_REG_D0 + i), 0x11111111u * uint32_t(i + 1));
+            if (i < 7)
+                m68k_set_reg(m68k_register_t(M68K_REG_A0 + i), 0xFF9000u + uint32_t(i) * 0x100);
+        }
+        m68k_set_reg(M68K_REG_SR, 0x2700);
+        m68k_set_reg(M68K_REG_USP, 0xFFD000);
+        m68k_set_reg(M68K_REG_PC, t.entry);
+        const int64_t fallbacks0 = g_native_fallbacks;
+        int64_t used = 0;
+        const int n = 12000 / slice + 1;
+        for (int s = 0; s < n; s++) {
+            for (int at : t.irq_at)
+                if (at >= 0 && s == at / slice)
+                    raise_irq(6);
+            const int c = cpu_execute(slice);
+            out.slices.push_back(c);
+            out.pcs.push_back(cpu_reg(M68K_REG_PC));
+            used += c;
+        }
+        native_sync();
+        for (int i = 0; i < 16; i++)
+            out.regs[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+        out.regs[16] = m68k_get_reg(nullptr, M68K_REG_PC);
+        out.regs[17] = m68k_get_reg(nullptr, M68K_REG_SR);
+        out.regs[18] = m68k_get_reg(nullptr, M68K_REG_USP);
+        out.regs[19] = m68k_get_reg(nullptr, M68K_REG_ISP);
+        out.stopped = coi_m68k_stopped();
+        out.ram.assign(g_bus.ram, g_bus.ram + 0x10000);
+        out.fallbacks = g_native_fallbacks - fallbacks0;
+        g_native_live = false;
+        return out;
+    };
+    std::vector<int> slices = {488, 100, 61, 23, 7, 1};    // COI_SELFTEST_SLICES=a,b,...: others
+    if (const char* e = std::getenv("COI_SELFTEST_SLICES")) {
+        slices.clear();
+        for (const char* p = e; *p; ) {
+            slices.push_back(std::atoi(p));
+            while (*p && *p != ',') p++;
+            if (*p) p++;
+        }
+    }
+    int failed = 0, runs = 0;
+    const int64_t exceptions0 = g_native_exceptions, interrupts0 = g_native_interrupts;
+    for (const Test& t : tests)
+        for (int slice : slices) {
+            const SelfRun i = run(t, slice, false);
+            const SelfRun n = run(t, slice, true);
+            runs++;
+            char why[200] = "";
+            for (size_t s = 0; s < i.slices.size() && !why[0]; s++)
+                if (i.slices[s] != n.slices[s])
+                    std::snprintf(why, sizeof(why), "slice %zu used %d cycles, interpreter %d (ended at $%06X, interpreter $%06X; "
+                                  "the slice before at $%06X, $%06X)", s, n.slices[s], i.slices[s], n.pcs[s], i.pcs[s],
+                                  s ? n.pcs[s - 1] : 0, s ? i.pcs[s - 1] : 0);
+            static const char* names[20] = {"d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "a0", "a1", "a2",
+                                            "a3", "a4", "a5", "a6", "a7", "PC", "SR", "USP", "SSP"};
+            for (int k = 0; k < 20 && !why[0]; k++)
+                if (i.regs[k] != n.regs[k])
+                    std::snprintf(why, sizeof(why), "%s = %08X, interpreter %08X", names[k], n.regs[k], i.regs[k]);
+            if (!why[0] && i.stopped != n.stopped)
+                std::snprintf(why, sizeof(why), "stopped %d, interpreter %d", n.stopped, i.stopped);
+            for (int k = 0; k < 0x10000 && !why[0]; k++)
+                if (i.ram[k] != n.ram[k])
+                    std::snprintf(why, sizeof(why), "RAM $FF%04X = %02X, interpreter %02X", k, n.ram[k], i.ram[k]);
+            if (!why[0] && n.fallbacks && !t.handover)
+                std::snprintf(why, sizeof(why), "%lld slices handed to Musashi", (long long)n.fallbacks);
+            if (!why[0] && i.ram[1] == 0 && i.ram[0] == 0)
+                std::snprintf(why, sizeof(why), "the test never got to its end");
+            std::printf("selftest: %-42s slices of %3d: %s", t.name, slice, why[0] ? why : "identical");
+            if (t.handover)
+                std::printf(" (%lld slices handed to Musashi)", (long long)n.fallbacks);
+            std::printf("\n");
+            if (std::getenv("COI_SELFTEST_DUMP"))      // what the handlers saw: counts per vector, $FF0020
+                std::printf("  privilege %d, trap #2 %d, trap #3 %d, level 6 %d; USP seen %08X; SR in the level 6 frame %04X\n",
+                            n.ram[0x18D], n.ram[0x32D], n.ram[0x33D], n.ram[0x2ED],
+                            uint32_t(n.ram[0x20] << 24 | n.ram[0x21] << 16 | n.ram[0x22] << 8 | n.ram[0x23]),
+                            n.ram[0x2E0] << 8 | n.ram[0x2E1]);
+            failed += why[0] != 0;
+        }
+    std::printf("selftest: %d of %d runs identical; translated code took %lld exceptions and %lld interrupts; "
+                "%zu translated on demand\n", runs - failed, runs, (long long)(g_native_exceptions - exceptions0),
+                (long long)(g_native_interrupts - interrupts0), g_on_demand.size());
+    return failed ? 1 : 0;
+}
+}  // namespace
+#endif
+
+// The PC and SR for the headless report, wherever the CPU state is.
+uint32_t cpu_pc_for_report()
+{
+#ifdef COI_NATIVE
+    return cpu_reg(M68K_REG_PC);
+#else
+    return m68k_get_reg(nullptr, M68K_REG_PC);
+#endif
+}
+
+uint32_t cpu_sr_for_report()
+{
+#ifdef COI_NATIVE
+    return cpu_reg(M68K_REG_SR);
+#else
+    return m68k_get_reg(nullptr, M68K_REG_SR);
+#endif
+}
+
+#if defined(COI_NATIVE) && !defined(COI_NO_INTERPRETER)
+// --write-cycles FILE: Musashi's 68000 cycle tables (per opcode, run-length coded, and per
+// exception) as C, for builds without Musashi (port/recomp/cycles68000.c); and the check, at
+// every start-up of a development build, that the file still matches Musashi.
+std::string g_write_cycles;
+
+// --decode-check: the decoder against Musashi's opcode table, over all 65,536 opcodes (with
+// zero extension words): which ones Musashi runs as 68000 instructions (a cycle count; 0 means
+// it takes the illegal-instruction exception) that the decoder rejects, and the other way.
+int native_decode_check()
+{
+    m68k_init();
+    m68k_set_cpu_type(M68K_CPU_TYPE_68000);
+    if (std::getenv("COI_DECODE_TABLE"))        // (with the opcode table, as the game decodes)
+        recomp::use_opcode_table(m68ki_cycles[0]);
+    std::vector<uint8_t> bytes(16, 0);
+    const recomp::Rom rom{bytes};
+    std::map<std::string, std::vector<uint16_t>> ours_only, musashi_only;
+    static const char* names[] = {"Unknown", "Move", "Movea", "Moveq", "Movem", "Lea", "Pea", "Exg", "Swap", "Clr",
+        "Link", "Unlk", "Add", "Adda", "Addq", "Addx", "Sub", "Suba", "Subq", "Subx", "Cmp", "Cmpa", "Cmpm", "And",
+        "Or", "Eor", "Neg", "Negx", "Not", "Ext", "Tst", "Tas", "Mulu", "Muls", "Divu", "Divs", "Abcd", "Sbcd",
+        "Nbcd", "Asl", "Asr", "Lsl", "Lsr", "Rol", "Ror", "Roxl", "Roxr", "Btst", "Bchg", "Bclr", "Bset", "Bra",
+        "Bsr", "Bcc", "DBcc", "Scc", "Jmp", "Jsr", "Rts", "Rte", "Rtr", "Trap", "Nop", "AndiCcr", "OriCcr",
+        "EoriCcr", "AndiSr", "OriSr", "EoriSr", "MoveToCcr", "MoveToSr", "MoveFromSr", "MoveToUsp", "MoveFromUsp",
+        "Stop", "Reset", "Illegal", "Trapv", "Chk", "LineA", "LineF"};
+    for (uint32_t op = 0; op < 0x10000; op++) {
+        bytes[0] = uint8_t(op >> 8);
+        bytes[1] = uint8_t(op);
+        const recomp::Insn in = recomp::decode(rom, 0);
+        const bool ours = in.op != recomp::Op::Unknown && in.op != recomp::Op::Illegal && in.op != recomp::Op::LineA
+                          && in.op != recomp::Op::LineF;
+        const bool musashi = m68ki_cycles[0][op] != 0 && op != 0x4AFC && (op >> 12) != 0xA && (op >> 12) != 0xF;
+        if (ours && !musashi)
+            ours_only[names[int(in.op)]].push_back(uint16_t(op));
+        else if (musashi && !ours)
+            musashi_only[std::to_string(op >> 12)].push_back(uint16_t(op));
+    }
+    auto show = [](const char* what, const std::map<std::string, std::vector<uint16_t>>& m) {
+        size_t n = 0;
+        for (const auto& [k, v] : m)
+            n += v.size();
+        std::printf("%s: %zu opcodes\n", what, n);
+        for (const auto& [k, v] : m) {
+            std::printf("  %-10s %5zu:", k.c_str(), v.size());
+            for (size_t i = 0; i < v.size() && i < 10; i++)
+                std::printf(" %04X", v[i]);
+            std::printf("\n");
+        }
+    };
+    show("decoded but illegal to Musashi", ours_only);
+    show("run by Musashi but not decoded (by top nibble)", musashi_only);
+    return 0;
+}
+
+bool native_write_cycles(const std::string& path)
+{
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f)
+        return false;
+    std::fprintf(f, "/* The 68000's cycle counts as Musashi counts them (third_party/Musashi, MIT licence): per\n"
+                    "   opcode (m68ki_cycles[0], each opcode with its addressing; runs of a count and a value)\n"
+                    "   and per exception vector (m68ki_exception_cycle_table[0]). Written by a development build\n"
+                    "   (coi --write-cycles port/recomp/cycles68000.c), which checks it against Musashi's own at\n"
+                    "   start-up; builds without Musashi (COI_NO_INTERPRETER) count with it. */\n"
+                    "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\n"
+                    "#ifdef COI_NO_INTERPRETER\nunsigned char m68ki_cycles[1][0x10000];    /* (native_rt.h's name for it) */\n#endif\n\n"
+                    "static const uint16_t kRuns[] = {");
+    int n = 0;
+    for (uint32_t op = 0; op < 0x10000;) {
+        uint32_t end = op;
+        while (end < 0x10000 && end - op < 0xFFFF && m68ki_cycles[0][end] == m68ki_cycles[0][op])
+            end++;
+        std::fprintf(f, "%s%u,%u,", n++ % 12 ? " " : "\n    ", end - op, m68ki_cycles[0][op]);
+        op = end;
+    }
+    std::fprintf(f, "\n};\n\nconst uint8_t coi_exception_cycles_68000[256] = {");
+    for (int v = 0; v < 256; v++)
+        std::fprintf(f, "%s%u,", v % 16 ? " " : "\n    ", coi_m68k_exception_cycles(unsigned(v)));
+    std::fprintf(f, "\n};\n\nvoid coi_cycles_68000(uint8_t* out)\n{\n    size_t at = 0;\n"
+                    "    for (size_t i = 0; i + 1 < sizeof(kRuns) / sizeof(kRuns[0]); i += 2) {\n"
+                    "        memset(out + at, kRuns[i + 1], kRuns[i]);\n        at += kRuns[i];\n    }\n}\n");
+    std::fclose(f);
+    return true;
+}
+
+bool native_check_cycles()
+{
+    if (!g_write_cycles.empty()) {
+        if (!native_write_cycles(g_write_cycles)) {
+            std::fprintf(stderr, "can't write %s\n", g_write_cycles.c_str());
+            return false;
+        }
+        std::printf("wrote %s\n", g_write_cycles.c_str());
+        std::exit(0);
+    }
+    static uint8_t ours[0x10000];
+    coi_cycles_68000(ours);
+    bool same = std::memcmp(ours, m68ki_cycles[0], sizeof(ours)) == 0;
+    for (int v = 0; v < 256; v++)
+        same = same && coi_exception_cycles_68000[v] == coi_m68k_exception_cycles(unsigned(v));
+    if (!same)
+        std::fprintf(stderr, "port/recomp/cycles68000.c doesn't match Musashi's cycle tables: write it again with "
+                             "coi --write-cycles port/recomp/cycles68000.c\n");
+    return same;
+}
+#endif
+
+uint32_t current_pc()
+{
+#ifdef COI_NATIVE
+    if (g_native_cpu)
+        return g_native_cpu->pc;
+    return cpu_reg(M68K_REG_PPC);
+#else
+    return m68k_get_reg(nullptr, M68K_REG_PPC);
+#endif
+}
+
+// A data (0-7) or address (8-15) register as the instruction running sees it.
+uint32_t current_reg(int r)
+{
+#ifdef COI_NATIVE
+    if (g_native_cpu)
+        return r < 8 ? g_native_cpu->d[r] : g_native_cpu->a[r - 8];
+    return cpu_reg(m68k_register_t(M68K_REG_D0 + r));
+#else
+    return m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + r));
+#endif
+}
+
 extern "C" {
 unsigned int m68k_read_memory_8(unsigned int a) { return g_bus.read8(a); }
 unsigned int m68k_read_memory_16(unsigned int a) { return g_bus.read16(a); }
 unsigned int m68k_read_memory_32(unsigned int a) { return g_bus.read16(a) << 16 | g_bus.read16(a + 2); }
-void m68k_write_memory_8(unsigned int a, unsigned int v) { g_bus.write8(a, v); }
-void m68k_write_memory_16(unsigned int a, unsigned int v) { g_bus.write16(a, v); }
-void m68k_write_memory_32(unsigned int a, unsigned int v) { g_bus.write16(a, v >> 16); g_bus.write16(a + 2, v & 0xFFFF); }
+#ifdef COI_NATIVE
+#define LOG_WRITE(a, size, v) if (g_write_log) g_write_log->push_back({(a) & 0xFFFFFF, size, (v)})
+#else
+#define LOG_WRITE(a, size, v)
+#endif
+void m68k_write_memory_8(unsigned int a, unsigned int v) { LOG_WRITE(a, 1, v); g_bus.write8(a, v); }
+void m68k_write_memory_16(unsigned int a, unsigned int v) { LOG_WRITE(a, 2, v); g_bus.write16(a, v); }
+void m68k_write_memory_32(unsigned int a, unsigned int v) { LOG_WRITE(a, 4, v); g_bus.write16(a, v >> 16); g_bus.write16(a + 2, v & 0xFFFF); }
 unsigned int m68k_read_disassembler_8(unsigned int a) { return g_bus.read8(a); }
 unsigned int m68k_read_disassembler_16(unsigned int a) { return g_bus.read16(a); }
 unsigned int m68k_read_disassembler_32(unsigned int a) { return m68k_read_memory_32(a); }
 
 int genesis_int_ack(int level)
 {
+#ifdef COI_NATIVE
+    if (g_native_strict && g_native_live && g_native_rom_ok && !g_native_acking && !kNoInterpreter) {
+        std::fflush(stdout);
+        std::fprintf(stderr, "native strict: frame %d: Musashi took a level %d interrupt at $%06X\n", g_native_frame, level,
+                     cpu_reg(M68K_REG_PC));
+        std::fflush(stderr);
+        std::_Exit(3);
+    }
+#endif
     g_irq_pending &= ~(1 << level);
     update_irq();
     return M68K_INT_ACK_AUTOVECTOR;
@@ -1441,8 +4329,8 @@ int main(int argc, char** argv)
     std::vector<int> swing_switch_frames;
     std::vector<std::pair<int, int>> stage_jumps;   // frame, stage (1-28)
     // This run only, over the saved settings.
-    bool no_widescreen = false, easy_bounce = false, smooth_swing = false, smooth_scroll = false, crt = false;
-    bool no_smooth_scroll = false, vanilla_rock_edges = false, vanilla_fades = false, show_fps = false, interpolate = false;
+    bool no_widescreen = false, easy_bounce = false, smooth_swing = false, no_smooth_swing = false, smooth_scroll = false, crt = false;
+    bool no_smooth_scroll = false, vanilla_rock_edges = false, vanilla_fades = false, vanilla_water = false, vanilla_glass = false, show_fps = false, show_coordinates = false, interpolate = false;
     bool no_interpolate = false, log_mdplus = false;
     int mdplus = -1;                                // --mdplus / --no-mdplus
     double interp_back = -1;                        // --interp-back (testing)
@@ -1463,11 +4351,15 @@ int main(int argc, char** argv)
         else if (arg == "--no-widescreen") no_widescreen = true;
         else if (arg == "--easy-bounce") easy_bounce = true;
         else if (arg == "--smooth-swing") smooth_swing = true;
+        else if (arg == "--no-smooth-swing") no_smooth_swing = true;
         else if (arg == "--smooth-scroll") smooth_scroll = true;
         else if (arg == "--no-smooth-scroll") no_smooth_scroll = true;
         else if (arg == "--vanilla-rock-edges") vanilla_rock_edges = true;
         else if (arg == "--vanilla-fades") vanilla_fades = true;
+        else if (arg == "--vanilla-water") vanilla_water = true;
+        else if (arg == "--vanilla-glass") vanilla_glass = true;
         else if (arg == "--show-fps") show_fps = true;
+        else if (arg == "--show-coordinates") show_coordinates = true;
         else if (arg == "--interpolate") interpolate = true;
         else if (arg == "--no-interpolate") no_interpolate = true;
         else if (arg == "--mdplus") mdplus = 1;
@@ -1479,6 +4371,10 @@ int main(int argc, char** argv)
         else if (arg == "--cheat" && i + 1 < argc) cheats.push_back(argv[++i]);
         else if (arg == "--crt") crt = true;
         else if (arg == "--console") {}           // handled first thing in main
+        else if (arg == "--stdout" && i + 1 < argc) {   // (Android has none; an app's process outlives main)
+            if (std::freopen(argv[++i], "w", stdout))
+                std::setvbuf(stdout, nullptr, _IOLBF, 1024);
+        }
         else if (arg == "--scanlines" && i + 1 < argc) scanlines = std::atoi(argv[++i]);
         else if (arg == "--hqx" && i + 1 < argc) hqx = std::atoi(argv[++i]);
         else if (arg == "--clean-edge-width" && i + 1 < argc) clean_edge_width = (float)std::atof(argv[++i]);
@@ -1491,6 +4387,43 @@ int main(int argc, char** argv)
 #ifndef NDEBUG
         else if (arg == "--snapshots" && i + 1 < argc) snapshot_dir = argv[++i];
         else if (arg == "--sprite-capture" && i + 1 < argc) sprite_capture_dir = argv[++i];
+#endif
+        else if (arg == "--save-rom" && i + 1 < argc) g_save_rom_path = argv[++i];
+        else if (arg == "--save-rom-family" && i + 1 < argc) g_save_rom_family = argv[++i];
+#ifdef COI_NATIVE_DEV
+        else if (native_dev_arg(arg, i, argc, argv)) {}
+#endif
+#ifdef COI_NATIVE
+        else if (arg == "--native-test" && i + 1 < argc) {
+            g_native_limit = std::atoi(argv[++i]);
+            g_native_live = false;                  // (it saves the calls the interpreter makes)
+        }
+#ifndef COI_NO_INTERPRETER
+        else if (arg == "--decode-check") return native_decode_check();
+#endif
+#ifndef COI_NO_INTERPRETER
+        else if (arg == "--native-probe" && i + 1 < argc) {
+            for (const char* p = argv[++i]; *p;) {
+                g_probe_frames.push_back(std::atoi(p));
+                while (*p && *p != ',') p++;
+                if (*p) p++;
+            }
+        }
+#endif
+        else if (arg == "--native") g_native_live = true;
+        else if (arg == "--no-native") {
+            if (kNoInterpreter)
+                std::fprintf(stderr, "--no-native: this build has no interpreter, so translated code runs\n");
+            else
+                g_native_live = false;
+        }
+#ifndef COI_NO_INTERPRETER
+        else if (arg == "--native-selftest") g_native_selftest = true;
+        else if (arg == "--write-cycles" && i + 1 < argc) g_write_cycles = argv[++i];
+#endif
+        else if (arg == "--jit") g_native_jit = true;
+#else
+        else if (arg == "--no-native") {}           // (no translator built in: the interpreter runs anyway)
 #endif
         else if (arg == "--vram" && i + 1 < argc) vram_path = argv[++i];
         else if (arg == "--cram" && i + 1 < argc) cram_path = argv[++i];
@@ -1610,8 +4543,14 @@ int main(int argc, char** argv)
         settings.clean_rock_edges = false;
     if (vanilla_fades)
         settings.smooth_fades = false;
+    if (vanilla_water)
+        settings.smooth_water = false;
+    if (vanilla_glass)
+        settings.smooth_glass = false;
     if (show_fps)
         settings.show_fps = true;
+    if (show_coordinates)
+        settings.show_coordinates = true;
     if (interpolate)
         settings.interpolate = true;
     if (no_interpolate)
@@ -1649,7 +4588,9 @@ int main(int argc, char** argv)
     g_cheats = settings.cheats;
     g_clean_rock_edges = settings.clean_rock_edges;
     g_smooth_fades = settings.smooth_fades;
-    g_smooth_swing = (settings.smooth_swing || smooth_swing) && g_smooth_swing_available;
+    g_smooth_water = settings.smooth_water;
+    g_smooth_glass = settings.smooth_glass;
+    g_smooth_swing = (settings.smooth_swing || smooth_swing) && !no_smooth_swing && g_smooth_swing_available;
     bool smooth_scroll_on = (settings.smooth_scroll || smooth_scroll) && !no_smooth_scroll;   // chosen
     set_smooth_scroll(smooth_scroll_on);
     g_vdp.smooth_scroll = [](int line, int hs_a, int hs_b, int scale, int& sub_a, int& sub_b) {
@@ -1664,8 +4605,7 @@ int main(int argc, char** argv)
     // Frame interpolation notes who writes each sprite and when the list reaches the VDP.
     g_bus.on_sprite_list_write = [](uint16_t address) {
         if (g_interp_capture)
-            g_interp.sprite_written(address, m68k_get_reg(nullptr, M68K_REG_PPC),
-                                    m68k_get_reg(nullptr, M68K_REG_A0), g_bus.ram);
+            g_interp.sprite_written(address, current_pc(), current_reg(8), g_bus.ram);
     };
     g_vdp.on_dma = [](uint32_t source) {
         if (g_interp_capture)
@@ -1678,21 +4618,136 @@ int main(int argc, char** argv)
         return false;
     };
 
+#ifdef COI_NO_INTERPRETER
+    coi_cycles_68000(m68ki_cycles[0]);
+    g_native_jit = true;
+#else
     m68k_init();
     m68k_set_cpu_type(M68K_CPU_TYPE_68000);
-    m68k_pulse_reset();
+#ifdef COI_NATIVE
+    if (!native_check_cycles())
+        return 1;
+#endif
+#endif
+#ifdef COI_NATIVE
+    recomp::use_opcode_table(m68ki_cycles[0]);
+#endif
+#ifdef COI_NATIVE
+    // --jit: translate the ROM (as patched now) into machine code here, and run that (instead of
+    // a translation a development build links in). The configuration and the tracer's lists: COI_RECOMP_CONFIG's
+    // and COI_RECOMP_SWEEP's (sites.txt beside it), else a recomp/ folder's (recomp.txt,
+    // subroutines.txt, sites.txt; on Android in the app's folder), else the ones built in
+    // (config/recomp.txt, recomp_functions.txt, recomp_sites.txt).
+    // A build with a translation linked in reads the same, for the ROMs that translation doesn't fit.
+#ifdef COI_NATIVE_BUILT_IN
+    constexpr bool kBuiltIn = true;
+#else
+    constexpr bool kBuiltIn = false;
+#endif
+    if ((g_native_jit || kBuiltIn) && (g_native_live || g_native_limit > 0)) {
+        JitResult r;
+        try {
+            std::string config_path, sweep;
+            for (const auto& dir : search_dirs("recomp"))
+                if (std::filesystem::exists(dir / "recomp.txt")) {
+                    config_path = (dir / "recomp.txt").string();
+                    sweep = std::filesystem::exists(dir / "subroutines.txt") ? (dir / "subroutines.txt").string() : "";
+                    break;
+                }
+            if (const char* e = std::getenv("COI_RECOMP_CONFIG")) config_path = e;
+            if (const char* e = std::getenv("COI_RECOMP_SWEEP")) sweep = e;
+            if (config_path.empty())
+                recomp::read_config(kRecompConfig, "the built-in config/recomp.txt", g_jit_input.config);
+            else
+                recomp::load_config(config_path, g_jit_input.config);
+            if (!sweep.empty()) {
+                g_jit_input.list = recomp::load_function_list(sweep);
+                recomp::load_config(sweep.substr(0, sweep.find_last_of("/\\") + 1) + "sites.txt", g_jit_input.config);
+            } else if (config_path.empty()) {
+                g_jit_input.list = recomp::read_function_list(kRecompFunctions);
+                recomp::read_config(kRecompSites, "the built-in config/recomp_sites.txt", g_jit_input.config);
+            }
+            g_jit_input.trace = g_native_limit > 0 || std::getenv("COI_NATIVE_CHECK");
+        } catch (const std::exception& ex) {
+            r.error = ex.what();
+        }
+        if (!r.error.empty()) {
+            std::fprintf(stderr, "jit: %s\n", r.error.c_str());
+            return 1;
+        }
+        // COI_JIT_ARCH=arm64/x64: translate for that CPU (with COI_JIT_DUMP, to look at it);
+        // code for another CPU than this one isn't run.
+        const char* arch = std::getenv("COI_JIT_ARCH");
+        const bool want_arm64 = arch ? std::string(arch) == "arm64" : kArm64;
+        if (!g_native_jit) {
+            // The translation linked in, where it fits; the app's own for any other ROM image,
+            // translated when it's met (native_rom_changed).
+            g_native_variants_on = g_native_live;
+            native_rom_changed();
+        } else {
+            g_native_code = nullptr;                    // the app's own code
+            g_native_rom_ok = false;
+            if (g_jit_input.trace || arch || g_native_strict) {
+                g_native_variants_on = g_native_live && g_native_strict;
+                // At once: the harness follows translated code from the first instruction.
+                r = jit_translate(g_jit_input, g_bus.rom, want_arm64);
+                if (r.code && want_arm64 != kArm64) {
+                    std::printf("jit: translated for another CPU (%s), not run\n", arch);
+                    return 0;
+                }
+                if (!r.code) {
+                    std::fprintf(stderr, "jit: %s\n", r.error.c_str());
+                    return 1;
+                }
+                native_installed(r);
+                g_native_code = r.code;
+                recomp::jit::select(r.code);
+                g_native_rom_ok = native_rom_matches(g_native_code);
+                if (g_native_variants_on && g_native_rom_ok)
+                    native_ahead_queue();
+            } else {
+                // In the game: on a thread, while the interpreter runs the boot and the Sega logo;
+                // the code runs from the first frame after it's ready (native_poll).
+                g_native_variants_on = g_native_live;
+                g_native_pending = std::async(std::launch::async, [in = g_jit_input, rom = g_bus.rom] { return jit_translate(in, rom, kArm64); });
+            }
+        }
+    }
+#endif
+    if (!g_save_rom_path.empty()) {
+        if (FILE* f = std::fopen(g_save_rom_path.c_str(), "wb")) {
+            std::fwrite(g_bus.rom.data(), 1, g_bus.rom.size(), f);
+            std::fclose(f);
+        }
+    }
+    if (!g_save_rom_family.empty() && !save_rom_family(g_rom_original, g_save_rom_family))
+        std::fprintf(stderr, "--save-rom-family: couldn't write the images to %s\n", g_save_rom_family.c_str());
+#ifdef COI_NATIVE_DEV
+    native_dev_start();
+#endif
+#if defined(COI_NATIVE) && !defined(COI_NO_INTERPRETER)
+    if (g_native_limit > 0)
+        m68k_set_instr_hook_callback(native_hook);
+#endif
+#if defined(COI_NATIVE) && !defined(COI_NO_INTERPRETER)
+    if (g_native_selftest)
+        return native_selftest();
+#endif
+    cpu_reset();
 
     std::vector<uint32_t> pixels(kWideWidth * kSubpixels * Vdp::kScreenHeight);   // room for any width
     for (auto& layer : g_layers)
+        layer.resize(kLayerStride * Vdp::kScreenHeight);
+    for (auto& layer : g_water_layers)
         layer.resize(kLayerStride * Vdp::kScreenHeight);
 
     if (headless_frames > 0) {
         std::vector<int16_t> all_audio;
         g_interp_capture = interp_back >= 0;
+        FILE* state_hash = state_hash_path.empty() ? nullptr : std::fopen(state_hash_path.c_str(), "w");
         // --frames counts pictures. Each runs one game frame, or with --fast-forward held over
         // it during a story scene up to kFastForward (as the windowed loop does). --press,
         // --poke and the other per-frame options count game frames, as before.
-        FILE* state_hash = state_hash_path.empty() ? nullptr : std::fopen(state_hash_path.c_str(), "w");
         int frame = 0;
         for (int picture = 0; picture < headless_frames; picture++) {
           bool held = false;
@@ -1702,6 +4757,9 @@ int main(int argc, char** argv)
           for (int step = 0; step < steps; step++, frame++) {
             if (step > 0 && !is_cutscene_state(g_bus.ram))
                 break;                              // the scene ended within the picture
+#ifdef COI_NATIVE
+            g_native_frame = frame;
+#endif
             g_bus.buttons = easy_bounce_buttons();
             for (const Press& p : presses)
                 if (frame >= p.first && frame <= p.last)
@@ -1723,8 +4781,13 @@ int main(int argc, char** argv)
                     g_bus.jump_stage = kStageIndex[stage - 1];
             if (g_vdp.trace)
                 std::printf("[frame %d]\n", frame);
+#if defined(COI_NATIVE) && !defined(COI_NO_INTERPRETER)
+            for (int f : g_probe_frames)
+                if (frame == f)
+                    probe_capture(frame);
+#endif
             run_frame(pixels.data());
-            if (state_hash)                         // game frame, picture, FNV-1a of RAM, VRAM, CRAM, registers, VSRAM
+            if (state_hash)                         // game frame, picture, machine_hash
                 std::fprintf(state_hash, "%d %d %016llx\n", frame, picture, (unsigned long long)machine_hash());
 #ifndef NDEBUG
             if (!sprite_capture_dir.empty())
@@ -1756,14 +4819,42 @@ int main(int argc, char** argv)
                 all_audio.insert(all_audio.end(), g_audio.begin(), g_audio.end());
           }
         }
-        if (state_hash)
-            std::fclose(state_hash);
         if (!wav_path.empty())
             write_wav(wav_path.c_str(), all_audio, g_sound.sample_rate());
+        if (state_hash)
+            std::fclose(state_hash);
+#ifdef COI_NATIVE_DEV
+        native_dev_finish();
+#endif
+#ifdef COI_NATIVE
+        std::printf("68000: %.0f ms for %d frames (%.3f ms a frame)\n", g_cpu_time / 1e6, headless_frames,
+                    g_cpu_time / 1e6 / headless_frames);
+        if (g_native_live && !g_native_rom_ok)
+            std::printf("native: the ROM as patched now isn't the one translated, so the interpreter ran it\n");
+        if (g_native_live) {
+            std::printf("68000: %.1f%% of %lld cycles in translated code\n", 100.0 * g_native_cycles / g_cpu_cycles,
+                        (long long)g_cpu_cycles);
+            std::printf("native: %lld slices handed to Musashi\n", (long long)g_native_fallbacks);
+            std::vector<std::pair<int64_t, uint32_t>> top;
+            for (const auto& [a, n] : g_interpreted)
+                top.push_back({n, a});
+            std::sort(top.rbegin(), top.rend());
+            for (size_t i = 0; i < top.size() && i < 25; i++)
+                std::printf("  interpreted %lld times at $%06X\n", (long long)top[i].first, top[i].second);
+            strict_report();
+        }
+        native_sync();                      // (Musashi's registers from here on: the report, the replays)
+#ifndef COI_NO_INTERPRETER
+        if (g_native_limit > 0)             // (it replays saved calls, so nothing after it reports this run)
+            return native_report() ? 1 : 0;
+        if (!g_probe_states.empty())
+            return native_probe() ? 1 : 0;
+#endif
+#endif
         std::printf("YM2612 timer expirations: A=%u B=%u\n", g_sound.timer_expirations[0],
                     g_sound.timer_expirations[1]);
         std::printf("Ran %d pictures, %d game frames; PC=%06X GameState=$%02X VIntMode=$%02X\n", headless_frames, frame,
-                    m68k_get_reg(nullptr, M68K_REG_PC), g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
+                    cpu_pc_for_report(), g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
                     g_bus.ram[0xF302] << 8 | g_bus.ram[0xF303]);
         save_state(ram_path, vram_path, cram_path);
         for (uint32_t a : peeks)
@@ -1777,7 +4868,7 @@ int main(int argc, char** argv)
             std::printf(" %02X", g_vdp.reg[r]);
         std::printf("\n");
         std::printf("VDP reg0=$%02X reg1=$%02X  irq pending=$%02X  SR=$%04X  RAM FF08=$%04X FF0A=$%04X\n",
-                    g_vdp.reg[0], g_vdp.reg[1], g_irq_pending, m68k_get_reg(nullptr, M68K_REG_SR),
+                    g_vdp.reg[0], g_vdp.reg[1], g_irq_pending, cpu_sr_for_report(),
                     g_bus.ram[0xFF08] << 8 | g_bus.ram[0xFF09], g_bus.ram[0xFF0A] << 8 | g_bus.ram[0xFF0B]);
         if (interp_back >= 0 && g_interp.ready())   // --interp-back: the last frame, drawn earlier
             render_interpolated(pixels.data(), interp_back);
@@ -2278,11 +5369,14 @@ int main(int argc, char** argv)
             pad = 0;
         act(menu_frame({g_widescreen, g_wide_available, fullscreen(), current_stage(), g_easy_bounce,
                         g_smooth_swing, g_smooth_swing_available, smooth_scroll_on, &settings.crt,
-                        &settings.scanlines, &settings.hqx, &settings.clean_edge_line_width, &settings.clean_rock_edges, &settings.smooth_fades,
+                        &settings.scanlines, &settings.hqx, &settings.clean_edge_line_width, &settings.clean_rock_edges, &settings.smooth_fades, &settings.smooth_water, &settings.smooth_glass,
                         &settings.remove_sprite_limit, &settings.vsync, &settings.show_fps, fps, game_fps,
                         &settings.cheats, &settings.interpolate, refresh, &settings.frame_rate,
                         g_mdplus_on, g_mdplus.loaded() ? g_mdplus.name().c_str() : nullptr, settings.quick,
-                        busy.empty() ? nullptr : busy.c_str(), busy_progress}),
+                        busy.empty() ? nullptr : busy.c_str(), busy_progress, &settings.show_coordinates,
+                        g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43], g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
+                        (int16_t)(g_bus.ram[0xDC10] << 8 | g_bus.ram[0xDC11]), (int16_t)(g_bus.ram[0xDC14] << 8 | g_bus.ram[0xDC15]),
+                        (int16_t)(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]), (int16_t)(g_bus.ram[0xFA80] << 8 | g_bus.ram[0xFA81])}),
             running);
         if ((Quick)settings.quick != Quick::Custom && look_of(settings) != quick_look((Quick)settings.quick)) {
             settings.quick = (int)Quick::Custom;    // one of its settings was changed by hand
@@ -2290,6 +5384,8 @@ int main(int argc, char** argv)
         }
         g_clean_rock_edges = settings.clean_rock_edges;
         g_smooth_fades = settings.smooth_fades;
+        g_smooth_water = settings.smooth_water;
+        g_smooth_glass = settings.smooth_glass;
         g_vdp.sprite_limit = !settings.remove_sprite_limit;
         if ((scrolling_smoothly() && !hqx_on()) != (g_scale > 1))
             set_smooth_scroll(scrolling_smoothly() && !hqx_on());
@@ -2313,6 +5409,11 @@ int main(int argc, char** argv)
             SDL_SetAudioStreamGain(music, fast_forwarding ? 0.0f : 1.0f);
 #ifdef COI_TIMING_LOG
         const Uint64 timing_start = SDL_GetTicksNS();
+        const Uint64 video_start = g_time_video, cpu_start = g_time_cpu, sound_start = g_time_sound;
+#ifdef COI_NATIVE
+        const bool translating_start = g_native_pending.valid();
+        const size_t variants_start = g_native_variants.size();
+#endif
 #endif
         for (int i = 0; i < due && running; i++) {
           const int steps = fast_forwarding && is_cutscene_state(g_bus.ram) ? kFastForward : 1;
@@ -2368,6 +5469,8 @@ int main(int argc, char** argv)
             LayeredFrame frame;
             for (int i = 0; i < LayeredFrame::kLayers; i++)
                 frame.layers[i] = g_layers[i].data();
+            for (int i = 0; i < 2; i++)
+                frame.water[i] = g_vdp.water_tiles.empty() ? nullptr : g_water_layers[i].data();
             frame.width = g_out_width + 2 * kLayerMargin;
             frame.height = Vdp::kScreenHeight;
             frame.margin = kLayerMargin;
@@ -2413,6 +5516,24 @@ int main(int argc, char** argv)
                 longest_gap = std::max(longest_gap, gap);
                 if (gap > 25000000)
                     late++;
+                // A hitch (a picture more than 45 ms after the last, about three refreshes):
+                // where that picture's time went, and what the translator was doing.
+                if (gap > 45000000) {
+                    const Uint64 work = swapped - timing_start;
+                    const char* native = "";
+#ifdef COI_NATIVE
+                    native = g_native_variants.size() != variants_start ? ", a translation installed"
+                             : translating_start || g_native_pending.valid() ? ", translating"
+                             : g_native_live && !g_native_rom_ok ? ", ROM not translated (interpreted)" : "";
+#endif
+                    SDL_Log("hitch: %.1f ms since the last picture; %d game frame(s): emulation %.2f ms (video %.2f, "
+                            "68000 %.2f, Z80+sound %.2f), drawing %.2f, swap %.2f, outside those %.2f ms; "
+                            "frame %d, GameState $%02X, stage %d%s",
+                            gap / 1e6, due, (timing_emulated - timing_start) / 1e6, (g_time_video - video_start) / 1e6,
+                            (g_time_cpu - cpu_start) / 1e6, (g_time_sound - sound_start) / 1e6,
+                            (timing_drawn - timing_emulated) / 1e6, (swapped - timing_drawn) / 1e6,
+                            (gap - std::min(gap, work)) / 1e6, frames_run, g_bus.ram[0xF301], current_stage(), native);
+                }
             }
             last_swap = swapped;
             emulate += timing_emulated - timing_start;
