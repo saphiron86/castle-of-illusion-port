@@ -118,6 +118,9 @@ constexpr int kWidth = 320;                         // the original view
 constexpr int kWideWidth = kWidth + 2 * kWideMargin;
 // GameStates drawn at 400 pixels; every other state is pillarboxed at 320.
 //   $0E  level play
+//   $10  stage 8's turn upside down (GameState_10): the picture of play squeezed to a line
+//        and opened out again through the line interrupt's vertical scroll; the planes
+//        are as wide as in play, so the strips squeeze with it
 //   $22  the cutscenes between worlds (set up by $20, which picks the scene by level):
 //        a scripted camera over 512-pixel planes that are drawn once. The castle
 //        exterior before the final boss needs a fill past its brick tower (TowerFill).
@@ -160,7 +163,7 @@ bool is_wide_state(uint16_t state, uint16_t level, const uint8_t* ram)
     (void)level;
     if (state == 0x16)
         return after_ending_scene(ram) != AfterEnding::TheEnd;
-    return state == 0x0E || state == 0x22 || state == 0x2A || state == 0x2C || state == 0x2E;
+    return state == 0x0E || state == 0x10 || state == 0x22 || state == 0x2A || state == 0x2C || state == 0x2E;
 }
 
 // Fast forward (Backspace, a controller's Y, or the touch controls' >> button, held): while
@@ -1266,11 +1269,214 @@ void update_tile_swaps(bool on, uint16_t state)
     }
 }
 
+// Smooth Water: the cream at the bottom of stages 15 and 23 (game stage indexes 21 and 22) is
+// one picture of 18 x 4 tiles (346-417, palette line 2, 144 x 32 pixels) repeated along plane A.
+// The game's block animation rewrites the tiles every 12 frames with the next of three frames,
+// each the last one moved 48 pixels left. In between, each row of the picture is matched with
+// the same row of the next frame, pixels moving at most kCreamReach either way (keeping their
+// order), so the bands sway side to side as the colours blend; the outline, a surface height
+// per column, rises and falls in place. The cream stays opaque. Drawn through Vdp::tile_rgba.
+constexpr int kCreamW = 144, kCreamH = 32, kCreamReach = 24;
+constexpr uint16_t kCreamLayout[4][18] = {
+    {346, 347, 350, 351, 354, 355, 370, 371, 374, 375, 378, 379, 394, 395, 398, 399, 402, 403},
+    {348, 349, 352, 353, 356, 357, 372, 373, 376, 377, 380, 381, 396, 397, 400, 401, 404, 405},
+    {358, 359, 362, 363, 366, 367, 382, 383, 386, 387, 390, 391, 406, 407, 410, 411, 414, 415},
+    {360, 361, 364, 365, 368, 369, 384, 385, 388, 389, 392, 393, 408, 409, 412, 413, 416, 417}};
+constexpr int kCreamLine = 2;
+
+struct CreamFrame {
+    std::array<uint8_t, kCreamW * kCreamH> values;  // palette values, 0 transparent
+    std::array<uint8_t, kCreamW * kCreamH> filled;  // transparent pixels take the cream's below
+    std::array<uint8_t, kCreamW> height;            // first opaque row per column
+    int next = -1;                                  // the frame seen after this one
+    std::array<std::vector<std::pair<int16_t, int16_t>>, kCreamH> pairs;   // rows matched with next's
+};
+struct CreamMorph {
+    std::vector<CreamFrame> frames;
+    int current = -1, frame = 0, last_swap = -1000, period = 12;
+} g_cream;
+
+CreamFrame cream_frame()
+{
+    CreamFrame f;
+    for (int ty = 0; ty < 4; ty++)
+        for (int tx = 0; tx < 18; tx++) {
+            const auto v = tile_values(kCreamLayout[ty][tx]);
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++)
+                    f.values[(ty * 8 + y) * kCreamW + tx * 8 + x] = v[y * 8 + x];
+        }
+    f.filled = f.values;
+    for (int x = 0; x < kCreamW; x++) {
+        int top = 0;
+        while (top < kCreamH && !f.values[top * kCreamW + x])
+            top++;
+        f.height[x] = (uint8_t)top;
+        for (int y = 0; y < top && top < kCreamH; y++)
+            f.filled[y * kCreamW + x] = f.values[top * kCreamW + x];
+    }
+    return f;
+}
+
+// Matches each row of `a` with the same row of `b` (by colour, the picture repeating along
+// the row): pixel pairs (i, j) in order, |i - j| <= kCreamReach, i and j unwrapped.
+void match_cream_rows(CreamFrame& a, const CreamFrame& b)
+{
+    constexpr int pad = 2 * kCreamReach, m = kCreamW + 2 * pad;
+    std::vector<float> cost((m + 1) * (m + 1));
+    std::vector<uint8_t> from((m + 1) * (m + 1));
+    float ra[m][3], rb[m][3];
+    for (int y = 0; y < kCreamH; y++) {
+        for (int i = 0; i < m; i++) {
+            const int x = ((i - pad) % kCreamW + kCreamW) % kCreamW;
+            const uint8_t va = a.filled[y * kCreamW + x], vb = b.filled[y * kCreamW + x];
+            const uint32_t ca = va ? shown_rgb(kCreamLine * 16 + va) : 0, cb = vb ? shown_rgb(kCreamLine * 16 + vb) : 0;
+            for (int ch = 0; ch < 3; ch++) {
+                ra[i][ch] = (float)(ca >> (16 - ch * 8) & 0xFF);
+                rb[i][ch] = (float)(cb >> (16 - ch * 8) & 0xFF);
+            }
+        }
+        std::fill(cost.begin(), cost.end(), 1e30f);
+        cost[0] = 0;
+        for (int i = 1; i <= m; i++)
+            for (int j = std::max(1, i - kCreamReach); j <= std::min(m, i + kCreamReach); j++) {
+                const float d = (std::abs(ra[i - 1][0] - rb[j - 1][0]) + std::abs(ra[i - 1][1] - rb[j - 1][1])
+                                 + std::abs(ra[i - 1][2] - rb[j - 1][2])) / 255.0f + 0.01f * std::abs(i - j);
+                const float c0 = cost[(i - 1) * (m + 1) + j - 1], c1 = cost[(i - 1) * (m + 1) + j],
+                            c2 = cost[i * (m + 1) + j - 1];
+                const float best = std::min({c0, c1, c2});
+                cost[i * (m + 1) + j] = d + best;
+                from[i * (m + 1) + j] = best == c0 ? 0 : best == c1 ? 1 : 2;
+            }
+        auto& pairs = a.pairs[y];
+        pairs.clear();
+        for (int i = m, j = m; i > 0 && j > 0;) {
+            const int pi = i - 1 - pad, pj = j - 1 - pad;
+            if (pi >= -kCreamReach && pi < kCreamW + kCreamReach)
+                pairs.push_back({(int16_t)pi, (int16_t)pj});
+            const uint8_t f = from[i * (m + 1) + j];
+            if (f == 0) i--, j--;
+            else if (f == 1) i--;
+            else j--;
+        }
+    }
+}
+
+// Follows the cream's frames (stages 15 and 23 in play, Smooth Water on).
+void update_cream(bool on, uint16_t state)
+{
+    const int stage = g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43];
+    CreamMorph& c = g_cream;
+    c.frame++;
+    if (!on || state != 0x0E || (stage != 21 && stage != 22)) {
+        c.frames.clear();
+        c.current = -1;
+        return;
+    }
+    CreamFrame now = cream_frame();
+    int index = -1;
+    for (size_t i = 0; i < c.frames.size(); i++)
+        if (c.frames[i].values == now.values)
+            index = (int)i;
+    if (index < 0) {
+        if (c.frames.size() >= 8) {                 // not the three-frame cycle: start over
+            c.frames.clear();
+            c.current = -1;
+        }
+        c.frames.push_back(now);
+        index = (int)c.frames.size() - 1;
+    }
+    if (index == c.current)
+        return;
+    if (c.current >= 0) {
+        CreamFrame& last = c.frames[c.current];
+        if (last.next != index) {
+            last.next = index;
+            match_cream_rows(last, c.frames[index]);
+        }
+        const int since = c.frame - c.last_swap;
+        if (since >= 2 && since <= 64)
+            c.period = since;
+    }
+    c.current = index;
+    c.last_swap = c.frame;
+}
+
+// Adds the cream's tiles to `vdp`'s tile pictures, as shown `back` game frames (0-1) before
+// the current one.
+void set_cream(Vdp& vdp, double back)
+{
+    const CreamMorph& c = g_cream;
+    if (c.current < 0 || c.frame - c.last_swap >= 2 * c.period)
+        return;
+    // From the frame shown towards the next; a moment before the last swap, from the one before.
+    double since = c.frame - c.last_swap - back;
+    int a = c.current;
+    if (since < 0) {
+        a = -1;
+        for (size_t i = 0; i < c.frames.size(); i++)
+            if (c.frames[i].next == c.current)
+                a = (int)i;
+        if (a < 0)
+            return;
+        since += c.period;
+    }
+    const CreamFrame& from = c.frames[a];
+    if (from.next < 0)
+        return;                                     // the next frame not seen yet
+    const CreamFrame& to = c.frames[from.next];
+    const double t = std::clamp(since / c.period, 0.0, 1.0);
+    uint32_t rgb[16];
+    for (int v = 0; v < 16; v++)
+        rgb[v] = v ? shown_rgb(kCreamLine * 16 + v) : 0;
+    std::vector<uint32_t> picture(kCreamW * kCreamH);
+    for (int y = 0; y < kCreamH; y++) {
+        float acc[kCreamW][3] = {}, weight[kCreamW] = {};
+        for (const auto& [i, j] : from.pairs[y]) {
+            const uint32_t ca = rgb[from.filled[y * kCreamW + (i + kCreamW) % kCreamW]];
+            const uint32_t cb = rgb[to.filled[y * kCreamW + (j + kCreamW) % kCreamW]];
+            const double x = i * (1 - t) + j * t;
+            const int x0 = (int)std::floor(x);
+            const float f = (float)(x - x0);
+            for (const auto& [xx, w] : {std::pair<int, float>{x0, 1 - f}, {x0 + 1, f}}) {
+                if (w <= 0)
+                    continue;
+                const int col = (xx % kCreamW + kCreamW) % kCreamW;
+                for (int ch = 0; ch < 3; ch++) {
+                    const int shift = 16 - ch * 8;
+                    acc[col][ch] += w * (float)((ca >> shift & 0xFF) * (1 - t) + (cb >> shift & 0xFF) * t);
+                }
+                weight[col] += w;
+            }
+        }
+        for (int x = 0; x < kCreamW; x++) {
+            const int height = (int)std::lround(from.height[x] * (1 - t) + to.height[x] * t);
+            if (y < height || weight[x] <= 0)
+                continue;
+            uint32_t p = 0xFF000000;
+            for (int ch = 0; ch < 3; ch++)
+                p |= (uint32_t)std::clamp((int)std::lround(acc[x][ch] / weight[x]), 0, 255) << (16 - ch * 8);
+            picture[y * kCreamW + x] = p;
+        }
+    }
+    vdp.tile_rgba_index.resize(2048, -1);
+    for (int ty = 0; ty < 4; ty++)
+        for (int tx = 0; tx < 18; tx++) {
+            std::array<uint32_t, 64> tile;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++)
+                    tile[y * 8 + x] = picture[(ty * 8 + y) * kCreamW + tx * 8 + x];
+            vdp.tile_rgba_index[kCreamLayout[ty][tx]] = (int16_t)vdp.tile_rgba.size();
+            vdp.tile_rgba.push_back(tile);
+        }
+}
+
 // Sets `vdp`'s tile pictures to the swaps as shown `back` game frames (0-1) before the current one.
 void set_tile_swaps(Vdp& vdp, double back)
 {
     vdp.tile_rgba_index.clear();
     vdp.tile_rgba.clear();
+    set_cream(vdp, back);
     for (const TileSwap& swap : g_tile_swaps) {
         if (!swap.known || swap.frame - swap.last_swap >= 2 * swap.period)
             continue;                               // not swapping (yet)
@@ -1497,6 +1703,57 @@ void fix_spawn_grid(uint16_t level, uint16_t act)
         return;
     grid[kCell5] = 1;
     grid[kCell6] = 0;
+}
+
+// Spawn entries the widescreen SpawnCell patch marked missed (bit 1 of the spawned byte, no
+// free slot in the object's pool): spawned here, as SpawnCell would, once a slot is free,
+// while the entry is still inside the range objects live in (DrawObject's deletion limits:
+// X from 168 left of the camera to 552 right, Y from 128 above to 512 below). Out of that
+// range the mark is dropped, and a later crossing spawns the entry as usual.
+void retry_missed_spawns()
+{
+    uint8_t* ram = g_bus.ram;
+    const uint8_t* grid = &ram[0xCA00];
+    const int width = grid[2], height = grid[3];
+    const uint16_t lists = grid[0] << 8 | grid[1];
+    if (!lists || width * height == 0 || 4 + width * height > lists)
+        return;
+    const int camera_x = (int16_t)(ram[0xFA84] << 8 | ram[0xFA85]);
+    const int camera_y = (int16_t)(ram[0xFA88] << 8 | ram[0xFA89]);
+    for (int cell = 0; cell < width * height; cell++) {
+        const int list = grid[4 + cell];
+        if (!list)
+            continue;
+        const uint32_t at = 0xCA00 + lists + 2 * (list - 1);
+        const uint32_t start = 0xCA00 + lists + (ram[at & 0xFFFF] << 8 | ram[(at + 1) & 0xFFFF]);
+        const int count = ram[start & 0xFFFF] + 1;
+        for (int i = 0; i < count; i++) {
+            uint8_t* e = &ram[(start + 1 + i * 9) & 0xFFFF];   // flags, ID, setting, spawned, count, Y, X
+            if ((e[3] & 3) != 2)
+                continue;
+            const int dx = (e[7] << 8 | e[8]) - camera_x, dy = (e[5] << 8 | e[6]) - camera_y;
+            if (dx < -168 || dx >= 552 || dy < -128 || dy >= 512) {
+                e[3] &= ~2;
+                continue;
+            }
+            if ((e[0] & 0x20) && !e[4])
+                continue;                           // SpawnCell's own condition
+            uint32_t slot = e[0] & 0x80 ? 0xD000 : e[0] & 0x40 ? 0xDD80 : 0xD400;
+            const int slots = e[0] & 0x80 ? 32 : e[0] & 0x40 ? 10 : 32;
+            int n = 0;
+            while (n < slots && (ram[slot] | ram[slot + 1]))
+                slot += 0x40, n++;
+            if (n == slots)
+                continue;
+            const uint16_t spawned = (uint16_t)((start + 1 + i * 9 + 3) & 0xFFFF);
+            ram[slot + 0x01] = e[1];
+            ram[slot + 0x29] = e[2];
+            ram[slot + 0x24] = spawned >> 8, ram[slot + 0x25] = spawned & 0xFF;
+            ram[slot + 0x14] = e[5], ram[slot + 0x15] = e[6];
+            ram[slot + 0x10] = e[7], ram[slot + 0x11] = e[8];
+            e[3] = 1;
+        }
+    }
 }
 
 #ifndef NDEBUG
@@ -1798,6 +2055,8 @@ void run_frame(uint32_t* pixels)
     const bool wide = g_widescreen && is_wide_state(state, level, g_bus.ram);
     if (g_widescreen)
         fix_spawn_grid(level, act);
+    if (state == 0x0E)
+        retry_missed_spawns();
     // $20/$22 pick the castle exterior for level 5, or for level 3 when $FFFF0D is 2
     // (the scene table at $07AB74).
     const bool exterior = level == 5 || (g_bus.ram[0xFF0D] == 2 && level == 3);
@@ -1844,6 +2103,7 @@ void run_frame(uint32_t* pixels)
     update_flows(g_smooth_water, state);
     set_flow_colours(g_vdp, g_flow_rgb, 0.0);
     update_tile_swaps(g_smooth_water, state);
+    update_cream(g_smooth_water, state);
     set_tile_swaps(g_vdp, 0.0);
     for (int i = 0; i < 64; i++)
         g_vdp.edge_palette[i] = g_bus.ram[0xF800 + i * 2] << 8 | g_bus.ram[0xF801 + i * 2];
@@ -5470,7 +5730,8 @@ int main(int argc, char** argv)
             for (int i = 0; i < LayeredFrame::kLayers; i++)
                 frame.layers[i] = g_layers[i].data();
             for (int i = 0; i < 2; i++)
-                frame.water[i] = g_vdp.water_tiles.empty() ? nullptr : g_water_layers[i].data();
+                frame.water[i] = g_vdp.water_tiles.empty() && g_vdp.tile_rgba_index.empty()
+                                 ? nullptr : g_water_layers[i].data();   // (tile pictures draw there too)
             frame.width = g_out_width + 2 * kLayerMargin;
             frame.height = Vdp::kScreenHeight;
             frame.margin = kLayerMargin;

@@ -145,6 +145,7 @@ set(PORT_SOURCES
     src/smooth_scroll.cpp
     src/smooth_swing.cpp
     src/boss_rush.cpp
+    src/psg.cpp
     src/sound.cpp
     src/touch.cpp
     src/vdp.cpp)
@@ -176,6 +177,9 @@ if(COI_NO_INTERPRETER)
 else()
     target_link_libraries(coi PRIVATE musashi ymfm z80 imgui ${SDL_LIBRARY})
 endif()
+
+# Local tools (not in the public tree) add their own targets here.
+include(${CMAKE_CURRENT_SOURCE_DIR}/local_tools.cmake OPTIONAL)
 
 # --- The translator (port/recomp, docs/native.md) ------------------------------------------
 # COI_JIT (on by default): the app's own 68000 translator. The game's code runs as machine

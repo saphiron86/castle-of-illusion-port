@@ -24,6 +24,7 @@ constexpr uint32_t kClampBeforeFill = 0x7FF36;
 constexpr uint32_t kCameraMaxX = 0x7FF6E;
 constexpr uint32_t kDeleteRange = 0x7FF8A;
 constexpr uint32_t kSpawnLeft = 0x7FFA0;
+constexpr uint32_t kSpawnSlot = 0x7FFD2;
 
 const std::vector<Patch>& patches()
 {
@@ -187,6 +188,26 @@ const std::vector<Patch>& patches()
                     0x4E, 0x75},                                // rts
                    "UpdateSpawns row start (routine)"},
         {0x06D59C, {0x7E, 0x04}, {0x7E, 0x05}, "UpdateSpawns row: 6 cells"},
+        // SpawnCell finds no free slot in the object's pool: mark the entry missed (bit 1 of
+        // its spawned byte, which DeleteObject clears with the rest), so the port can spawn it
+        // once a slot frees (retry_missed_spawns in main.cpp). Objects live 40 pixels further
+        // out on each side, so a pool the console only just fills can overflow: stage 15's
+        // lower chocolate block (X 1344) found the pool's 32 slots taken.
+        {0x06D66E, {0x4A, 0x53, 0x67, 0x0A, 0x47, 0xEB, 0x00, 0x40, 0x51, 0xCE, 0xFF, 0xF6, 0x60, 0x2A},
+                   {0x4E, 0xB9, 0x00, 0x07, 0xFF, 0xD2,         // jsr     the routine
+                    0x67, 0x06,                                 // beq.s   $06D67C            a free slot
+                    0x60, 0x2E,                                 // bra.s   $06D6A6            the next entry
+                    0x4E, 0x71, 0x4E, 0x71},
+                   "SpawnCell slot search (jsr)"},
+        {kSpawnSlot, std::vector<uint8_t>(24, 0xFF),
+                   {0x4A, 0x53,                                 // loop: tst.w (a3)
+                    0x67, 0x12,                                 // beq.s   done               free: Z set
+                    0x47, 0xEB, 0x00, 0x40,                     // lea     $40(a3),a3
+                    0x51, 0xCE, 0xFF, 0xF6,                     // dbra    d6,loop
+                    0x08, 0xEA, 0x00, 0x01, 0x00, 0x02,         // bset    #1,2(a2)           missed
+                    0x02, 0x3C, 0x00, 0xFB,                     // andi.b  #$FB,ccr           Z clear
+                    0x4E, 0x75},                                // done: rts
+                   "SpawnCell slot search (routine)"},
         {0x001B12, {0x0C, 0x44, 0x02, 0x80, 0x64, 0x00, 0x01, 0x7C, 0x4A, 0x44, 0x6B, 0x00, 0x01, 0x76},
                    {0x4E, 0xB9, 0x00, 0x07, 0xFF, 0x8A, 0x4E, 0x71, 0x4E, 0x71, 0x4E, 0x71, 0x4E, 0x71},
                    "off-screen deletion, X (jsr)"},
