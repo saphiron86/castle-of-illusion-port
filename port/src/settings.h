@@ -51,6 +51,7 @@ struct Settings {
     bool vsync = true;
     bool show_fps = false;
     bool show_coordinates = false;  // Debug > Show Coordinates
+    bool check_for_updates = true;  // Game > Check for Updates (GitHub's releases, at start-up)
     bool interpolate = false;
     int frame_rate = 0;             // pictures a second: 0 = the display's refresh, 60, 120 or 240
     Cheats cheats;

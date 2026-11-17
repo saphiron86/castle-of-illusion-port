@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "stages.h"
 #include "touch.h"
@@ -19,6 +21,72 @@ bool g_open = false;
 SDL_Window* g_menu_window = nullptr;
 bool g_focus_bar = false;                           // put the nav cursor on the first menu next frame
 int g_last_menu = 0;                                // index of the top-level menu last opened
+// Short messages at the top of the screen (menu_notice): each until its time is up, fading
+// out over its last half second.
+struct Notice {
+    std::string text;
+    Uint64 until;
+};
+std::vector<Notice> g_notices;
+
+void draw_notices()
+{
+    const Uint64 now = SDL_GetTicks();
+    g_notices.erase(std::remove_if(g_notices.begin(), g_notices.end(), [&](const Notice& n) { return now >= n.until; }),
+                    g_notices.end());
+    if (g_notices.empty())
+        return;
+    const ImGuiViewport* view = ImGui::GetMainViewport();
+    const float top = view->Pos.y + (g_open ? ImGui::GetFrameHeight() : 0.0f) + 8.0f;
+    float fade = 1.0f;
+    for (const Notice& n : g_notices)
+        fade = std::min(fade, std::max(0.0f, (float)(n.until - now) / 500.0f));
+    ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x / 2, top), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.7f * std::min(1.0f, fade));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::min(1.0f, fade));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                                 | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
+                                 | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::Begin("##notices", nullptr, flags))
+        for (const Notice& n : g_notices)
+            ImGui::TextUnformatted(n.text.c_str());
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
+// The launch hint (menu_hint): top left, until its time is up, fading out over the last half
+// second; its text can change while it shows.
+Notice g_hint;
+std::string g_status;                               // menu_status: this frame's top right line
+float g_status_alpha = 0.0f;
+std::string g_status_left;                          // menu_status_left: this frame's top left line
+float g_status_left_alpha = 0.0f;
+
+void draw_hint()
+{
+    const Uint64 now = SDL_GetTicks();
+    if (g_hint.text.empty() || now >= g_hint.until || g_open)
+        return;
+    const float fade = std::min(1.0f, (float)(g_hint.until - now) / 500.0f);
+    const ImGuiViewport* view = ImGui::GetMainViewport();
+    SDL_Rect safe;                                  // clear of a phone's camera cut-out
+    float left = view->Pos.x + 8.0f, top = view->Pos.y + 8.0f;
+    if (SDL_GetWindowSafeArea(g_menu_window, &safe) && safe.w > 0) {
+        left = std::max(left, (float)safe.x + 8.0f);
+        top = std::max(top, (float)safe.y + 8.0f);
+    }
+    ImGui::SetNextWindowPos(ImVec2(left, top), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.7f * fade);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                                 | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
+                                 | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::Begin("##hint", nullptr, flags))
+        ImGui::TextUnformatted(g_hint.text.c_str());
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 bool g_crt_window = false;                          // the CRT settings window is open
 bool g_focus_crt_window = false;
 constexpr const char* kCrtWindow = "CRT Shader Settings";
@@ -218,6 +286,17 @@ MenuChoice menu_frame(const MenuState& state)
         if (begin_menu("Game")) {
             if (ImGui::MenuItem("Reset", "Ctrl+R"))
                 choice.action = MenuAction::Reset;
+            ImGui::Separator();
+            if (state.update_tag) {
+                char label[96];
+                std::snprintf(label, sizeof(label), "Get the Update (%s)...", state.update_tag);
+                if (ImGui::MenuItem(label))
+                    choice.action = MenuAction::OpenReleases;
+                ImGui::SetItemTooltip("Opens the releases page on GitHub in your browser.");
+            }
+            if (ImGui::MenuItem("Check for Updates", nullptr, state.check_for_updates))
+                choice.action = MenuAction::ToggleUpdateCheck;
+            ImGui::SetItemTooltip("At start-up, asks GitHub whether a newer release is out (nothing else is sent).");
             ImGui::Separator();
             if (ImGui::MenuItem("Exit to desktop", "Alt+F4"))
                 choice.action = MenuAction::Exit;
@@ -516,10 +595,57 @@ MenuChoice menu_frame(const MenuState& state)
     }
     if (g_open && g_crt_window && crt_settings_window(*state.crt))
         choice.save_settings = true;
-    if (*state.show_fps || *state.show_coordinates) {
-        // Top right, below the menu bar when it is open: the frame rate, then the coordinates.
+    // Top right, below the menu bar when it is open: the status line (menu_status), then the
+    // frame rate and the coordinates below it.
+    float status_bottom = 0.0f;
+    if (!g_status.empty() && g_status_alpha > 0.0f) {
         const ImGuiViewport* view = ImGui::GetMainViewport();
-        const float top = view->Pos.y + (g_open ? ImGui::GetFrameHeight() : 0.0f) + 6.0f;
+        float right = view->Pos.x + view->Size.x - 8.0f, top = view->Pos.y + (g_open ? ImGui::GetFrameHeight() : 0.0f) + 8.0f;
+        SDL_Rect safe;                              // clear of a phone's camera cut-out
+        if (SDL_GetWindowSafeArea(g_menu_window, &safe) && safe.w > 0) {
+            right = std::min(right, (float)(safe.x + safe.w) - 8.0f);
+            top = std::max(top, (float)safe.y + 8.0f);
+        }
+        const float alpha = std::min(1.0f, g_status_alpha);
+        ImGui::SetNextWindowPos(ImVec2(right, top), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.7f * alpha);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                                     | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
+                                     | ImGuiWindowFlags_NoSavedSettings;
+        if (ImGui::Begin("##status", nullptr, flags)) {
+            ImGui::TextUnformatted(g_status.c_str());
+            status_bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+    g_status.clear();                               // set again every frame while it shows
+    // Top left, below the menu bar when it is open: menu_status_left's line.
+    if (!g_status_left.empty() && g_status_left_alpha > 0.0f) {
+        const ImGuiViewport* view = ImGui::GetMainViewport();
+        float left = view->Pos.x + 8.0f, top = view->Pos.y + (g_open ? ImGui::GetFrameHeight() : 0.0f) + 8.0f;
+        SDL_Rect safe;                              // clear of a phone's camera cut-out
+        if (SDL_GetWindowSafeArea(g_menu_window, &safe) && safe.w > 0) {
+            left = std::max(left, (float)safe.x + 8.0f);
+            top = std::max(top, (float)safe.y + 8.0f);
+        }
+        const float alpha = std::min(1.0f, g_status_left_alpha);
+        ImGui::SetNextWindowPos(ImVec2(left, top), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.7f * alpha);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                                     | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
+                                     | ImGuiWindowFlags_NoSavedSettings;
+        if (ImGui::Begin("##status_left", nullptr, flags))
+            ImGui::TextUnformatted(g_status_left.c_str());
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+    g_status_left.clear();
+    if (*state.show_fps || *state.show_coordinates) {
+        const ImGuiViewport* view = ImGui::GetMainViewport();
+        const float top = std::max(view->Pos.y + (g_open ? ImGui::GetFrameHeight() : 0.0f) + 6.0f, status_bottom + 4.0f);
         ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x - 6.0f, top), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
         ImGui::SetNextWindowBgAlpha(0.5f);
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
@@ -557,10 +683,39 @@ MenuChoice menu_frame(const MenuState& state)
         }
         ImGui::End();
     }
+    draw_hint();
+    draw_notices();
     if (!g_open)
         touch_draw();
     ImGui::Render();
     return choice;
+}
+
+void menu_hint(const char* text, double seconds)
+{
+    g_hint = {text, SDL_GetTicks() + (Uint64)(seconds * 1000)};
+}
+
+void menu_hint_text(const char* text)
+{
+    g_hint.text = text;
+}
+
+void menu_status(const char* text, float alpha)
+{
+    g_status = text;
+    g_status_alpha = alpha;
+}
+
+void menu_status_left(const char* text, float alpha)
+{
+    g_status_left = text;
+    g_status_left_alpha = alpha;
+}
+
+void menu_notice(const char* text, double seconds)
+{
+    g_notices.push_back({text, SDL_GetTicks() + (Uint64)(seconds * 1000)});
 }
 
 void menu_render()

@@ -15,6 +15,9 @@
     <!-- Controller rumble -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- The update check (one request to GitHub's releases list at start-up) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="true"

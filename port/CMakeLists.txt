@@ -145,9 +145,11 @@ set(PORT_SOURCES
     src/smooth_scroll.cpp
     src/smooth_swing.cpp
     src/boss_rush.cpp
+    src/coop.cpp
     src/psg.cpp
     src/sound.cpp
     src/touch.cpp
+    src/update_check.cpp
     src/vdp.cpp)
 if(ANDROID)
     add_library(coi SHARED ${PORT_SOURCES} src/android_mdplus.cpp src/android_pacing.cpp src/android_rom.cpp)
@@ -169,6 +171,12 @@ else()
         # (built in Valve's Steam Runtime SDK, it needs glibc 2.29 or later: SteamOS, Bazzite, Ubuntu 20.04+).
         target_link_options(coi PRIVATE -static-libstdc++ -static-libgcc)
     endif()
+endif()
+# The version the update check compares with GitHub's newest release (keep it in step with
+# versionName in android/app/build.gradle).
+target_compile_definitions(coi PRIVATE COI_VERSION="0.6.0-beta")
+if(WIN32)
+    target_link_libraries(coi PRIVATE winhttp)
 endif()
 if(COI_NO_INTERPRETER)
     target_link_libraries(coi PRIVATE ymfm z80 imgui ${SDL_LIBRARY})

@@ -473,3 +473,5 @@ Redraw:
 	jmp	(CursorRedraw).l
 
 	include	"boss_rush_results.asm"
+	include	"hardcore.asm"
+	include	"coop.asm"

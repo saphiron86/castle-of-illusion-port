@@ -1,5 +1,11 @@
 #include "vdp.h"
 
+// Co-op's recolour (Vdp::recolor_tile): a colour with its red and blue swapped.
+static inline uint32_t swap_red_blue(uint32_t c)
+{
+    return (c & 0xFF00FF00u) | (c >> 16 & 0xFF) | (c & 0xFF) << 16;
+}
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -282,6 +288,102 @@ void Vdp::line_scroll(int line, int& hs_a, int& hs_b) const
     hs_b = (vram[(base_hscroll + hs_offset + 2) & 0xFFFF] << 8 | vram[(base_hscroll + hs_offset + 3) & 0xFFFF]) & 0x3FF;
 }
 
+// Co-op's recolour mask: lays out every sprite (palette line 0) drawn from the recoloured
+// tiles on a canvas as the sprite table places them, finds the areas of touching pixels whose
+// values are in recolor_values, and marks the tile pixels of the areas big enough (Mickey's
+// shorts; his tongue, the same reds, is a few pixels).
+void Vdp::build_recolor_mask(int base_sprites, int max_sprites)
+{
+    recolor_mask.assign((size_t)recolor_tiles * 64, 0);
+    struct Piece { int x, y, w, h; uint16_t attr; };
+    Piece pieces[80];
+    int count = 0, left = 1 << 30, top = 1 << 30, right = -1, bottom = -1;
+    int link = 0;
+    for (int n = 0; n < max_sprites && count < 80; n++) {
+        const uint8_t* s = &vram[(base_sprites + link * 8) & 0xFFFF];
+        const uint16_t attr = s[4] << 8 | s[5];
+        const int tile = attr & 0x7FF;
+        const int raw_y = (s[0] << 8 | s[1]) & 0x3FF;
+        // (Mickey's code parks unused pieces at Y 0, above the screen: left out.)
+        if (!(attr & 0x6000) && tile >= recolor_tile && tile < recolor_tile + recolor_tiles && raw_y > 128 - 32) {
+            Piece p{(s[6] << 8 | s[7]) & 0x1FF, raw_y, ((s[2] >> 2) & 3) + 1, (s[2] & 3) + 1, attr};
+            pieces[count++] = p;
+            left = std::min(left, p.x), top = std::min(top, p.y);
+            right = std::max(right, p.x + p.w * 8), bottom = std::max(bottom, p.y + p.h * 8);
+        }
+        link = s[3] & 0x7F;
+        if (link == 0)
+            break;
+    }
+    if (!count)
+        return;
+    const int cw = right - left, ch = bottom - top;
+    if (cw > 160 || ch > 160)                       // pieces far apart: not one Mickey
+        return;
+    // Each canvas pixel: the tile pixel shown there (-1: none, or not a candidate value).
+    std::vector<int> canvas((size_t)cw * ch, -1);
+    for (int k = count - 1; k >= 0; k--) {          // earlier sprites drawn in front
+        const Piece& p = pieces[k];
+        for (int cy = 0; cy < p.h * 8; cy++)
+            for (int cx = 0; cx < p.w * 8; cx++) {
+                const int col = (p.attr & 0x0800) ? p.w * 8 - 1 - cx : cx;
+                const int row = (p.attr & 0x1000) ? p.h * 8 - 1 - cy : cy;
+                const int tile = (p.attr & 0x7FF) + (col >> 3) * p.h + (row >> 3);
+                if (tile >= recolor_tile + recolor_tiles)
+                    continue;
+                const uint8_t pair = vram[(tile * 32 + (row & 7) * 4 + ((col & 7) >> 1)) & 0xFFFF];
+                const int pixel = (col & 1) ? pair & 15 : pair >> 4;
+                if (!pixel)
+                    continue;
+                int& c = canvas[(size_t)(p.y + cy - top) * cw + (p.x + cx - left)];
+                c = (recolor_values >> pixel & 1) ? (tile - recolor_tile) * 64 + (row & 7) * 8 + (col & 7)
+                    : (recolor_link_values >> pixel & 1) ? -2 : -1;
+            }
+    }
+    // Areas: each pixel's area number; per area, its size, top row and the sum of its rows.
+    std::vector<int> area_of((size_t)cw * ch, -1), stack;
+    struct Area { int size = 0, top = 1 << 30, row_sum = 0; };
+    std::vector<Area> areas;
+    for (int start = 0; start < cw * ch; start++) {
+        if (canvas[start] < 0 || area_of[start] >= 0)    // (areas start from a red pixel)
+            continue;
+        const int number = (int)areas.size();
+        areas.emplace_back();
+        Area& a = areas.back();
+        stack.assign(1, start);
+        area_of[start] = number;
+        while (!stack.empty()) {
+            const int at = stack.back();
+            stack.pop_back();
+            const int ax = at % cw, ay = at / cw;
+            if (canvas[at] >= 0)                    // red (not a linking button pixel)
+                a.size++, a.top = std::min(a.top, ay), a.row_sum += ay;
+            const int next[4][2] = {{ax - 1, ay}, {ax + 1, ay}, {ax, ay - 1}, {ax, ay + 1}};
+            for (const auto& q : next)
+                if (q[0] >= 0 && q[0] < cw && q[1] >= 0 && q[1] < ch) {
+                    const int to = q[1] * cw + q[0];
+                    if (canvas[to] != -1 && area_of[to] < 0)
+                        area_of[to] = number, stack.push_back(to);
+                }
+        }
+    }
+    // Red pixels joined through the buttons' yellow (recolor_link_values) are one area. The
+    // biggest area is the shorts. Areas from their top row down are bits of the shorts cut
+    // off by a button or the outline; areas above them (his tongue) keep their red.
+    int shorts = -1;
+    for (int k = 0; k < (int)areas.size(); k++)
+        if (shorts < 0 || areas[k].size > areas[shorts].size)
+            shorts = k;
+    if (shorts < 0 || areas[shorts].size < recolor_min_area)
+        return;
+    std::vector<uint8_t> blue(areas.size(), 0);
+    for (int k = 0; k < (int)areas.size(); k++)
+        blue[k] = k == shorts || areas[k].row_sum >= (areas[shorts].top - 1) * areas[k].size;
+    for (int at = 0; at < cw * ch; at++)
+        if (canvas[at] >= 0 && area_of[at] >= 0 && blue[area_of[at]])
+            recolor_mask[canvas[at]] = 1;
+}
+
 void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, LineLayers* layers)
 {
     uint32_t backdrop = color(reg[7]);
@@ -383,6 +485,8 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
     int link = 0, on_line = 0;
     bool nonzero_x_seen = false;                    // for sprite masking
     const int max_sprites = h40 ? 80 : 64, max_per_line = sprite_limit ? (h40 ? 20 : 16) : max_sprites;
+    if (line == 0 && recolor_tile >= 0)
+        build_recolor_mask(base_sprites, max_sprites);
     for (int n = 0; n < max_sprites; n++) {
         const uint8_t* s = &vram[(base_sprites + link * 8) & 0xFFFF];
         int y = ((s[0] << 8 | s[1]) & 0x3FF) - 128;
@@ -427,11 +531,15 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
                     int pixel = (col & 1) ? pair & 15 : pair >> 4;
                     if (!pixel)
                         continue;
+                    const bool recolored = recolor_tile >= 0 && !(attr & 0x6000) && tile >= recolor_tile
+                                           && tile < recolor_tile + recolor_tiles
+                                           && recolor_mask.size() == (size_t)recolor_tiles * 64
+                                           && recolor_mask[(tile - recolor_tile) * 64 + (row & 7) * 8 + (col & 7)];
                     const int start = (x + cx + left) * scale + shift;
                     for (int ox = start < 0 ? 0 : start; ox < start + scale && ox < out_width; ox++) {
                         if (sprite_pixel[ox])
                             continue;
-                        sprite_pixel[ox] = ((attr >> 9) & 0x30) | pixel;
+                        sprite_pixel[ox] = recolored ? (uint8_t)(64 | pixel) : (uint8_t)(((attr >> 9) & 0x30) | pixel);
                         sprite_priority[ox] = attr & 0x8000;
                         sprite_on_b[ox] = on_b;
                     }
@@ -559,7 +667,9 @@ void Vdp::render_pixels(int line, uint32_t* out, int width, int left, int scale,
     uint32_t colors[256];
     for (int i = 0; i < 64; i++)
         colors[i] = color(i);
-    int extra_colors = 64;
+    for (int i = 0; i < 16; i++)                    // co-op: Player 2's recoloured pixels
+        colors[64 + i] = swap_red_blue(colors[i]);
+    int extra_colors = 80;
     const bool b_rgb = plane_b_rgb && plane_b_rgb_w == plane_w * 8 && plane_b_rgb_h == plane_h * 8;
 
     // Plane pixels: the palette index (0 = transparent) and priority; for plane A also
@@ -880,9 +990,11 @@ void Vdp::render_pixels_plain(int line, uint32_t* out, int width, int left, int 
     auto floor_div = [](int v, int d) { return v >= 0 ? v / d : -((-v + d - 1) / d); };
     const int out_width = width * scale;
 
-    uint32_t colors[64];
+    uint32_t colors[80];
     for (int i = 0; i < 64; i++)
         colors[i] = color(i);
+    for (int i = 0; i < 16; i++)                    // co-op: Player 2's recoloured pixels
+        colors[64 + i] = swap_red_blue(colors[i]);
 
     // Plane pixels: the palette index (0 = transparent) and priority; for plane A also
     // whether it is a strip fill drawn in front of everything.

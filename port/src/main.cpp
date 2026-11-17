@@ -93,6 +93,14 @@
 #include "interp.h"
 #include "mdplus.h"
 #include "menu.h"
+#include "update_check.h"
+#include "coop.h"
+
+#ifdef __ANDROID__
+constexpr const char* kMenuHint = "Press Back to open the Menu";
+#else
+constexpr const char* kMenuHint = "Press F1 to open the Menu";
+#endif
 #include "patches.h"
 #include "rom_family.h"
 #include "settings.h"
@@ -111,6 +119,8 @@ extern "C" {
 #include <windows.h>
 #endif
 }
+
+void native_stop_before_next();         // (below) translated code stops before its next instruction
 
 namespace {
 
@@ -201,6 +211,7 @@ bool is_cutscene_state(const uint8_t* ram)
 }
 
 bool g_widescreen = true;
+bool g_coop_rom = false;                            // the image has co-op's patches (Player 2 joined)
 bool g_easy_bounce = false;
 bool g_clean_rock_edges = true;                     // Enhancements > Graphics > Clean Rock Edges
 bool g_smooth_fades = true;                         // Enhancements > Graphics > Smooth Fades (fade.cpp)
@@ -1575,6 +1586,8 @@ void render_interpolated(uint32_t* pixels, double back)
     set_tile_swaps(v, back);
     std::memcpy(v.edge_palette, g_vdp.edge_palette, sizeof(v.edge_palette));
     v.sprite_limit = g_vdp.sprite_limit;
+    v.recolor_tile = g_vdp.recolor_tile, v.recolor_tiles = g_vdp.recolor_tiles, v.recolor_values = g_vdp.recolor_values;
+    v.recolor_link_values = g_vdp.recolor_link_values;
     v.palette = nullptr;
     if (g_vdp.palette) {
         if (g_smooth_fades)
@@ -2057,6 +2070,16 @@ void run_frame(uint32_t* pixels)
         fix_spawn_grid(level, act);
     if (state == 0x0E)
         retry_missed_spawns();
+    // Co-op: Player 2 (coop.asm, in the level while $FFFC00 is set) draws from tiles $580 on;
+    // his shorts (palette line 0, values 7-9: Mickey's reds, in areas big enough) in blue.
+    if (g_coop_rom)                                 // the view's extra width for coop.asm's pull
+        g_bus.ram[0xFC0F] = wide ? 40 : 0;
+    if (g_bus.ram[0xFC00]) {
+        g_vdp.recolor_tile = 0x580, g_vdp.recolor_tiles = 32, g_vdp.recolor_values = 1 << 7 | 1 << 8 | 1 << 9;
+        g_vdp.recolor_link_values = 1 << 6;          // the buttons' yellow
+    } else {
+        g_vdp.recolor_tile = -1;
+    }
     // $20/$22 pick the castle exterior for level 5, or for level 3 when $FFFF0D is 2
     // (the scene table at $07AB74).
     const bool exterior = level == 5 || (g_bus.ram[0xFF0D] == 2 && level == 3);
@@ -2144,11 +2167,16 @@ void run_frame(uint32_t* pixels)
 #ifdef COI_NATIVE
         const Uint64 cpu_start = SDL_GetTicksNS();
 #endif
+        // Co-op: Mickey's code runs twice a frame, and in busy places (stage 7's ? box clown)
+        // the game ran past its frame and slowed to half speed. While Player 2 is in a level the
+        // 68000 gets three times the cycles in the vertical blank's lines, where nothing is
+        // drawn, so the picture's timing (raster effects) is as it was. Solo play: unchanged.
+        const int cycles = line >= Vdp::kScreenHeight && g_coop_rom && g_bus.ram[0xFC00] ? kCyclesPerLine * 3 : kCyclesPerLine;
 #ifdef COI_NATIVE
-        TIMED(g_time_cpu, g_cpu_cycles += cpu_execute(kCyclesPerLine));
+        TIMED(g_time_cpu, g_cpu_cycles += cpu_execute(cycles));
         g_cpu_time += SDL_GetTicksNS() - cpu_start;
 #else
-        TIMED(g_time_cpu, m68k_execute(kCyclesPerLine));
+        TIMED(g_time_cpu, m68k_execute(cycles));
 #endif
         TIMED(g_time_sound, g_sound.run(kZ80CyclesPerLine, g_audio));
     }
@@ -2162,6 +2190,25 @@ int current_stage()
     if ((state != 0x0C && state != 0x0E) || g_bus.ram[0xF40A])
         return 0;
     return stage_number(g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43]);
+}
+
+// The final boss's script after its last hit (Mickey's states $2F-$32, MickeyFinaleFall to
+// MickeyFinaleEnd; in co-op both players play it, coop.asm): nobody joins meanwhile.
+bool finale_running()
+{
+    return current_stage() == 28 && g_bus.ram[0xDC03] >= 0x2F && g_bus.ram[0xDC03] <= 0x32;
+}
+
+// ... and its fade to white is over (every colour white, the ending's scene next): co-op
+// ends there, and the ending plays as it does alone.
+bool finale_white()
+{
+    if (current_stage() != 28 || (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) != 0x0E)
+        return false;
+    for (int i = 0; i < 64; i++)
+        if ((g_bus.ram[0xF780 + i * 2] << 8 | g_bus.ram[0xF781 + i * 2]) != 0x0EEE)
+            return false;
+    return true;
 }
 
 // Easy Bounce Attack: in the original, Mickey only bounces on enemies if Down is pressed during a
@@ -2231,7 +2278,7 @@ void retune_camera_limits(bool wide)
 // stderr (the image running; not the ones translated ahead).
 RomSettings current_rom_settings()
 {
-    return {g_widescreen, g_smooth_swing, g_cheats};
+    return {g_widescreen, g_smooth_swing, g_cheats, g_coop_rom};
 }
 
 std::vector<uint8_t> make_rom(const RomSettings& s, bool report)
@@ -2552,6 +2599,7 @@ void build_rom()
     g_bus.rom = make_rom(current_rom_settings(), true);
 #ifdef COI_NATIVE
     g_rom_hash_known = false;
+    native_stop_before_next();
 #endif
 #ifdef COI_NATIVE
     // Translated code is only right for the ROM it was translated from: with any other patch
@@ -2699,38 +2747,60 @@ void close_gamepad(SDL_JoystickID id)
         }
 }
 
-uint8_t gamepad_buttons()
+// Co-op: Player 2's drop-in input (coop.cpp); Player 1 gets every other device.
+CoopInput g_coop;
+
+// Back to single player (the co-op image is switched out): co-op's RAM cleared (coop.asm: Player
+// 2 out of the level, each player's state, the port's requests), and the HUD's two rows as the
+// game draws them (DrawHudLayout's, then every value redrawn), since the co-op
+// HUD (CoopDrawHud) rewrote its labels and the plain DrawHud only redraws the values.
+void coop_ended()
 {
-    constexpr Sint16 kStickThreshold = 13000;       // about 40% of full travel
-    uint8_t b = 0;
-    for (SDL_Gamepad* pad : g_gamepads) {
-        auto held = [pad](SDL_GamepadButton button) { return SDL_GetGamepadButton(pad, button); };
-        Sint16 x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX);
-        Sint16 y = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
-        if (held(SDL_GAMEPAD_BUTTON_DPAD_UP) || y < -kStickThreshold) b |= BTN_UP;
-        if (held(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || y > kStickThreshold) b |= BTN_DOWN;
-        if (held(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || x < -kStickThreshold) b |= BTN_LEFT;
-        if (held(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || x > kStickThreshold) b |= BTN_RIGHT;
-        if (held(SDL_GAMEPAD_BUTTON_WEST)) b |= BTN_A;      // Xbox X
-        if (held(SDL_GAMEPAD_BUTTON_SOUTH)) b |= BTN_B;     // Xbox A
-        if (held(SDL_GAMEPAD_BUTTON_EAST)) b |= BTN_C;      // Xbox B
-        if (held(SDL_GAMEPAD_BUTTON_START)) b |= BTN_START; // Xbox menu
+    g_bus.ram[0xFC00] = 0;
+    g_bus.ram[0xFCF4] = 0;
+    std::fill(g_bus.ram + 0xFD68, g_bus.ram + 0xFDC0, 0);   // (an MD+ pack keeps a byte at $FFFDE1)
+    std::fill(g_bus.ram + 0xFCA0, g_bus.ram + 0xFCE0, 0);
+    std::fill(g_bus.ram + 0xFF32, g_bus.ram + 0xFF39, 0);
+    if ((g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) != 0x0E || g_rom_original.size() < 0x9A74 + 80)
+        return;
+    auto put = [](int at, uint16_t entry) {
+        g_vdp.vram[at] = entry >> 8;
+        g_vdp.vram[at + 1] = entry & 0xFF;
+    };
+    for (int i = 0; i < 80; i++)                // rows 25 and 26 (64 tiles a row)
+        put(0xBC80 + (i / 40) * 0x80 + (i % 40) * 2, 0x8000 | g_rom_original[0x9A74 + i]);
+    // DrawHudLayout's others: the tries icon's mirrored half, and the stage's item icon (its
+    // index by StageIndex from $009B14, four tiles from $009B32).
+    put(0xBC9A, 0x887A);
+    put(0xBD1A, 0x887B);
+    const int stage = g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43];
+    if (stage < 30) {
+        const int icon = 0x9B32 + g_rom_original[0x9B14 + stage] * 8;
+        auto word = [&](int i) { return (uint16_t)(g_rom_original[icon + i * 2] << 8 | g_rom_original[icon + i * 2 + 1]); };
+        put(0xBCAA, word(0));
+        put(0xBCAC, word(1));
+        put(0xBD2A, word(2));
+        put(0xBD2C, word(3));
     }
-    return b;
+    const int power = g_bus.ram[0xF322] << 8 | g_bus.ram[0xF323];
+    for (int i = 0; i < 5; i++) {               // ShowPower's buffer
+        const uint16_t tile = i < power ? 0x807C : 0x807D;
+        g_bus.ram[0xF244 + i * 2] = tile >> 8;
+        g_bus.ram[0xF245 + i * 2] = tile & 0xFF;
+    }
+    const int tries = std::min(10, g_bus.ram[0xF324] << 8 | g_bus.ram[0xF325]);
+    const uint16_t tens = 0x8010 + tries / 10, ones = 0x8010 + tries % 10;   // ShowTries'
+    g_bus.ram[0xF234] = tens >> 8, g_bus.ram[0xF235] = tens & 0xFF;
+    g_bus.ram[0xF236] = ones >> 8, g_bus.ram[0xF237] = ones & 0xFF;
+    g_bus.ram[0xF409] |= 0x0F;                  // HudDirty: DrawHud writes them, the items and the score
 }
 
-uint8_t keyboard_buttons()
+// Every controller's buttons together (coop.cpp reads them one by one).
+uint8_t gamepad_buttons()
 {
-    const bool* keys = SDL_GetKeyboardState(nullptr);
     uint8_t b = 0;
-    if (keys[SDL_SCANCODE_UP]) b |= BTN_UP;
-    if (keys[SDL_SCANCODE_DOWN]) b |= BTN_DOWN;
-    if (keys[SDL_SCANCODE_LEFT]) b |= BTN_LEFT;
-    if (keys[SDL_SCANCODE_RIGHT]) b |= BTN_RIGHT;
-    if (keys[SDL_SCANCODE_Z]) b |= BTN_A;
-    if (keys[SDL_SCANCODE_X]) b |= BTN_B;
-    if (keys[SDL_SCANCODE_C]) b |= BTN_C;
-    if (keys[SDL_SCANCODE_RETURN]) b |= BTN_START;
+    for (SDL_Gamepad* pad : g_gamepads)
+        b |= read_pad(pad);
     return b;
 }
 
@@ -2801,6 +2871,18 @@ bool g_native_replaying = false;
 int coi_native_tracing = 0;     // (native_rt.h) translated code calls coi_native_trace: replays, checks
 const CoiCpu* g_native_cpu = nullptr;  // translated code running (live or replayed): its state
 int g_native_frame = 0;
+
+// The ROM image changed under translated code (a switch from the main loop's hook, which runs in
+// a bus read): it stops before its next instruction, as when its budget runs out, so the rest
+// runs from the new image (its own translation, or the interpreter) as it would interpreted.
+// Without this, code still running went on calling the old image's functions until it returned.
+void native_stop_before_next()
+{
+    if (g_native_cpu) {
+        CoiCpu* cpu = const_cast<CoiCpu*>(g_native_cpu);   // (native_run's, not const)
+        cpu->cycle_limit = std::max<int64_t>(cpu->cycles, 1);
+    }
+}
 extern "C" int m68ki_initial_cycles, m68ki_remaining_cycles;      // Musashi's slice counters
 extern "C" unsigned int* coi_m68k_registers(void);                 // Musashi's D0-D7, A0-A7 (musashi_regs.c)
 extern "C" unsigned int* coi_m68k_usp(void);                       // its user stack pointer (in supervisor mode)
@@ -4574,8 +4656,12 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--console") == 0)
             show_console();
     std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path, snapshot_dir, sprite_capture_dir;
+    std::string snapshot_picture;                   // F9 (Debug): where to save the window's picture once drawn
     int headless_frames = 0;
     std::vector<Press> presses;
+    std::vector<Press> presses2;                    // --press2: Player 2's (co-op), headless
+    int join2_frame = -1;                           // --join2: Player 2 joins at this frame, headless
+    int leave2_frame = -1;                          // --leave2: and leaves at this one
     std::vector<std::pair<int, int>> fast_forwards; // --fast-forward FIRST-LAST, in pictures
     std::string state_hash_path;                    // --state-hash: one line per game frame
     std::vector<uint32_t> peeks;                   // RAM words to print after a headless run
@@ -4738,6 +4824,18 @@ int main(int argc, char** argv)
                                  (uint32_t)std::strtoul(spec.substr(colon + 1, equals - colon - 1).c_str(), nullptr, 16),
                                  (uint16_t)std::strtoul(spec.substr(equals + 1).c_str(), nullptr, 16)});
             }
+        }
+        else if (arg == "--press2" && i + 1 < argc) {
+            Press p;
+            if (!parse_press(argv[++i], p)) {
+                std::fprintf(stderr, "bad --press2 value: %s\n", argv[i]);
+                return 1;
+            }
+            presses2.push_back(p);
+        } else if (arg == "--join2" && i + 1 < argc) {
+            join2_frame = std::atoi(argv[++i]);
+        } else if (arg == "--leave2" && i + 1 < argc) {
+            leave2_frame = std::atoi(argv[++i]);
         }
         else if (arg == "--press" && i + 1 < argc) {
             Press p;
@@ -5024,6 +5122,43 @@ int main(int argc, char** argv)
             for (const Press& p : presses)
                 if (frame >= p.first && frame <= p.last)
                     g_bus.buttons |= p.button;
+            static bool finale_left = false;        // (the finale's leave: not back in)
+            const bool p2_in = join2_frame >= 0 && frame >= join2_frame && (leave2_frame < 0 || frame < leave2_frame)
+                               && !finale_left;
+            static bool leaving = false;            // as a window's leave: Player 1 back, the
+            static int leave_from = 0;              // camera on him, then out
+            if (!leaving && g_coop_rom && ((leave2_frame >= 0 && frame == leave2_frame) || finale_white())) {
+                leaving = true;
+                leave_from = frame;
+                if (finale_white()) {
+                    finale_left = true;
+                    std::printf("frame %d: the finale's fade to white: Player 2 leaves\n", frame);
+                }
+            }
+            if (leaving) {
+                g_bus.ram[0xFF36] = g_bus.ram[0xFF38] = 1;
+                if ((g_bus.ram[0xFD68] == 0 && g_bus.ram[0xFF37]) || frame > leave_from + 600) {
+                    leaving = false;
+                    g_coop_rom = false;
+                    g_bus.ram[0xFF30] = g_bus.ram[0xFF31] = 0;
+                    g_bus.at_main_loop = [] {
+                        build_rom();
+                        coop_ended();
+                    };
+                }
+            }
+            if (p2_in && !g_coop_rom) {
+                g_coop_rom = true;                  // co-op's patches while Player 2 plays
+                g_bus.at_main_loop = [] { build_rom(); };
+            }
+            if (p2_in) {                            // co-op's Player 2, headless
+                uint8_t p2 = 0;
+                for (const Press& p : presses2)
+                    if (frame >= p.first && frame <= p.last)
+                        p2 |= p.button;
+                g_bus.ram[0xFF30] = p2 & (uint8_t)~BTN_START;
+                g_bus.ram[0xFF31] = 1;
+            }
             for (const Poke& p : pokes)
                 if (frame == p.frame)
                     g_bus.write16(p.address, p.value);
@@ -5226,6 +5361,13 @@ int main(int argc, char** argv)
     menu_init(window, gl);
     touch_init(window);
 
+    // How to open the menu, for the first 5 seconds (the controller's way while one is
+    // connected: see the main loop); then the update check (once a session, on
+    // a thread, when the setting allows), whose answer shows as a notice.
+    menu_hint(kMenuHint, 5.0);
+    if (settings.check_for_updates)
+        update_check_start();
+
     SDL_AudioSpec audio_spec = {SDL_AUDIO_S16, 2, g_sound.sample_rate()};
     // The game's sound and the MD+ music (mdplus.cpp) are two streams on one device, which
     // mixes them.
@@ -5302,6 +5444,16 @@ int main(int argc, char** argv)
         case MenuAction::ToggleWidescreen:
             set_widescreen(!g_widescreen);
             settings.widescreen = g_widescreen;
+            save_settings(settings);
+            break;
+        case MenuAction::OpenReleases:
+            if (!SDL_OpenURL(kReleasesUrl))
+                std::fprintf(stderr, "Could not open %s: %s\n", kReleasesUrl, SDL_GetError());
+            break;
+        case MenuAction::ToggleUpdateCheck:
+            settings.check_for_updates = !settings.check_for_updates;
+            if (settings.check_for_updates)
+                update_check_start();
             save_settings(settings);
             break;
         case MenuAction::OpenSettingsFolder:
@@ -5527,8 +5679,10 @@ int main(int argc, char** argv)
 #endif
             else if (event.type == SDL_EVENT_GAMEPAD_ADDED)    // also sent for pads present at startup
                 open_gamepad(event.gdevice.which);
-            else if (event.type == SDL_EVENT_GAMEPAD_REMOVED)
+            else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+                g_coop.pad_removed(event.gdevice.which);
                 close_gamepad(event.gdevice.which);
+            }
             else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
                 menu_toggle(true);                  // Xbox View button
                 update_cursor();
@@ -5560,7 +5714,9 @@ int main(int argc, char** argv)
                     static int snapshots = 0;
                     const std::string base = snapshot_dir + "/snap" + std::to_string(++snapshots);
                     save_state(base + ".ram", base + ".vram", base + ".cram");
-                    save_ppm((base + ".ppm").c_str(), pixels.data());
+                    // The picture: the window's, once this picture is drawn (the layered renderer
+                    // never fills `pixels`, so it was saved black).
+                    snapshot_picture = base + ".ppm";
                     std::printf("Saved %s (frame %d)\n", base.c_str(), frames_run);
 #endif
                 }
@@ -5627,6 +5783,66 @@ int main(int argc, char** argv)
             pad_held_over = false;
         if (pad_held_over)
             pad = 0;
+        // Player 2 may drop in during level play with the menu closed (coop.cpp). Not on Android
+        // yet (until co-op is finished), and not in a Hardcore game (hardcore.asm's $FFFF29).
+#ifdef __ANDROID__
+        constexpr bool kCoopAvailable = false;
+#else
+        constexpr bool kCoopAvailable = true;
+#endif
+        const bool coop_allowed = kCoopAvailable && !g_bus.ram[0xFF29];
+        const bool can_join = coop_allowed && !menu_open() && (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E
+                              && !finale_running();
+        static bool in_stage_1 = false;             // stage 1's play begins: the keyboard join hint
+        const bool stage_1 = coop_allowed && current_stage() == 1 && (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E;
+        if (stage_1 && !in_stage_1)
+            g_coop.stage_1_started();
+        in_stage_1 = stage_1;
+        {
+            // Player 2 leaves when the game goes back to the start: a reset (the Sega logo), the
+            // title, the options, the opening story or a game over.
+            const int state = g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301];
+            const bool back_to_start = state <= 0x0A || state == 0x12 || state == 0x18 || state == 0x1A
+                                       || state == 0x28 || state == 0x2A;
+            if (g_coop.joined && back_to_start)
+                g_coop.leave();
+        }
+        // Each player's state in the game (coop.asm's CoopStatus): 4 out of tries; 1-5 Player 1
+        // out of play (dying, waiting, in a bubble, out, popping).
+        g_coop.p1_out = g_coop_rom && g_bus.ram[0xFD68] == 4;
+        g_coop.p2_out = g_coop_rom && g_bus.ram[0xFD69] == 4;
+        g_coop.p1_parked = g_coop_rom && g_bus.ram[0xFD68] >= 1 && g_bus.ram[0xFD68] <= 5;
+        g_coop.update(g_gamepads, keyboard_free, can_join);
+        if (g_coop.joined && finale_white())
+            g_coop.finale_leave();                  // the final boss's fade to white: alone from here
+        static bool continue_p1 = false, continue_p2 = false;   // until a frame has run with them
+        continue_p1 |= g_coop.p1_continue;
+        continue_p2 |= g_coop.p2_continue;
+        if (g_coop.leave_pending) {                 // Player 1 back in play first (coop.asm's ReviveP1),
+            static int waited = 0;                  // and in a level the camera on him alone (CoopSettled)
+            const bool in_level = (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E;
+            if ((!g_coop.p1_parked && (!in_level || g_bus.ram[0xFF37])) || ++waited > 600) {
+                waited = 0;
+                g_coop.finish_leave();
+            }
+        }
+        if (g_coop.joined != g_coop_rom) {          // co-op's patches only while Player 2 plays
+            g_coop_rom = g_coop.joined;
+            // Switched at the top of the main loop: switched here, mid-frame, a routine running
+            // in the old image could return into the middle of a patch in the new one. Co-op's
+            // state is cleared and the HUD put back then too: done here, the rest of the frame
+            // in the co-op image drew the co-op HUD again over it.
+            g_bus.at_main_loop = [] {
+                build_rom();
+                if (!g_coop_rom)
+                    coop_ended();
+            };
+        }
+        const uint8_t player1 = pad_held_over ? (keyboard_free ? read_keys(0) : 0) : g_coop.p1;
+        menu_hint_text(SDL_HasGamepad() ? "Press the View button to open the Menu" : kMenuHint);
+        static std::string update_tag;
+        if (update_tag.empty() && settings.check_for_updates && !(update_tag = update_available()).empty())
+            menu_notice(("Update available! " + update_tag + " is out: see Game in the Menu").c_str(), 8.0);
         act(menu_frame({g_widescreen, g_wide_available, fullscreen(), current_stage(), g_easy_bounce,
                         g_smooth_swing, g_smooth_swing_available, smooth_scroll_on, &settings.crt,
                         &settings.scanlines, &settings.hqx, &settings.clean_edge_line_width, &settings.clean_rock_edges, &settings.smooth_fades, &settings.smooth_water, &settings.smooth_glass,
@@ -5636,7 +5852,8 @@ int main(int argc, char** argv)
                         busy.empty() ? nullptr : busy.c_str(), busy_progress, &settings.show_coordinates,
                         g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43], g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
                         (int16_t)(g_bus.ram[0xDC10] << 8 | g_bus.ram[0xDC11]), (int16_t)(g_bus.ram[0xDC14] << 8 | g_bus.ram[0xDC15]),
-                        (int16_t)(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]), (int16_t)(g_bus.ram[0xFA80] << 8 | g_bus.ram[0xFA81])}),
+                        (int16_t)(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]), (int16_t)(g_bus.ram[0xFA80] << 8 | g_bus.ram[0xFA81]),
+                        settings.check_for_updates, update_tag.empty() ? nullptr : update_tag.c_str()}),
             running);
         if ((Quick)settings.quick != Quick::Custom && look_of(settings) != quick_look((Quick)settings.quick)) {
             settings.quick = (int)Quick::Custom;    // one of its settings was changed by hand
@@ -5654,7 +5871,7 @@ int main(int argc, char** argv)
             g_scroll_smoother.reset();
         }
 
-        const uint8_t buttons = (keyboard_free ? keyboard_buttons() : 0) | pad | touch_buttons();
+        const uint8_t buttons = player1 | touch_buttons() | (g_coop.p2_start_to_game ? BTN_START : 0);
         // Fast forward: held, with the menu closed, while a story scene plays (is_cutscene_state).
         // The touch controls show their >> button only then.
         const bool in_scene = is_cutscene_state(g_bus.ram);
@@ -5681,6 +5898,21 @@ int main(int argc, char** argv)
             if (step > 0 && !is_cutscene_state(g_bus.ram))
                 break;                              // the scene ended within the picture
             g_bus.buttons = buttons | easy_bounce_buttons();
+            // Player 2 for the game's side: buttons at $FFFFFF30 (Bus::buttons' bits, Start left
+            // out), joined at $FFFFFF31. Left alone while nobody has joined.
+            if (g_coop.joined || g_bus.ram[0xFF31]) {
+                g_bus.ram[0xFF30] = g_coop.joined ? g_coop.p2_buttons : 0;
+                g_bus.ram[0xFF31] = g_coop.joined;
+                // coop.asm: the bubble buttons, a continue, Player 1 back before Player 2 leaves.
+                g_bus.ram[0xFF32] = g_coop.joined && g_coop.p1_bubble;
+                g_bus.ram[0xFF33] = g_coop.joined && g_coop.p2_bubble;
+                if (continue_p1)
+                    g_bus.ram[0xFF34] = 1, continue_p1 = false;
+                if (continue_p2)
+                    g_bus.ram[0xFF35] = 1, continue_p2 = false;
+                g_bus.ram[0xFF36] = g_coop.leave_pending;
+                g_bus.ram[0xFF38] = g_coop.leave_pending;   // (never cleared by coop.asm)
+            }
             for (const Press& p : presses)          // --press works in a window too
                 if (frames_run >= p.first && frames_run <= p.last)
                     g_bus.buttons |= p.button;
@@ -5745,6 +5977,19 @@ int main(int argc, char** argv)
                          settings.scanlines, settings.hqx);
         }
         menu_render();
+#ifndef NDEBUG
+        if (!snapshot_picture.empty()) {            // F9's picture (see above)
+            std::vector<uint8_t> rgb;
+            int w, h;
+            display.read_window(rgb, w, h);
+            if (FILE* f = std::fopen(snapshot_picture.c_str(), "wb")) {
+                std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+                std::fwrite(rgb.data(), 1, rgb.size(), f);
+                std::fclose(f);
+            }
+            snapshot_picture.clear();
+        }
+#endif
         if (capture_frame >= 0 && frames_run >= capture_frame) {
             std::vector<uint8_t> rgb;
             int w, h;

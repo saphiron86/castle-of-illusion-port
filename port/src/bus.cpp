@@ -59,6 +59,11 @@ uint16_t Bus::read16(uint32_t address)
         // is the one safe point to switch states from outside.
         if ((address & 0xFFFF) == 0xF300 && jump_stage >= 0 && current_pc() == kMainLoopRead)
             start_game_at_stage();
+        if ((address & 0xFFFF) == 0xF300 && at_main_loop && current_pc() == kMainLoopRead) {
+            const std::function<void()> run = std::move(at_main_loop);
+            at_main_loop = nullptr;
+            run();
+        }
         return ram[address & 0xFFFF] << 8 | ram[(address + 1) & 0xFFFF];
     }
     if (address >= 0xC00000 && address < 0xC00020)

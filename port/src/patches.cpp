@@ -139,6 +139,13 @@ const std::vector<Patch>& patches()
         {0x00FE90, {0x00, 0x60}, {0x00, 0x38}, "building tops: hide past screen X -72"},
         {0x00FE96, {0x01, 0xE0}, {0x02, 0x08}, "building tops: hide past screen X 392"},
 
+        // Stage 24's rolling boulders (object $4C, $005B28 and $005B82) roll back once they
+        // are 184 pixels ($B8) beyond Mickey's X, just past the console's view with him in
+        // its middle: in the widened view they turned round in sight, short of the walls.
+        // 40 pixels more ($E0), past the widened view's edge as before.
+        {0x005B2E, {0x00, 0xB8}, {0x00, 0xE0}, "boulders: roll back 224 px right of Mickey"},
+        {0x005B88, {0x00, 0xB8}, {0x00, 0xE0}, "boulders: roll back 224 px left of Mickey"},
+
         // Spawning. Objects come from a grid of 128-pixel cells: when the camera X crosses a
         // multiple of 128, UpdateSpawns spawns a column of cells, moving left the one just
         // left of the camera (0-127 pixels left), moving right the one 384-511 pixels right,

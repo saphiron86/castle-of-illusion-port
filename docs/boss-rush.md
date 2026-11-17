@@ -5,7 +5,7 @@ nav_order: 5
 
 # Boss Rush
 
-The game's options screen (Start at the title) has a fourth row, BOSS RUSH; B or C ticks it. With it ticked, Start plays the six boss fights back to back: the Old Oak Tree, Jack-in-the-Box, the Storm Men, the Licorice Dragon, the Oaf and Mizrabel (stages 5, 9, 13, 23, 27 and 28).
+The game's options screen (Start at the title) has a fourth row, BOSS RUSH; B or C ticks it. (The cursor also wraps round there: down on BOSS RUSH swings Mickey back up to DIFFICULTY, and up on DIFFICULTY down to BOSS RUSH.) With it ticked, Start plays the six boss fights back to back: the Old Oak Tree, Jack-in-the-Box, the Storm Men, the Licorice Dragon, the Oaf and Mizrabel (stages 5, 9, 13, 23, 27 and 28).
 
 - Normal and Hard only: Practice has no bosses, so it can't be ticked there (switching to Practice unticks it). Each difficulty's bosses are the game's own.
 - One try for the whole rush, no continues and no extra tries. Power starts as in a new game; on Normal it refills to that at every boss, on Hard it carries over.

@@ -15,6 +15,7 @@
 struct RomSettings {
     bool widescreen = false, smooth_swing = false;
     Cheats cheats;
+    bool coop = false;          // Player 2 has joined (co-op's patches)
 };
 
 // The image these settings make from the ROM as dumped. `report`: patches skipped go to stderr.

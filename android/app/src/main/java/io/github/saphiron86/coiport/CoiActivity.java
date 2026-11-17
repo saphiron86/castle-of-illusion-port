@@ -61,6 +61,39 @@ public class CoiActivity extends SDLActivity {
         return args == null || args.trim().isEmpty() ? new String[0] : args.trim().split("\\s+");
     }
 
+    // The update check (update_check.cpp): GitHub's newest release, fetched once on a thread
+    // of its own. Null until it has an answer; "" when it failed.
+    private static volatile String sUpdateReply;
+
+    public static void startUpdateCheck() {
+        new Thread(() -> {
+            String reply = "";
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(
+                    "https://api.github.com/repos/saphiron86/castle-of-illusion-port/releases?per_page=1").openConnection();
+                c.setConnectTimeout(10000);
+                c.setReadTimeout(10000);
+                c.setRequestProperty("User-Agent", "coi-port-update-check");
+                c.setRequestProperty("Accept", "application/vnd.github+json");
+                if (c.getResponseCode() == 200) {
+                    try (InputStream in = c.getInputStream()) {
+                        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+                        byte[] buffer = new byte[8192];
+                        for (int n; (n = in.read(buffer)) > 0 && out.size() < (1 << 20);)
+                            out.write(buffer, 0, n);
+                        reply = out.toString("UTF-8");
+                    }
+                }
+                c.disconnect();
+            } catch (Exception e) {
+                Log.i(TAG, "Update check failed: " + e);
+            }
+            sUpdateReply = reply;
+        }).start();
+    }
+
+    public static String updateCheckResult() { return sUpdateReply; }
+
     public static int packImportState() { return sImportState; }
     public static long packImportDone() { return sImportDone; }
     public static long packImportTotal() { return sImportTotal; }

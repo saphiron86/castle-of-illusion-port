@@ -20,6 +20,8 @@ An unofficial PC (Windows, Linux and Steam Deck) and Android port of the US Sega
 - [Settings](settings.md): the port's menu, every setting and what it does, and command-line options.
 - [Stages](stages.md): the stage list and starting at a given stage.
 - [Boss Rush](boss-rush.md): the six boss fights back to back, timed.
+- [Co-op](coop.md): a second player drops in at any time and plays a second Mickey on the same screen.
+- [Hardcore](hardcore.md): Hard with 1 power at every level and one try for the whole game.
 - [MD+ soundtrack packs](mdplus.md): a fan-made soundtrack in place of the game's music.
 
 ## For developers

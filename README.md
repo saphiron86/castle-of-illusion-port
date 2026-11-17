@@ -6,7 +6,7 @@ An unofficial PC (Windows, Linux and Steam Deck) and Android port of the US Sega
 
 **No game data is included.** This repository and the release downloads contain no ROM, graphics, sound, level data or game code. The port runs the game from your own dump of the cartridge.
 
-**Documentation:** every setting, Boss Rush, MD+ packs, building from source and the technical notes are on the [project site](https://saphiron86.github.io/castle-of-illusion-port/).
+**Documentation:** every setting, co-op, Boss Rush, MD+ packs, building from source and the technical notes are on the [project site](https://saphiron86.github.io/castle-of-illusion-port/).
 
 ## Features
 
@@ -15,7 +15,9 @@ An unofficial PC (Windows, Linux and Steam Deck) and Android port of the US Sega
 - **Cleaner pictures:** Smooth Water and Smooth Glass (see-through water and jars instead of dithering), Clean Rock Edges and Remove Sprite Limit.
 - **Display options:** HQ2x-HQ4x and cleanEdge upscalers, scanlines, and a CRT shader with adjustable mask, glow and curvature.
 - **Exact gameplay:** the game's own code runs, translated to native code as it starts, frame for frame as on the console. Every enhancement can be switched off (F3 gives the original game).
+- **Two-player co-op:** a second player drops in at any time during a level and plays a second Mickey on the same screen (Windows and Linux).
 - **Boss Rush:** the six boss fights back to back, timed to 1/100 s, from the game's options screen.
+- **Hardcore:** Hard with 1 power at every level, one try for the whole game and no continues.
 - **MD+ soundtrack packs:** play a fan-made CD-quality soundtrack in place of the game's music.
 - **Cheats:** invincibility, infinite power, tries, items and continues, faster walking, moon jump and more.
 - **Controllers and touch:** keyboard, any SDL-supported controller, the Steam Deck's controls, and on-screen controls on Android.

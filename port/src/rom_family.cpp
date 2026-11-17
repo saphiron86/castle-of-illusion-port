@@ -19,6 +19,11 @@ std::vector<uint8_t> make_rom_image(const std::vector<uint8_t>& original, const 
     const std::string skipped = apply_cheats(rom, s.cheats);
     if (report && !skipped.empty())
         std::fprintf(stderr, "%s\n", skipped.c_str());
+    if (s.coop && rush.empty()) {                   // after the cheats: it keeps what they changed
+        const std::string coop = apply_coop(rom);
+        if (report && !coop.empty())
+            std::fprintf(stderr, "%s\n", coop.c_str());
+    }
     fix_checksum(rom);
     return rom;
 }
@@ -35,6 +40,7 @@ const RomSetting kRomSettings[] = {
     {"walk-faster", [](RomSettings& s) -> bool& { return s.cheats.walk_faster; }},
     {"moon-jump", [](RomSettings& s) -> bool& { return s.cheats.moon_jump; }},
     {"midair-jump", [](RomSettings& s) -> bool& { return s.cheats.midair_jump; }},
+    {"coop", [](RomSettings& s) -> bool& { return s.coop; }},
 };
 const size_t kRomSettingCount = sizeof(kRomSettings) / sizeof(kRomSettings[0]);
 

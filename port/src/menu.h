@@ -41,9 +41,11 @@ struct MenuState {
     int game_state;             // GameState ($FFF300)
     int mickey_x, mickey_y;     // Mickey's position in the level ($FFDC10, $FFDC14)
     int camera_x, camera_y;     // CameraA ($FFFA84, $FFFA80)
+    bool check_for_updates;     // the setting
+    const char* update_tag;     // a newer release's tag (nullptr: none found)
 };
 
-enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, ImportMdPlus, OpenSettingsFolder, GoToStage, QuickSettings };
+enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, ImportMdPlus, OpenSettingsFolder, GoToStage, QuickSettings, OpenReleases, ToggleUpdateCheck };
 
 struct MenuChoice {
     MenuAction action = MenuAction::None;
@@ -71,3 +73,17 @@ bool menu_wants_keyboard();
 // drawing the game.
 MenuChoice menu_frame(const MenuState& state);
 void menu_render();
+
+// Shows a hint in the top left corner for `seconds` (hidden while the menu is open), and
+// changes its text while it shows.
+void menu_hint(const char* text, double seconds);
+void menu_hint_text(const char* text);
+
+// Shows a line in the top right corner this frame (call every frame it should show), at
+// `alpha` opacity (0-1) for fading.
+void menu_status(const char* text, float alpha);
+// The same in the top left corner.
+void menu_status_left(const char* text, float alpha);
+
+// Shows a short message at the top of the screen for `seconds` (several stack, newest last).
+void menu_notice(const char* text, double seconds);

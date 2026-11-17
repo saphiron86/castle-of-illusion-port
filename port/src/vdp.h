@@ -75,6 +75,19 @@ public:
     }
     bool trace = false;         // log register writes and commands to stdout
     bool sprite_masking = true; // X-0 sprites hide later sprites on their lines (off only for testing)
+    // Co-op: Player 2's sprites (tiles recolor_tile .. + recolor_tiles - 1, palette line 0)
+    // draw their pixel values in recolor_values (a bit each) as colour 64 + value: the
+    // palette's colour with red and blue swapped (Mickey's red shorts in blue). Off at -1.
+    int recolor_tile = -1, recolor_tiles = 0;
+    uint16_t recolor_values = 0;
+    // Only the biggest area of touching pixels of those values, as the sprites lay them out
+    // (the shorts, at least recolor_min_area pixels), and the areas from its top row down are
+    // recoloured, not those above (the tongue): one byte per pixel of each tile, built from
+    // the sprite table on the frame's first line.
+    int recolor_min_area = 12;
+    uint16_t recolor_link_values = 0;   // values that join red areas (his buttons' yellow)
+    std::vector<uint8_t> recolor_mask;
+    void build_recolor_mask(int base_sprites, int max_sprites);
 
     // Optional per-scene fill for the widened strips: called for plane A pixels outside the
     // original columns (view_x < 0 or >= 320) with the plane coordinates about to be sampled;

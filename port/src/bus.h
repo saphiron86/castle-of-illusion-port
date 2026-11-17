@@ -26,6 +26,9 @@ public:
     // Stage selects, as game stage indexes ($FFFF42; see stages.h for the stage numbers).
     int start_stage = -1;           // --stage: applied at the first level start, then -1
     int jump_stage = -1;            // debug menu: start a new game at this stage right away
+    // Optional: run once, then cleared, the next time the main loop reads GameState (no game
+    // routine in progress: co-op switches ROM images there, so no return lands in a patch).
+    std::function<void()> at_main_loop;
     std::vector<uint16_t> watches;  // RAM words (low 16 bits of the address) whose writes are logged
     Vdp* vdp = nullptr;
     Sound* sound = nullptr;

@@ -6,7 +6,7 @@ nav_order: 3
 # Settings
 {: .no_toc }
 
-F1, or the Back (View) button on a controller, shows or hides a menu bar over the game, which keeps running underneath. Use it with the mouse, with the arrow keys and Enter once it has focus (the game doesn't get those keys while it does), or with a controller: the D-pad or left stick moves, A selects, and B goes back, closing the menu from the top level. While the menu is open, controllers drive only the menu; after it closes, they reach the game again once all their buttons are released. On Android, tap the menu button or press Back.
+F1, or the Back (View) button on a controller, shows or hides a menu bar over the game, which keeps running underneath. Use it with the mouse, with the arrow keys and Enter once it has focus (the game doesn't get those keys while it does), or with a controller: the D-pad or left stick moves, A selects, and B goes back, closing the menu from the top level. While the menu is open, controllers drive only the menu; after it closes, they reach the game again once all their buttons are released. On Android, tap the menu button or press Back. For the first 5 seconds after the port starts, a hint in the top left corner says how to open the menu (the View button while a controller is connected).
 
 1. TOC
 {:toc}
@@ -15,6 +15,12 @@ F1, or the Back (View) button on a controller, shows or hides a menu bar over th
 
 **Reset** (Ctrl+R)
 : Restarts the game as if the console were switched off and on, dropping any stage chosen with `--stage` or the Debug menu.
+
+**Get the Update** (only when there is one)
+: Opens the project's releases page on GitHub in your browser. It appears when the update check has found a release newer than the one you are running, which a message at the top of the screen also announces at start-up.
+
+**Check for Updates**
+: On by default. As the port starts, it asks GitHub for the project's newest release, in the background (nothing is sent but the request itself). Switch it off and the port never contacts the internet.
 
 **Exit to desktop** (Alt+F4)
 : Closes the port.

@@ -67,6 +67,7 @@ const Entry kEntries[] = {
     entry("vsync", FIELD(vsync)),
     entry("show_fps", FIELD(show_fps)),
     entry("show_coordinates", FIELD(show_coordinates)),
+    entry("check_for_updates", FIELD(check_for_updates)),
     entry("high_refresh_interpolation", FIELD(interpolate)),
     entry("frame_rate", FIELD(frame_rate)),
     entry("mdplus_soundtrack", FIELD(mdplus)),
