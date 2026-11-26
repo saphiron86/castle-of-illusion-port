@@ -10,6 +10,7 @@ extern "C" {
 
 #include "sound.h"
 #include "stages.h"
+#include "state_io.h"
 #include "vdp.h"
 
 namespace {
@@ -170,6 +171,31 @@ void Bus::power_on()
     stage_lock = -1;
     pad_data = 0x40;
     std::fill(std::begin(port_ctrl), std::end(port_ctrl), 0);
+}
+
+void Bus::save_state(StateWriter& w) const
+{
+    w.bytes(ram, sizeof(ram));
+    w.bytes(z80_ram, sizeof(z80_ram));
+    w.put<int32_t>(start_stage);
+    w.put<int32_t>(jump_stage);
+    w.put<int32_t>(stage_lock);
+    w.put(z80_bus_requested);
+    w.put(pad_data);
+    w.put_array(port_ctrl);
+}
+
+bool Bus::load_state(StateReader& r)
+{
+    r.bytes(ram, sizeof(ram));
+    r.bytes(z80_ram, sizeof(z80_ram));
+    start_stage = r.get<int32_t>();
+    jump_stage = r.get<int32_t>();
+    stage_lock = r.get<int32_t>();
+    r.get(z80_bus_requested);
+    r.get(pad_data);
+    r.get_array(port_ctrl);
+    return r.ok();
 }
 
 // Stage select. The game tracks progress as a stage index ($FFFF42, 0-27), which it maps

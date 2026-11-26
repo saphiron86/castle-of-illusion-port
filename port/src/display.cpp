@@ -111,6 +111,7 @@ constexpr GLenum kPixelFormat = GL_BGRA, kSwizzleRed = GL_RED, kSwizzleBlue = GL
     X(void, glUniform2f, (GLint, GLfloat, GLfloat)) \
     X(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
     X(void, glUniform2i, (GLint, GLint, GLint)) \
+    X(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glColorMask, (GLboolean, GLboolean, GLboolean, GLboolean)) \
     X(void, glGenVertexArrays, (GLsizei, GLuint*)) \
     X(void, glDeleteVertexArrays, (GLsizei, const GLuint*)) \
@@ -157,17 +158,44 @@ void main()
 )";
 
 // The simple scanlines: how much of a pixel's light is left at line position y (in game
-// lines), averaging the dark band over the part of the line the pixel covers.
+// lines), averaging the dark band over the part of the line the pixel covers. While zoomed,
+// line_height gives the lines a screen pixel covers (the derivative jumps at the zoom's edge).
 const char* kScanlines = R"(
+float line_height = 0.0;
 float scanline_shade(float y, float strength)
 {
-    float h = abs(dFdy(y));
+    float h = line_height > 0.0 ? line_height : abs(dFdy(y));
     float dark = 0.0;
     for (int i = 0; i < 4; i++) {
         float d = abs(fract(y + h * (float(i) - 1.5) / 4.0) - 0.5) * 2.0;   // 0 mid-line, 1 at the edge
         dark += smoothstep(0.55, 0.75, d);
     }
     return 1.0 - strength * dark / 4.0;
+}
+)";
+
+// Co-op Zoom (ZoomView): where in the picture (0-1) a point p of the screen (0-1) looks, and
+// how many picture units a screen unit down covers there.
+const char* kZoom = R"(
+uniform vec4 zoom;            // left, top, width, height of the picture shown; width 0: no zoom
+uniform vec4 zoom_hud;        // the same for the screen below zoom_split (the HUD)
+uniform float zoom_split;     // the screen's height above which `zoom` applies
+uniform int zoom_sharp;       // 1: not at the usual scale (sharp pixels blend their edges)
+
+vec2 zoomed(vec2 p)
+{
+    if (zoom.z <= 0.0)
+        return p;
+    if (p.y < zoom_split)
+        return zoom.xy + vec2(p.x, p.y / zoom_split) * zoom.zw;
+    return zoom_hud.xy + vec2(p.x, (p.y - zoom_split) / (1.0 - zoom_split)) * zoom_hud.zw;
+}
+
+float zoom_scale_y(vec2 p)
+{
+    if (zoom.z <= 0.0)
+        return 1.0;
+    return p.y < zoom_split ? zoom.w / zoom_split : zoom_hud.w / (1.0 - zoom_split);
 }
 )";
 
@@ -244,14 +272,41 @@ vec3 horizontal(float x, float row, int radius, float step, float scale)
 
 float scanline(float dy, float scale) { return exp2(scale * dy * dy); }
 
+// Sharp pixels while zoomed (Co-op Zoom): the scale is rarely whole and keeps changing, so
+// each texel's edge is blended over one screen pixel; pixels then keep even widths instead of
+// shimmering, and stay sharp.
+vec3 sharp(vec2 v)
+{
+    vec2 t = v * texels;
+    vec2 px = max(fwidth(t), vec2(1e-4));                     // texels per screen pixel
+    vec2 b = floor(t + 0.5);                                  // the nearest texel edge
+    vec2 w = clamp((t - b) / px + 0.5, 0.0, 1.0);
+    ivec2 i0 = ivec2(clamp(b - 1.0, vec2(0.0), texels - 1.0)), i1 = ivec2(clamp(b, vec2(0.0), texels - 1.0));
+    vec3 top = mix(texelFetch(image, i0, 0).rgb, texelFetch(image, ivec2(i1.x, i0.y), 0).rgb, w.x);
+    vec3 bottom = mix(texelFetch(image, ivec2(i0.x, i1.y), 0).rgb, texelFetch(image, i1, 0).rgb, w.x);
+    return mix(top, bottom, w.y);
+}
 
 void main()
 {
     if (crt == 0) {                                           // sharp pixels
-        vec3 c = smooth_sample == 1 ? texture(image, uv).rgb
-                                    : texelFetch(image, ivec2(min(uv * texels, texels - 1.0)), 0).rgb;
-        if (scanlines > 0.0)
-            c *= scanline_shade(uv.y * rows, scanlines);
+        vec2 v = zoomed(uv);
+        vec3 c;
+        if (smooth_sample == 1) {
+            c = texture(image, v).rgb;
+        } else {
+            c = texelFetch(image, ivec2(min(v * texels, texels - 1.0)), 0).rgb;
+            if (zoom_sharp == 1) {
+                vec3 s = sharp(v);                            // (its derivatives taken everywhere)
+                if (uv.y < zoom_split)
+                    c = s;
+            }
+        }
+        if (scanlines > 0.0) {
+            if (zoom.z > 0.0)
+                line_height = abs(dFdy(uv.y)) * rows * zoom_scale_y(uv);
+            c *= scanline_shade(v.y * rows, scanlines);
+        }
         frag = vec4(c, 1.0);
         return;
     }
@@ -262,6 +317,7 @@ void main()
         frag = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
+    pos = zoomed(pos);
     float x = pos.x * texels.x;
     float y = pos.y * texels.y;
     float row = floor(y);
@@ -371,7 +427,10 @@ vec3 over(vec3 under, sampler2D layer, float x, float y)
 
 void main()
 {
-    float x = uv.x * picture.x, y = uv.y * picture.y;
+    vec2 v = zoomed(uv);
+    float x = v.x * picture.x, y = v.y * picture.y;
+    if (zoom.z > 0.0)
+        line_height = abs(dFdy(uv.y)) * picture.y * zoom_scale_y(uv);
     float shade = scanlines > 0.0 ? scanline_shade(y, scanlines) : 1.0;
     if (x < clip.x || x >= clip.y) {
         frag = vec4(0.0, 0.0, 0.0, 1.0);
@@ -745,7 +804,7 @@ bool Display::init_hqx()
     hqx_pass1 = link(kHqxVertexShader, (fragment + pass1).c_str());
     hqx_pass1_layer = link(kHqxVertexShader, (std::string(kHqxLayerKey) + pass1).c_str());
     hqx_pass2 = link(kHqxVertexShader, (fragment + "#define PARAMETER_UNIFORM\n" + pass2).c_str());
-    composite = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kCompositeShader).c_str());
+    composite = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kZoom + kCompositeShader).c_str());
     layer_merge = link(kVertexShader, kLayerMergeShader);
     if (!hqx_pass1 || !hqx_pass1_layer || !hqx_pass2 || !composite || !layer_merge)
         return false;
@@ -808,8 +867,10 @@ void Display::hqx_free(HqxTarget& t)
 }
 
 // Runs the two hqx passes over `source` into t.color (and, for a layer, its alpha into
-// t.alpha, by running the second pass again on the source's alpha).
-void Display::hqx_run(HqxTarget& t, GLuint pass1, GLuint source, bool alpha)
+// t.alpha, by running the second pass again on the source's alpha). `rgba_source`: the source
+// is a texture already in R, G, B order (the GPU VDP's layers), which must not get the red and
+// blue swap of the port's own pixel textures back after the alpha pass.
+void Display::hqx_run(HqxTarget& t, GLuint pass1, GLuint source, bool alpha, bool rgba_source)
 {
     const int width = t.width, height = t.height, scale = t.scale;
     glBindVertexArray(vao);
@@ -844,9 +905,9 @@ void Display::hqx_run(HqxTarget& t, GLuint pass1, GLuint source, bool alpha)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ALPHA);
         glBindFramebuffer(GL_FRAMEBUFFER, t.alpha_fbo);
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, kSwizzleRed);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, rgba_source ? GL_RED : kSwizzleRed);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, kSwizzleBlue);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, rgba_source ? GL_BLUE : kSwizzleBlue);
     }
     glBindVertexArray(0);
     glActiveTexture(GL_TEXTURE0);
@@ -858,7 +919,7 @@ bool Display::init(SDL_Window* w)
     window = w;
     if (!load_gl())
         return false;
-    program = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kCrtMask + kFragmentShader).c_str());
+    program = link(kVertexShader, (std::string("#version 330 core\n") + kScanlines + kZoom + kCrtMask + kFragmentShader).c_str());
     if (!program)
         return false;
 #ifdef __ANDROID__
@@ -997,23 +1058,26 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     glDisable(GL_BLEND);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
-    if (width != tex_width || height != tex_height) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, kPixelFormat, GL_UNSIGNED_BYTE, pixels);
-        tex_width = width;
-        tex_height = height;
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, kPixelFormat, GL_UNSIGNED_BYTE, pixels);
+    const GLuint frame = source_texture ? source_texture : texture;
+    glBindTexture(GL_TEXTURE_2D, frame);
+    if (!source_texture) {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
+        if (width != tex_width || height != tex_height) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, kPixelFormat, GL_UNSIGNED_BYTE, pixels);
+            tex_width = width;
+            tex_height = height;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, kPixelFormat, GL_UNSIGNED_BYTE, pixels);
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
     // hqx works on whole game pixels, so not on the finer texels of smooth scrolling.
     const bool use_hqx = hqx >= 2 && hqx <= 4 && hqx_ready && !crt.enabled && width == logical_width
                          && hqx_resize(hqx_flat, width, height, hqx, false);
     if (use_hqx)
-        hqx_run(hqx_flat, hqx_pass1, texture, false);
+        hqx_run(hqx_flat, hqx_pass1, frame, false);
     const int clean_scale = clean_edge_scale(logical_width, height);
     bool use_clean = hqx == kCleanEdge && clean_edge && !crt.enabled && width == logical_width;
     if (use_clean && (clean_flat_width != width * clean_scale || clean_flat_height != height * clean_scale)) {
@@ -1027,15 +1091,19 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
         clean_flat_height = use_clean ? height * clean_scale : 0;
     }
     if (use_clean)
-        clean_edge_run(texture, width, height, clean_scale, clean_flat_fbo, true, clean_codes[kLayers]);
+        clean_edge_run(frame, width, height, clean_scale, clean_flat_fbo, true, clean_codes[kLayers]);
     glViewport(0, 0, out_w, out_h);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Letterbox: the largest rectangle with the picture's shape (square game pixels).
-    const float scale = std::min((float)out_w / logical_width, (float)out_h / height);
-    const int vw = (int)(logical_width * scale + 0.5f), vh = (int)(height * scale + 0.5f);
+    // Letterbox: the largest rectangle with the picture's shape (square game pixels), or
+    // the zoom's screen shape.
+    const float shape_w = zoom.on() && zoom.screen_width > 0 ? zoom.screen_width : (float)logical_width;
+    const float shape_h = zoom.on() && zoom.screen_height > 0 ? zoom.screen_height : (float)height;
+    const float scale = std::min((float)out_w / shape_w, (float)out_h / shape_h);
+    const int vw = (int)(shape_w * scale + 0.5f), vh = (int)(shape_h * scale + 0.5f);
     glViewport((out_w - vw) / 2, (out_h - vh) / 2, vw, vh);
+    picture_x = (out_w - vw) / 2, picture_y = (out_h - vh) / 2, picture_w = vw, picture_h = vh;
 
     // On a phone the CRT shader's beams cost too much at every screen pixel: they are drawn at
     // half size and enlarged, with the mask (which costs little) added at full size.
@@ -1068,6 +1136,8 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     } else if (use_clean) {
         glBindTexture(GL_TEXTURE_2D, clean_flat);
         glUniform2f(loc("texels"), (float)clean_flat_width, (float)clean_flat_height);
+    } else if (source_texture && source_width > 0 && source_height > 0) {
+        glUniform2f(loc("texels"), (float)source_width, (float)source_height);
     } else {
         glUniform2f(loc("texels"), (float)width, (float)height);
     }
@@ -1085,6 +1155,10 @@ void Display::draw(const uint32_t* pixels, int width, int height, int logical_wi
     glUniform2f(loc("warp"), crt.curvature_x, crt.curvature_y);
     glUniform1f(loc("glow"), crt.glow);
     glUniform1f(loc("brightness"), half ? 1.0f : crt.brightness);
+    glUniform4f(loc("zoom"), zoom.left, zoom.top, zoom.on() && !half ? zoom.width : 0.0f, zoom.height);
+    glUniform4f(loc("zoom_hud"), zoom.hud_left, zoom.hud_top, zoom.hud_width, zoom.hud_height);
+    glUniform1f(loc("zoom_split"), zoom.split);
+    glUniform1i(loc("zoom_sharp"), zoom.on() && zoom.resample ? 1 : 0);
     glBindVertexArray(vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     if (half) {
@@ -1129,7 +1203,9 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
         // around a layer's pixels (as far as its slices reach, two texels) when they don't
         // fill it (sprites, a strip of ground).
         int area[4] = {f.width, f.height, 0, 0};    // left, top, right, bottom (exclusive)
-        for (int y = 0; y < f.height; y++) {
+        if (f.textures)                             // (the whole layer)
+            area[0] = area[1] = 0, area[2] = f.width, area[3] = f.height;
+        for (int y = 0; !f.textures && y < f.height; y++) {
             const uint32_t* row = f.layers[i] + (size_t)y * f.width;
             int x0 = 0, x1 = f.width;
             while (x0 < x1 && row[x0] == 0)
@@ -1141,25 +1217,28 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
             area[0] = std::min(area[0], x0), area[2] = std::max(area[2], x1);
             area[1] = std::min(area[1], y), area[3] = y + 1;
         }
-        const bool empty = area[2] == 0;
+        const bool empty = f.textures ? (f.empty >> i & 1) != 0 : area[2] == 0;
         area[0] = std::max(area[0] - 2, 0), area[1] = std::max(area[1] - 2, 0);
         area[2] = std::min(area[2] + 2, f.width), area[3] = std::min(area[3] + 2, f.height);
         if (empty && l.cleared && l.merged_width == f.width * scale && l.merged_height == f.height * scale)
             continue;
         if (!l.source)
             l.source = pixel_texture(GL_NEAREST);
-        glBindTexture(GL_TEXTURE_2D, l.source);
-        if (l.width != f.width || l.height != f.height) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.width, f.height, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.layers[i]);
-            l.width = f.width;
-            l.height = f.height;
-        } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f.width, f.height, kPixelFormat, GL_UNSIGNED_BYTE, f.layers[i]);
+        const GLuint source = f.textures ? f.textures[i] : l.source;
+        if (!f.textures) {
+            glBindTexture(GL_TEXTURE_2D, l.source);
+            if (l.width != f.width || l.height != f.height) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.width, f.height, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.layers[i]);
+                l.width = f.width;
+                l.height = f.height;
+            } else {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f.width, f.height, kPixelFormat, GL_UNSIGNED_BYTE, f.layers[i]);
+            }
         }
         if (!clean && !empty) {
             if (!hqx_resize(l.hqx, f.width, f.height, hqx, true))
                 return false;
-            hqx_run(l.hqx, hqx_pass1_layer, l.source, true);
+            hqx_run(l.hqx, hqx_pass1_layer, source, true, f.textures != nullptr);
         }
         if (l.merged_width != f.width * scale || l.merged_height != f.height * scale) {
             if (!l.merged) {
@@ -1187,7 +1266,7 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
         }
         if (clean) {
             // cleanEdge keeps edges hard, so its picture is already the merged one.
-            clean_edge_run(l.source, f.width, f.height, scale, l.merged_fbo, false, clean_codes[i], area);
+            clean_edge_run(source, f.width, f.height, scale, l.merged_fbo, false, clean_codes[i], area);
             continue;
         }
         glBindFramebuffer(GL_FRAMEBUFFER, l.merged_fbo);
@@ -1202,7 +1281,7 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
         glActiveTexture(GL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, l.hqx.alpha);
         glActiveTexture(GL_TEXTURE0 + 2);
-        glBindTexture(GL_TEXTURE_2D, l.source);
+        glBindTexture(GL_TEXTURE_2D, source);
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindVertexArray(0);
@@ -1222,6 +1301,8 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
         if (!water[i])
             water[i] = pixel_texture(GL_NEAREST);
         glBindTexture(GL_TEXTURE_2D, water[i]);
+        if (f.water_textures)
+            continue;
         if (f.water[i])
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, f.width, f.height, 0, kPixelFormat, GL_UNSIGNED_BYTE, f.water[i]);
         else
@@ -1234,9 +1315,12 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     const int logical_width = f.width - 2 * f.margin;
-    const float fit = std::min((float)out_w / logical_width, (float)out_h / f.height);
-    const int vw = (int)(logical_width * fit + 0.5f), vh = (int)(f.height * fit + 0.5f);
+    const float shape_w = zoom.on() && zoom.screen_width > 0 ? zoom.screen_width : (float)logical_width;
+    const float shape_h = zoom.on() && zoom.screen_height > 0 ? zoom.screen_height : (float)f.height;
+    const float fit = std::min((float)out_w / shape_w, (float)out_h / shape_h);
+    const int vw = (int)(shape_w * fit + 0.5f), vh = (int)(shape_h * fit + 0.5f);
     glViewport((out_w - vw) / 2, (out_h - vh) / 2, vw, vh);
+    picture_x = (out_w - vw) / 2, picture_y = (out_h - vh) / 2, picture_w = vw, picture_h = vh;
 
     glUseProgram(composite);
     auto loc = [this](const std::string& name) { return glGetUniformLocation(composite, name.c_str()); };
@@ -1253,13 +1337,16 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     glUniform1i(loc("backdrop"), kLayers + 1);
     for (int i = 0; i < 2; i++) {
         glActiveTexture(GL_TEXTURE0 + kLayers + 2 + i);
-        glBindTexture(GL_TEXTURE_2D, water[i]);
+        glBindTexture(GL_TEXTURE_2D, f.water_textures ? f.water_textures[i] : water[i]);
         glUniform1i(loc("water" + std::to_string(i)), kLayers + 2 + i);
     }
     glUniform2f(loc("picture"), (float)logical_width, (float)f.height);
     glUniform1f(loc("margin"), (float)f.margin);
     glUniform2f(loc("clip"), (float)f.clip_left, (float)f.clip_right);
     glUniform1f(loc("scanlines"), std::clamp(scanlines, 0, 100) / 100.0f);
+    glUniform4f(loc("zoom"), zoom.left, zoom.top, zoom.on() ? zoom.width : 0.0f, zoom.height);
+    glUniform4f(loc("zoom_hud"), zoom.hud_left, zoom.hud_top, zoom.hud_width, zoom.hud_height);
+    glUniform1f(loc("zoom_split"), zoom.split);
     glBindVertexArray(vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
@@ -1267,6 +1354,44 @@ bool Display::draw_layers(const LayeredFrame& f, int scanlines, int hqx)
     glActiveTexture(GL_TEXTURE0);
     glViewport(0, 0, out_w, out_h);
     return true;
+}
+
+bool Display::read_picture(std::vector<uint8_t>& rgb, int& width, int& height)
+{
+    width = picture_w, height = picture_h;
+    if (width <= 0 || height <= 0)
+        return false;
+    std::vector<uint8_t> bottom_up((size_t)width * height * 3);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(picture_x, picture_y, width, height, GL_RGB, GL_UNSIGNED_BYTE, bottom_up.data());
+    rgb.resize(bottom_up.size());
+    for (int y = 0; y < height; y++)
+        std::copy_n(&bottom_up[(size_t)(height - 1 - y) * width * 3], width * 3, &rgb[(size_t)y * width * 3]);
+    return true;
+}
+
+#ifndef GL_RGB8
+#define GL_RGB8 0x8051
+#endif
+
+unsigned Display::rgb_texture(const uint8_t* rgb, int width, int height, unsigned reuse)
+{
+    GLuint t = reuse ? reuse : new_texture(GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return t;
+}
+
+void Display::free_texture(unsigned t)
+{
+    if (t) {
+        GLuint id = t;
+        glDeleteTextures(1, &id);
+    }
 }
 
 bool Display::read_window(std::vector<uint8_t>& rgb, int& width, int& height)

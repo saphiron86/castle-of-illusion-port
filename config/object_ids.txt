@@ -53,7 +53,7 @@
 8E Cupcake             a platform that rises and falls (stage 15)
 8F PassageTrigger      starts a passage for Mickey (MickeyPassage) when he touches it, its $29 the way (1 down, 2 up): invisible (stage 15, a pair in the arched doorway)
 90 ExitSign            (stages 2 4 6-8 10-12 15 24)
-93 Spark               a tiny yellow spark (most stages from 6)
+93 Decoration          a small decoration, its look picked by subtype ($29: the anim table at $15C8): 1 a bell swinging in an arch (stages 6 8), others a tiny yellow spark and the like (stages 6-8 14-19 23)
 95 Fireworks           a firework explosion (stages 15 24)
 96 Shelf               a thin platform with something on it (stages 16-19)
 98 SmallGem            (stages 15 24)

@@ -11,6 +11,7 @@ static inline uint32_t swap_red_blue(uint32_t c)
 #include <cstring>
 
 #include "bus.h"
+#include "state_io.h"
 
 extern "C" {
 #include "m68k.h"
@@ -53,6 +54,7 @@ void Vdp::write_port(uint32_t port, uint16_t value)
             int length = reg[19] | reg[20] << 8;
             if (length == 0)
                 length = 0x10000;
+            vram_writes++;
             for (int i = 0; i < length; i++) {
                 vram[(address ^ 1) & 0xFFFF] = value >> 8;
                 address += reg[15];
@@ -96,6 +98,7 @@ void Vdp::write_data(uint16_t value)
     switch (code & 0x0F) {
     case 0x01: {                                    // VRAM; an odd address swaps the bytes
         uint32_t a = address & 0xFFFF;
+        vram_writes++;
         vram[a] = value >> 8;
         vram[a ^ 1] = value & 0xFF;
         break;
@@ -124,6 +127,7 @@ void Vdp::do_dma()
         return;
     case 3: {                                       // VRAM copy
         uint16_t source = reg[21] | reg[22] << 8;
+        vram_writes++;
         for (int i = 0; i < length; i++) {
             vram[address & 0xFFFF] = vram[source++];
             address += reg[15];
@@ -163,6 +167,38 @@ void Vdp::power_on()
     code = 0;
     pending = fill_pending = vblank = false;
     hint_counter = vcounter = 0;
+}
+
+void Vdp::save_state(StateWriter& w) const
+{
+    w.bytes(vram, sizeof(vram));
+    w.put_array(cram);
+    w.put_array(vsram);
+    w.bytes(reg, sizeof(reg));
+    w.put(address);
+    w.put(code);
+    w.put(pending);
+    w.put(fill_pending);
+    w.put(vblank);
+    w.put<int32_t>(hint_counter);
+    w.put<int32_t>(vcounter);
+}
+
+bool Vdp::load_state(StateReader& r)
+{
+    r.bytes(vram, sizeof(vram));
+    r.get_array(cram);
+    r.get_array(vsram);
+    r.bytes(reg, sizeof(reg));
+    r.get(address);
+    r.get(code);
+    r.get(pending);
+    r.get(fill_pending);
+    r.get(vblank);
+    hint_counter = r.get<int32_t>();
+    vcounter = r.get<int32_t>();
+    vram_writes++;                                  // (--gpu-vdp's copies: all of VRAM is new)
+    return r.ok();
 }
 
 void Vdp::start_frame()
@@ -286,6 +322,42 @@ void Vdp::line_scroll(int line, int& hs_a, int& hs_b) const
     }
     hs_a = (vram[(base_hscroll + hs_offset) & 0xFFFF] << 8 | vram[(base_hscroll + hs_offset + 1) & 0xFFFF]) & 0x3FF;
     hs_b = (vram[(base_hscroll + hs_offset + 2) & 0xFFFF] << 8 | vram[(base_hscroll + hs_offset + 3) & 0xFFFF]) & 0x3FF;
+    hs_b = (hs_b + plane_b_hs_add) & 0x3FF;
+    // Co-op Zoom's lines under the HUD (ignore_window): with scrolling by line or cell, the
+    // game leaves the table's entries for the HUD's lines as they are (0 in stage 4), and the
+    // planes drawn there were shifted against the lines above (the user's "stale tiles" at the
+    // bottom). They go on from the last 16 lines of play instead: the same scroll where that
+    // is even, and on at the same slope where it changes by line (plane B's parallax).
+    const int split = (reg[18] & 0x1F) * 8;
+    if (ignore_window && (reg[11] & 3) && (reg[18] & 0x80) && split >= 17 && line >= split) {
+        int a1, b1, a0, b0;
+        line_scroll(split - 1, a1, b1);             // (lines above the split: not this branch)
+        line_scroll(split - 17, a0, b0);
+        auto on = [&](int last, int before) {
+            const int s1 = (last ^ 0x200) - 0x200, s0 = (before ^ 0x200) - 0x200;   // signed 10 bits
+            int d = s1 - s0;
+            if (d > 512) d -= 1024;
+            if (d < -512) d += 1024;
+            return (s1 + d * (line - split + 1) / 16) & 0x3FF;
+        };
+        hs_a = on(a1, a0);
+        hs_b = on(b1, b0);
+    }
+}
+
+// The game hides the sprites behind the HUD with a pair on lines 192-223: sprite #0 left of
+// the screen (X 64, 64 pixels left of it), then #1 at X 0. With the masking off (Co-op Zoom's
+// lines under the HUD) the first showed at the zoomed-out frame's left edge (the user's "small
+// visual defect in the bottom left"); it is left out.
+bool Vdp::masking_lead(int base_sprites, int link, int line) const
+{
+    const uint8_t* s = &vram[(base_sprites + link * 8) & 0xFFFF];
+    const int raw_x = (s[6] << 8 | s[7]) & 0x1FF, cells_w = ((s[2] >> 2) & 3) + 1, next = s[3] & 0x7F;
+    if (sprite_masking || raw_x == 0 || raw_x + cells_w * 8 > 128 || next == 0)
+        return false;
+    const uint8_t* t = &vram[(base_sprites + next * 8) & 0xFFFF];
+    const int y = ((t[0] << 8 | t[1]) & 0x3FF) - 128 + sprite_y_shift;
+    return ((t[6] << 8 | t[7]) & 0x1FF) == 0 && line >= y && line < y + ((t[2] & 3) + 1) * 8;
 }
 
 // Co-op's recolour mask: lays out every sprite (palette line 0) drawn from the recoloured
@@ -429,11 +501,11 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
 
     // Window: whole lines from the vertical setting, or columns from the horizontal one.
     const int window_vp = (reg[18] & 0x1F) * 8;
-    const bool window_line = (reg[18] & 0x80) ? line >= window_vp : line < window_vp;
+    const bool window_line = !ignore_window && ((reg[18] & 0x80) ? line >= window_vp : line < window_vp);
     if (layers)
         layers->window_line = window_line;
-    const int window_hp = (reg[17] & 0x1F) * 16;
-    const bool window_right = reg[17] & 0x80;
+    const int window_hp = ignore_window ? 0 : (reg[17] & 0x1F) * 16;   // (0 on the left: no columns)
+    const bool window_right = !ignore_window && (reg[17] & 0x80);
     const int window_w = h40 ? 64 : 32;
 
     // Outside the original columns, a whole-line window (the HUD) is extended: a row
@@ -478,7 +550,7 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
             int dx = 0, dy = 0;
             if (sprite_offset)
                 sprite_offset(o.sprite, line, 0, scale, dx, dy);
-            const int row = line - (o.y + dy);
+            const int row = line - (o.y + sprite_y_shift + dy);
             if (row >= 0 && row < o.h)
                 overlay_rows.push_back({&o, row, (o.x + left) * scale + (layers ? 0 : sub_a) + dx});
         }
@@ -489,7 +561,7 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
         build_recolor_mask(base_sprites, max_sprites);
     for (int n = 0; n < max_sprites; n++) {
         const uint8_t* s = &vram[(base_sprites + link * 8) & 0xFFFF];
-        int y = ((s[0] << 8 | s[1]) & 0x3FF) - 128;
+        int y = ((s[0] << 8 | s[1]) & 0x3FF) - 128 + sprite_y_shift;
         int cells_w = ((s[2] >> 2) & 3) + 1;
         int cells_h = (s[2] & 3) + 1;
         uint16_t attr = s[4] << 8 | s[5];
@@ -505,6 +577,7 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
             // Masking: a sprite at raw X 0 hides every later sprite on this line, once a
             // sprite with nonzero X has appeared on it. The game hides sprites behind the
             // HUD this way (sprite #0 at X 64, then sprite #1 at X 0 on lines 192-223).
+            const bool nonzero_x_seen_before = nonzero_x_seen;
             if (raw_x == 0) {
                 if (nonzero_x_seen && sprite_masking)
                     break;
@@ -522,6 +595,8 @@ void Vdp::render_line(int line, uint32_t* out, int width, int left, int scale, L
             int row = line - (y + dy);
             if (hiding && (size_t)link < hidden_sprites.size() && hidden_sprites[link])
                 row = -1;                           // drawn as an overlay instead
+            if (!nonzero_x_seen_before && masking_lead(base_sprites, link, line))
+                row = -1;
             if (row >= 0 && row < cells_h * 8) {
                 if (attr & 0x1000) row = cells_h * 8 - 1 - row;
                 for (int cx = 0; cx < cells_w * 8; cx++) {

@@ -68,6 +68,12 @@ void FrameInterpolator::sprite_written(uint16_t address, uint32_t pc, uint32_t a
     o.y = word(ram, object + 0x14);
     o.camera_x = o.screen ? 0 : word(ram, 0xFA84);
     o.camera_y = o.screen ? 0 : word(ram, 0xFA80);
+    o.flags = ram[(object + 2) & 0xFFFF];
+    o.anim = ram[(object + 0x0A) & 0xFFFF];
+    o.anim_frame = ram[(object + 0x0B) & 0xFFFF];
+    o.anim_timer = ram[(object + 0x0C) & 0xFFFF];
+    o.tile_base = (uint16_t)word(ram, object + 4);
+    o.vel_x = (int16_t)word(ram, object + 0x18);
 }
 
 void FrameInterpolator::dma(uint32_t source)

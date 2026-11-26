@@ -19,6 +19,7 @@ An unofficial PC (Windows, Linux and Steam Deck) and Android port of the US Sega
 - **Boss Rush:** the six boss fights back to back, timed to 1/100 s, from the game's options screen.
 - **Hardcore:** Hard with 1 power at every level, one try for the whole game and no continues.
 - **MD+ soundtrack packs:** play a fan-made CD-quality soundtrack in place of the game's music.
+- **Texture packs (experimental):** draw the game with redrawn art at four times the size, made from your own ROM with the included art dump tool. Still being worked on: you may run into bugs.
 - **Cheats:** invincibility, infinite power, tries, items and continues, faster walking, moon jump and more.
 - **Controllers and touch:** keyboard, any SDL-supported controller, the Steam Deck's controls, and on-screen controls on Android.
 - **Story fast forward:** hold Backspace (Y on a controller) to run story scenes at four times their speed.
@@ -51,6 +52,8 @@ Android 7.0 or later, on a 64-bit phone with OpenGL ES 3.0.
 2. On first start, pick your ROM with the file picker. It is copied into the app, so it is asked for only once.
 3. Play with the on-screen controls or a USB or Bluetooth controller. The menu button, or Back, opens the menu.
 
+On an Android TV such as the NVIDIA Shield, you can also play with the remote while no controller is connected: hold it sideways, D-pad on the left (see the controls below). Connecting a controller switches to it at once, and the remote is back in play once it disconnects. The remote adds a slight input lag, so a controller is recommended.
+
 ### Controls
 
 | Genesis | Keyboard | Controller (Xbox layout) |
@@ -62,6 +65,9 @@ Android 7.0 or later, on a 64-bit phone with OpenGL ES 3.0.
 | Start   | Enter    | Menu                     |
 | Fast forward (story scenes) | Backspace (hold) | Y (hold) |
 | Port menu | F1     | Back (View)              |
+| Save / load state (Game menu) | F5 / F7 | View + LB / View + RB |
+
+With the NVIDIA Shield's remote, held sideways with its top to the left: the D-pad moves (turned a quarter turn), the centre button is Start, Back opens the menu, and the three buttons after Back along the same edge (fast forward, play/pause and rewind) are A, B and C.
 
 The menu holds every setting; F2 picks the Enhanced settings (the default), F3 the original game (Vanilla) and F4 your own choices. Settings are remembered between runs. See [Settings](https://saphiron86.github.io/castle-of-illusion-port/settings.html) for what each one does.
 

@@ -59,7 +59,7 @@ constexpr uint32_t kCoopObjects = 0x0D2000, kCoopCameraTarget = 0x0D2006, kCoopT
                    kCoopFinaleCheck = 0x0D20B4, kCoopFinaleX = 0x0D20BA, kCoopFinaleArrive = 0x0D20C0,
                    kCoopFinaleWaiting = 0x0D20C6, kCoopOrb = 0x0D20CC, kCoopOrbBurst = 0x0D20D2,
                    kCoopDrawFlip = 0x0D20D8, kCoopOrbsGone = 0x0D20DE,
-                   kCoopOrbTiles = 0x0D20E4,
+                   kCoopOrbTiles = 0x0D20E4, kCoopSparkleD1 = 0x0D20EA, kCoopExitPower = 0x0D20EA,
                    kCoopSoundRoutine = 0x0D7FFC;
 // Co-op's art, made from the ROM when the co-op image is built (coop.asm's CoopArt): the orb
 // that traps Minnie (object $EA, stage 28; Nemesis-compressed at $05177C, 28 tiles), its
@@ -253,9 +253,13 @@ const std::vector<Patch>& coop_patches()
         {0x001B42, {0x08, 0x80, 0x00, 0x0F, 0xD2, 0xC0}, jsr(kCoopDrawFlip), "finale: Player 2 faces left"},
         {0x0109A8, {0x00, 0x38, 0x00, 0x01, 0xDC, 0x82}, jsr(kCoopOrbsGone), "finale: orbs gone"},
         {0x00CDF4, {0x33, 0x7C, 0xA5, 0x80, 0x00, 0x04}, jsr(kCoopOrbTiles), "finale: orbs' tiles"},
+        {0x010AD8, {0x33, 0x7C, 0x00, 0xFC, 0x00, 0x10}, jmp(kCoopSparkleD1), "finale: sparkles from each orb"},
+        {0x0006DC, {0x4A, 0x78, 0xF3, 0x22, 0x67, 0x40}, jsr(kCoopExitPower), "exit: either player's power"},
     };
     return list;
 }
+
+}  // namespace
 
 // Nemesis decompression (the game's NemDec, $07FBAE): the tiles at `src`, 32 bytes each, or
 // nothing if the data runs past the ROM or holds a code the table doesn't.
@@ -339,8 +343,6 @@ std::vector<uint8_t> nemesis_decode(const std::vector<uint8_t>& rom, size_t src)
     }
     return out;
 }
-
-}  // namespace
 
 std::string apply_coop(std::vector<uint8_t>& rom)
 {

@@ -26,6 +26,8 @@ Entry entry(const char* key, Field field)
                 using T = std::decay_t<decltype(v)>;
                 if constexpr (std::is_same_v<T, bool>)
                     return std::string(v ? "true" : "false");
+                else if constexpr (std::is_same_v<T, std::string>)
+                    return v;
                 else
                     return std::to_string(v);
             },
@@ -36,6 +38,8 @@ Entry entry(const char* key, Field field)
                 if constexpr (std::is_same_v<T, bool>) {
                     if (text == "true" || text == "false")
                         v = text == "true";
+                } else if constexpr (std::is_same_v<T, std::string>) {
+                    v = text;
                 } else if constexpr (std::is_same_v<T, int>) {
                     long n = std::strtol(text.c_str(), &end, 10);
                     if (end != text.c_str() && *end == '\0')
@@ -64,13 +68,24 @@ const Entry kEntries[] = {
     entry("smooth_water", FIELD(smooth_water)),
     entry("smooth_glass", FIELD(smooth_glass)),
     entry("remove_sprite_limit", FIELD(remove_sprite_limit)),
+    entry("smooth_animation", FIELD(smooth_animation)),
+    entry("stage4_storm", FIELD(stage4_storm)),
     entry("vsync", FIELD(vsync)),
     entry("show_fps", FIELD(show_fps)),
     entry("show_coordinates", FIELD(show_coordinates)),
     entry("check_for_updates", FIELD(check_for_updates)),
     entry("high_refresh_interpolation", FIELD(interpolate)),
     entry("frame_rate", FIELD(frame_rate)),
+    entry("coop_camera", FIELD(coop_camera)),
+    entry("gpu_renderer", FIELD(gpu_renderer)),
     entry("mdplus_soundtrack", FIELD(mdplus)),
+    entry("clear_fm", FIELD(clear_fm)),
+    entry("clean_psg", FIELD(clean_psg)),
+    entry("model1_low_pass", FIELD(low_pass)),
+    entry("texture_packs", FIELD(texture_packs)),
+    entry("texture_pack", FIELD(texture_pack)),
+    entry("save_slot", FIELD(save_slot)),
+    entry("tv_remote_help_shown", FIELD(tv_remote_help_shown)),
     entry("cheat_invincibility", FIELD(cheats.invincibility)),
     entry("cheat_infinite_power", FIELD(cheats.infinite_power)),
     entry("cheat_infinite_tries", FIELD(cheats.infinite_tries)),
@@ -100,9 +115,14 @@ const Entry kEntries[] = {
     entry("custom_smooth_water", FIELD(custom.smooth_water)),
     entry("custom_smooth_glass", FIELD(custom.smooth_glass)),
     entry("custom_remove_sprite_limit", FIELD(custom.remove_sprite_limit)),
+    entry("custom_smooth_animation", FIELD(custom.smooth_animation)),
     entry("custom_hqx", FIELD(custom.hqx)),
     entry("custom_scanlines", FIELD(custom.scanlines)),
     entry("custom_crt_shader", FIELD(custom.crt)),
+    entry("custom_clear_fm", FIELD(custom.clear_fm)),
+    entry("custom_clean_psg", FIELD(custom.clean_psg)),
+    entry("custom_model1_low_pass", FIELD(custom.low_pass)),
+    entry("custom_stage4_storm", FIELD(custom.stage4_storm)),
 };
 
 std::string settings_path()
@@ -128,20 +148,22 @@ bool Look::operator==(const Look& o) const
     return widescreen == o.widescreen && smooth_swing == o.smooth_swing && smooth_scroll == o.smooth_scroll
         && clean_rock_edges == o.clean_rock_edges && smooth_fades == o.smooth_fades && smooth_water == o.smooth_water
         && smooth_glass == o.smooth_glass
-        && remove_sprite_limit == o.remove_sprite_limit && hqx == o.hqx && scanlines == o.scanlines && crt == o.crt;
+        && remove_sprite_limit == o.remove_sprite_limit && smooth_animation == o.smooth_animation && hqx == o.hqx && scanlines == o.scanlines && crt == o.crt
+        && clear_fm == o.clear_fm && clean_psg == o.clean_psg && low_pass == o.low_pass && stage4_storm == o.stage4_storm;
 }
 
 Look quick_look(Quick quick)
 {
     if (quick == Quick::Vanilla)
-        return {false, false, false, false, false, false, false, false, 1, 0, false};
+        return {false, false, false, false, false, false, false, false, false, 1, 0, false, false, false, false, false};
     return look_of(Settings{});                     // Enhanced: the defaults
 }
 
 Look look_of(const Settings& s)
 {
     return {s.widescreen, s.smooth_swing, s.smooth_scroll, s.clean_rock_edges, s.smooth_fades, s.smooth_water, s.smooth_glass,
-            s.remove_sprite_limit, s.hqx, s.scanlines, s.crt.enabled};
+            s.remove_sprite_limit, s.smooth_animation, s.hqx, s.scanlines, s.crt.enabled, s.clear_fm, s.clean_psg, s.low_pass,
+            s.stage4_storm};
 }
 
 void set_look(Settings& s, const Look& look)
@@ -154,9 +176,14 @@ void set_look(Settings& s, const Look& look)
     s.smooth_water = look.smooth_water;
     s.smooth_glass = look.smooth_glass;
     s.remove_sprite_limit = look.remove_sprite_limit;
+    s.smooth_animation = look.smooth_animation;
     s.hqx = look.hqx;
     s.scanlines = look.scanlines;
     s.crt.enabled = look.crt;
+    s.clear_fm = look.clear_fm;
+    s.clean_psg = look.clean_psg;
+    s.low_pass = look.low_pass;
+    s.stage4_storm = look.stage4_storm;
 }
 
 std::string settings_folder()

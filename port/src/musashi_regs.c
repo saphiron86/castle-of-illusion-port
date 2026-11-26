@@ -66,3 +66,31 @@ unsigned int coi_m68k_irq_level(void)
 {
     return m68ki_cpu.nmi_pending ? 8 : CPU_INT_LEVEL >> 8;
 }
+
+/* Save states (savestate.h): Musashi's data, field by field (its callbacks and cycle tables,
+   which are pointers, stay as they are). COI_M68K_STATE_WORDS words. */
+#define COI_M68K_STATE_FIELDS(X) \
+    X(ppc) X(pc) X(vbr) X(sfc) X(dfc) X(ir) X(t1_flag) X(t0_flag) X(s_flag) X(m_flag) X(x_flag) \
+    X(n_flag) X(not_z_flag) X(v_flag) X(c_flag) X(int_mask) X(int_level) X(stopped) X(pref_addr) \
+    X(pref_data) X(instr_mode) X(run_mode) X(reset_cycles) X(virq_state) X(nmi_pending)
+
+unsigned int coi_m68k_state_save(unsigned int* out)
+{
+    unsigned int n = 0, i;
+    for (i = 0; i < 16; i++) out[n++] = m68ki_cpu.dar[i];
+    for (i = 0; i < 7; i++) out[n++] = m68ki_cpu.sp[i];
+#define COI_SAVE(f) out[n++] = (unsigned int)m68ki_cpu.f;
+    COI_M68K_STATE_FIELDS(COI_SAVE)
+#undef COI_SAVE
+    return n;
+}
+
+void coi_m68k_state_load(const unsigned int* in)
+{
+    unsigned int n = 0, i;
+    for (i = 0; i < 16; i++) m68ki_cpu.dar[i] = in[n++];
+    for (i = 0; i < 7; i++) m68ki_cpu.sp[i] = in[n++];
+#define COI_LOAD(f) m68ki_cpu.f = in[n++];
+    COI_M68K_STATE_FIELDS(COI_LOAD)
+#undef COI_LOAD
+}

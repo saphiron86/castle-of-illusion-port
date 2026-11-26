@@ -19,6 +19,10 @@ public:
     // The colours to show `back` game frames (0-1) before the current one.
     void fill(PaletteOverride& out, double back = 0.0) const;
     void reset();
+    // Stage 4's day-to-night: the game steps a few colours at a time towards night, every 8
+    // frames, each its own way (channels up and down, by several levels). While set, any
+    // small palette change (up to 16 colours) that isn't a fade step is eased over that time too.
+    bool ease_steps = false;
 
 private:
     struct Channel {

@@ -82,6 +82,8 @@ CoopFinale	equ	$FFFFFD47	; byte: the final boss's last hit: bit 7 the script has
 				; player's start still to come (Mickey's, Player 2's)
 CoopFinaleIn	equ	$FFFFFD48	; byte: the players in the script (bit 0 Mickey, bit 1 Player 2)
 CoopFinaleAt	equ	$FFFFFD49	; byte: ... and those at their place, waiting
+CoopCamV	equ	$FFFFFD4A	; word: the camera's eased X speed (8.8 pixels a frame, CoopCameraTarget)
+CoopCamF	equ	$FFFFFD4C	; word: its fraction of a pixel
 CoopMusic	equ	$FFFFFD7E	; byte: the last music asked for (not a jingle: CoopPlaySound)
 CoopMusicWait	equ	$FFFFFD7F	; byte: frames until it is asked for again (after a death's jingle)
 CoopBubbles	equ	$FFFFFD80	; $40: Player 1's bubble, drawn like an object
@@ -166,6 +168,27 @@ CoopHurts2Replay:
 	jmp	(CoopDrawFlip).l	; $0D20D8
 	jmp	(CoopOrbsGone).l	; $0D20DE
 	jmp	(CoopOrbTiles).l	; $0D20E4
+	jmp	(CoopSparkleD1).l	; $0D20EA
+	jmp	(CoopExitPower).l	; $0D20EA
+
+; The stage's exit (object $07, $0006DC, in place of tst.w (Power).w / beq.s to its rts): it
+; takes nobody while Mickey's power is 0, and Mickey's is Player 1's, so with Player 1 out of
+; play (dying, waiting, in his bubble, out of tries) Player 2 walked through it and nothing
+; happened (the user's report). Now either player's will do: Player 1's, or Player 2's while he
+; plays (TouchesMickey then tests only the players in play). None: back from the exit's code.
+CoopExitPower:
+	tst.w	(Power).w
+	bne.s	.yes
+	tst.b	(P2Active).w
+	beq.s	.no
+	tst.b	(CoopStatus+1).w
+	bne.s	.no
+	tst.w	(P2Power).w
+	bne.s	.yes
+.no:
+	addq.l	#4,a7			; (the exit's own rts)
+.yes:
+	rts
 
 ; MickeySolidObject ($00C142, in place of bclr #0,$E(a1); $00C200 and $00C33C, in place of
 ; bset #0,$E(a1)): the solid object's "stood on" bit is bit 0 for Mickey and bit 4 for Player 2
@@ -751,7 +774,7 @@ CoopCameraTarget:
 .free:
 	cmpi.b	#3,d7			; they don't fit (whatever the camera's X: tested on it,
 					; it went back and forth between the two): the one walking away leads
-	bne.s	.oneWay
+	bne.s	.fit
 	moveq	#1,d7
 	tst.w	$18(a2)
 	bgt.s	.oneWay
@@ -760,22 +783,165 @@ CoopCameraTarget:
 	bmi.s	.oneWay
 	bra.s	.hold			; neither: the camera stays (back to the middle and on
 					; again, it jumped while one walked into a wall)
+.fit:
+	; They fit: the point between them moves the camera only within cmin..cmax (to cmax
+	; at most rightward, to cmin at least leftward). Past it, the bound brought it back the
+	; next frame, and the camera went back and forth a pixel with both standing still (the
+	; user's "the bottom of the screen twitches": Player 1 at the left edge, Player 2 far
+	; right on a cliff, the point past the right threshold).
+	move.w	d5,d2			; point <= cmax + right threshold
+	add.w	(FollowWindow).w,d2
+	cmp.w	d2,d0
+	ble.s	.fitLow
+	move.w	d2,d0
+.fitLow:
+	move.w	d4,d2			; point >= cmin + left threshold
+	add.w	(FollowWindow+2).w,d2
+	cmp.w	d2,d0
+	bge.s	.oneWay
+	move.w	d2,d0
+	; Where the camera must move for the bounds, the point starts from the threshold it
+	; crosses (CoopCamX moved there; the camera stays put for a point on it): from the
+	; window's middle, at 8 pixels a frame, it took 4 frames to cross it, and then the
+	; camera moved 6 or 7 pixels at once (the user's jumps as the pull starts). Each bound
+	; leaves a least move (d4 right, d5 left): what keeps the player it moves for within
+	; 8 pixels of the 16 once he has moved (the edges drag past 8; Mickey moves before the
+	; camera, Player 2 after it, by up to his speed + 1).
 .oneWay:
 	btst	#0,d7
-	beq.s	.notRightward
+	beq.s	.noRight
 	move.w	d4,d2			; point >= cmin + right threshold
 	add.w	(FollowWindow).w,d2
 	cmp.w	d2,d0
-	bge.s	.notRightward
+	bge.s	.noRight
 	move.w	d2,d0
-.notRightward:
+	move.w	(FollowWindow).w,d2	; d2 = camera + right threshold
+	add.w	d6,d2
+	cmp.w	d2,d0
+	ble.s	.noRight		; the camera needn't move
+	move.w	d0,d4			; least move: past the 16 less 8
+	sub.w	d2,d4
+	subq.w	#8,d4
+	cmpa.w	#MickeySlot&$FFFF,a2
+	beq.s	.rightBase
+	move.w	$18(a2),d3
+	bpl.s	.rightSpeed
+	moveq	#0,d3
+.rightSpeed:
+	add.w	d3,d4
+	addq.w	#1,d4
+.rightBase:
+	cmp.w	(CoopCamX).w,d2
+	ble.s	.right
+	move.w	d2,(CoopCamX).w
+	bra.s	.right
+.noRight:
+	moveq	#0,d4
+.right:
 	btst	#1,d7
-	beq.s	.placed
+	beq.s	.noLeft
 	move.w	d5,d2			; point <= cmax + left threshold
 	add.w	(FollowWindow+2).w,d2
 	cmp.w	d2,d0
-	ble.s	.placed
+	ble.s	.noLeft
 	move.w	d2,d0
+	move.w	(FollowWindow+2).w,d2	; d2 = camera + left threshold
+	add.w	d6,d2
+	cmp.w	d2,d0
+	bge.s	.noLeft			; the camera needn't move
+	move.w	d2,d5			; least move
+	sub.w	d0,d5
+	subq.w	#8,d5
+	cmpa.w	#MickeySlot&$FFFF,a1
+	beq.s	.leftBase
+	move.w	$18(a1),d3
+	neg.w	d3
+	bpl.s	.leftSpeed
+	moveq	#0,d3
+.leftSpeed:
+	add.w	d3,d5
+	addq.w	#1,d5
+.leftBase:
+	cmp.w	(CoopCamX).w,d2
+	bge.s	.left
+	move.w	d2,(CoopCamX).w
+	bra.s	.left
+.noLeft:
+	moveq	#0,d5
+.left:
+	; The camera's speed eases (CoopCamV, 8.8 pixels a frame; CoopCamF its fraction): it
+	; gains at most 1/4 of a pixel a frame and goes no faster than a quarter of how far the
+	; point is past the threshold, so it starts and catches up gently (it went from still
+	; to full speed in a frame, and caught up 7 or 8 pixels at once), never less than the
+	; least move and never past the point. Where it ends up is as before.
+	move.w	(FollowWindow).w,d2	; d2 = camera + right threshold
+	add.w	d6,d2
+	move.w	d0,d3
+	sub.w	d2,d3
+	bgt.s	.goRight
+	move.w	(FollowWindow+2).w,d2	; d2 = camera + left threshold
+	add.w	d6,d2
+	move.w	d2,d3
+	sub.w	d0,d3
+	bgt.s	.goLeft
+	clr.l	(CoopCamV).w		; inside the window: still
+	bra.s	.placed
+.goRight:
+	move.w	(CoopCamV).w,d7
+	bpl.s	.easeRight
+	moveq	#0,d7			; (it was going the other way)
+	clr.w	(CoopCamF).w
+.easeRight:
+	bsr.s	.ease
+	move.w	d7,(CoopCamV).w
+	move.w	d2,d0
+	add.w	d3,d0
+	bra.s	.placed
+.goLeft:
+	move.w	(CoopCamV).w,d7
+	neg.w	d7
+	bpl.s	.easeLeft
+	moveq	#0,d7
+	clr.w	(CoopCamF).w
+.easeLeft:
+	move.w	d5,d4
+	bsr.s	.ease
+	neg.w	d7
+	move.w	d7,(CoopCamV).w
+	move.w	d2,d0
+	sub.w	d3,d0
+	bra.s	.placed
+; d3 how far past the threshold the point is (> 0), d7 the speed that way, d4 the least
+; move: d3 the move, d7 the new speed.
+.ease:
+	move.w	d2,-(a7)
+	addi.w	#$40,d7
+	move.w	#$2000,d2		; at most a quarter of the distance (32 pixels at most)
+	cmpi.w	#128,d3
+	bge.s	.far
+	move.w	d3,d2
+	lsl.w	#6,d2
+.far:
+	cmp.w	d2,d7
+	ble.s	.speedOk
+	move.w	d2,d7
+.speedOk:
+	move.w	(CoopCamF).w,d2
+	add.w	d7,d2
+	move.b	d2,(CoopCamF+1).w
+	clr.b	(CoopCamF).w
+	lsr.w	#8,d2
+	cmp.w	d4,d2
+	bge.s	.leastOk
+	move.w	d4,d2
+.leastOk:
+	cmp.w	d3,d2
+	ble.s	.mostOk
+	move.w	d3,d2
+.mostOk:
+	move.w	d2,d3
+	move.w	(a7)+,d2
+	rts
 .placed:
 	movem.l	(a7)+,d4-d7/a1-a2
 .limit2:
@@ -910,6 +1076,44 @@ CoopRevive:
 	move.w	$14(a2),d1
 	subq.w	#8,d1
 	move.w	d1,$14(a0)
+	; Popped beside the other player standing on the ground (his saved state at P2State on
+	; either turn): on his footing, no lower than his feet and within 8 pixels of him. The
+	; bubble bobs 8 pixels about his feet, so popped on its low half he came out under a
+	; narrow platform's top and fell through it (the user's report).
+	movem.l	d3-d4,-(a7)
+	btst	#0,(P2Ground).w
+	beq.s	.placed
+	move.w	(P2State+$10).w,d3
+	move.w	d3,d4
+	sub.w	$10(a0),d4		; dx: the other less the bubble
+	cmpi.w	#32,d4
+	bgt.s	.placed
+	cmpi.w	#-32,d4
+	blt.s	.placed
+	move.w	(P2State+$14).w,d4
+	sub.w	d1,d4			; dy: the other's feet less his
+	cmpi.w	#32,d4
+	bgt.s	.placed
+	cmpi.w	#-32,d4
+	blt.s	.placed
+	tst.w	d4
+	bge.s	.high			; above the other's feet already
+	move.w	(P2State+$14).w,$14(a0)
+.high:
+	move.w	$10(a0),d4
+	sub.w	d3,d4			; his X less the other's, to -8..8
+	cmpi.w	#8,d4
+	ble.s	.notRight
+	moveq	#8,d4
+.notRight:
+	cmpi.w	#-8,d4
+	bge.s	.notLeft
+	moveq	#-8,d4
+.notLeft:
+	add.w	d3,d4
+	move.w	d4,$10(a0)
+.placed:
+	movem.l	(a7)+,d3-d4
 	clr.w	$16(a0)
 	clr.l	$18(a0)
 	clr.l	$1C(a0)
@@ -2517,4 +2721,56 @@ CoopOrbTiles:
 	move.w	(a7)+,sr
 	movem.l	(a7)+,d1/a2-a3
 .done:
+	rts
+
+; The boss flashing white after the orbs' burst (MizrabelSpawnD1, $010AD8, in place of
+; move.w #$FC,$10(a1) after it has put object $D1, a sparkle, in a1; the rest of the routine is
+; here): a sparkle every 8 frames from the orb, at X $FC and Y $160, out in one of 8
+; directions in turn (velocities at $06890A, lives at $06892A, the turn at $2A of the boss).
+; In co-op it comes from each orb held up: Mickey's, and Player 2's at the mirror of it (X
+; $1C4, its X velocity mirrored); Player 2's alone when Mickey isn't in the script (dead or out
+; of tries at the last hit), where his came from the empty spot Mickey would hold.
+CoopSparkleD1:
+	moveq	#1,d2			; who holds an orb: bit 0 Mickey, bit 1 Player 2
+	tst.b	(CoopFinale).w
+	bpl.s	.who
+	move.b	(CoopFinaleIn).w,d2
+	bne.s	.who
+	moveq	#1,d2
+.who:
+	moveq	#0,d3
+	move.b	$2A(a0),d3		; the turn
+	btst	#0,d2
+	beq.s	.p2
+	move.w	#$FC,d4
+	bsr.s	.sparkle		; (a1: the one MizrabelSpawnD1 found)
+	btst	#1,d2
+	beq.s	.turn
+	moveq	#2,d0
+	jsr	($00A5C0).l		; FindObject: a free slot
+	tst.w	(a1)
+	bne.s	.turn			; (none free)
+	move.w	#$D1,(a1)
+.p2:
+	move.w	#2*FinaleMiddle-$FC,d4
+	bsr.s	.sparkle
+	neg.w	$18(a1)
+.turn:
+	addq.b	#1,$2A(a0)
+	cmpi.b	#8,$2A(a0)
+	bcs.s	.done
+	move.b	#0,$2A(a0)
+.done:
+	rts
+; a1: the sparkle at X d4, Y $160, with turn d3's velocity and life.
+.sparkle:
+	move.w	d4,$10(a1)
+	move.w	#$160,$14(a1)
+	move.w	d3,d0
+	lsl.w	#2,d0
+	lea	($06890A).l,a2
+	move.w	(a2,d0.w),$18(a1)
+	move.w	2(a2,d0.w),$1C(a1)
+	lea	($06892A).l,a2
+	move.b	(a2,d3.w),$26(a1)
 	rts

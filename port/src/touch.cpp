@@ -118,6 +118,8 @@ bool finger_on_forward(const Layout& l, const Finger& f)
 void touch_init(SDL_Window* window)
 {
     g_window = window;
+    if (SDL_IsTV())                                 // no touch screen: a remote or a controller
+        g_shown = false;
 }
 
 bool touch_shown()

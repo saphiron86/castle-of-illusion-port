@@ -11,6 +11,10 @@ src/*.asm
 !src/header.asm
 # MD+ soundtrack packs (a patched ROM and the music): supplied by you, like the ROM
 mdplus/
+# Texture packs (art redrawn from your ROM's dump): supplied by you, like the ROM
+texture_packs/*
+!texture_packs/README.txt
+artpack/
 *.7z
 
 # Third-party libraries, fetched by tools/fetch_deps.py

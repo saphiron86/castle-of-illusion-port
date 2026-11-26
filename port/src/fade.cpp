@@ -17,6 +17,8 @@ namespace {
 constexpr int kVotes = 3;           // colours that must step together to start a fade
 constexpr int kFadeGap = 16;        // frames without fade steps that end a fade
 constexpr int kMaxLength = 10;      // longest ease, in frames
+constexpr int kStepLength = 8;      // ease_steps: frames between the game's steps (stage 4's night)
+constexpr int kMaxStepColours = 16; // ease_steps: more colours changed at once are a new palette
 
 int level(uint16_t cram, int channel) { return (cram >> (1 + channel * 4)) & 7; }
 
@@ -56,10 +58,11 @@ void FadeSmoother::update(const uint16_t* cram)
     }
 
     // Does this frame look like a fade step?
-    int up = 0, down = 0;
+    int up = 0, down = 0, changed = 0;
     for (int i = 0; i < 64; i++) {
         if (cram[i] == source[i])
             continue;
+        changed++;
         int sign = 0;
         bool single = true;
         for (int ch = 0; ch < 3; ch++) {
@@ -102,6 +105,11 @@ void FadeSmoother::update(const uint16_t* cram)
                 c.start = frame - 1;
                 c.length = interval;
                 c.last_step = frame;
+            } else if (ease_steps && changed <= kMaxStepColours) {
+                c.from = shown(c, frame);
+                c.to = (float)now;
+                c.start = frame - 1;
+                c.length = kStepLength;
             } else {
                 c.from = c.to = (float)now;
                 c.length = 0;

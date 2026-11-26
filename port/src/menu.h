@@ -3,8 +3,17 @@
 
 #include <SDL3/SDL.h>
 
+#include <string>
+#include <vector>
+
 #include "cheats.h"
 #include "display.h"
+
+// A save slot's picture (Game > Save Slot's tooltips): an OpenGL texture, 0 for none.
+struct SlotPicture {
+    unsigned texture = 0;
+    int width = 0, height = 0;
+};
 
 struct MenuState {
     bool widescreen;            // current setting
@@ -43,14 +52,42 @@ struct MenuState {
     int camera_x, camera_y;     // CameraA ($FFFA84, $FFFA80)
     bool check_for_updates;     // the setting
     const char* update_tag;     // a newer release's tag (nullptr: none found)
+    bool* coop_camera;          // Co-op Dynamic Camera, edited in place
+    bool gpu_renderer;          // GPU Renderer: the setting
+    bool gpu_available;         // false once the GPU renderer could not start (the CPU draws)
+    // Texture Packs (Graphics): the setting, the packs found (folder names) and the one chosen
+    // (-1: none), the one loading (nullptr: none), and why packs don't show now (nullptr:
+    // they do).
+    bool texture_packs;
+    const std::vector<std::string>* texture_pack_names;
+    int texture_pack;
+    const char* texture_pack_loading;
+    float texture_pack_progress;    // 0-1, while one loads (shown at the top, menu open or not)
+    const char* texture_pack_blocked;
+    bool* smooth_animation;     // Smooth Animation (Enhancements > Graphics > Enhancements), edited in place
+    bool busy_corner;           // `busy` in the bottom left corner instead of the centre (clear of the Sega
+                                // logo), its bar as wide as the text and with no percentage (an estimate)
+    bool* clear_fm;             // Enhancements > Audio, edited in place
+    bool* clean_psg;            // edited in place
+    bool* low_pass;             // edited in place
+    bool* stage4_storm;         // Weather - Stage 4 (Enhancements > Graphics > Enhancements), edited in place
+    // Save states (Game > Save, Load, Save Slot): the slot in use (1-5), each slot's line
+    // (5), and why Save and Load are off now (nullptr: they aren't).
+    int save_slot;
+    const std::string* slot_labels;
+    const SlotPicture* slot_pictures;   // (5) the game as each slot was saved
+    const char* states_blocked;
 };
 
-enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, ImportMdPlus, OpenSettingsFolder, GoToStage, QuickSettings, OpenReleases, ToggleUpdateCheck };
+enum class MenuAction { None, Reset, Exit, ToggleWidescreen, ToggleFullscreen, ToggleEasyBounce, ToggleSmoothSwing, ToggleSmoothScroll, ToggleMdPlus, ImportMdPlus, OpenSettingsFolder, GoToStage, QuickSettings, OpenReleases, ToggleUpdateCheck, ToggleGpuRenderer, ToggleTexturePacks, ChooseTexturePack, AllEnhancements, SaveState, LoadState, ChooseSaveSlot };
 
 struct MenuChoice {
     MenuAction action = MenuAction::None;
     int stage = 0;              // for GoToStage: 1-28
     int quick = 0;              // for QuickSettings: the one chosen (Quick in settings.h)
+    int texture_pack = 0;       // for ChooseTexturePack: its place in texture_pack_names
+    int save_slot = 1;          // for ChooseSaveSlot: 1-5
+    bool all_on = false;        // for AllEnhancements: All On (else All Off)
     bool save_settings = false; // the CRT settings changed and should be saved
     bool cheats_changed = false;    // a cheat was switched: rebuild the ROM (and save)
 };
@@ -65,6 +102,10 @@ bool menu_open();
 // Shows or hides the menu. Opened from a controller, it takes the controller's focus at
 // once (A selects, B goes back and, at the top level, closes the menu).
 void menu_toggle(bool from_gamepad = false);
+
+// A TV remote drives the menu (tv_remote.h): its keys keep the bar focused, as a controller's
+// buttons do, since there is no mouse to click it with.
+void menu_remote_nav(bool on);
 
 // True while the menu has keyboard focus (its keys must not reach the game).
 bool menu_wants_keyboard();

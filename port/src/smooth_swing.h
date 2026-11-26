@@ -15,3 +15,6 @@ std::string apply_smooth_swing(std::vector<uint8_t>& rom);
 // Converts vine objects already in RAM between the two animations, so switching the setting
 // mid-swing keeps each vine where it is in its swing.
 void convert_swing_objects(uint8_t* ram, bool to_smooth);
+
+// True for a vine's or rope's animation script pointer (object +6), original or smooth.
+bool is_swing_script(uint32_t script);

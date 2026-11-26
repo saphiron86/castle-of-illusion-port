@@ -19,6 +19,7 @@ namespace {
 
 bool g_open = false;
 SDL_Window* g_menu_window = nullptr;
+bool g_remote_nav = false;                          // menu_remote_nav: the keyboard keeps the bar focused like a controller
 bool g_focus_bar = false;                           // put the nav cursor on the first menu next frame
 int g_last_menu = 0;                                // index of the top-level menu last opened
 // Short messages at the top of the screen (menu_notice): each until its time is up, fading
@@ -218,6 +219,10 @@ bool menu_event(const SDL_Event& event)
     case SDL_EVENT_KEY_UP:
         // The port's own hotkeys always reach it: once a menu has been opened and closed, the
         // bar keeps the keyboard, and F1 couldn't close the menu until a click elsewhere.
+#ifdef __ANDROID__
+        if (event.key.key == SDLK_ESCAPE)               // a TV remote's Back (tv_remote.cpp)
+            return false;
+#endif
         if (event.key.key == SDLK_F1 || event.key.key == SDLK_AC_BACK || event.key.key == SDLK_F2 || event.key.key == SDLK_F3
             || event.key.key == SDLK_F4 || event.key.key == SDLK_F11 || event.key.key == SDLK_F12
             || (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)))
@@ -247,6 +252,8 @@ void menu_toggle(bool from_gamepad)
     }
 }
 
+void menu_remote_nav(bool on) { g_remote_nav = on; }
+
 bool menu_wants_keyboard() { return g_open && ImGui::GetIO().WantCaptureKeyboard; }
 
 MenuChoice menu_frame(const MenuState& state)
@@ -264,7 +271,7 @@ MenuChoice menu_frame(const MenuState& state)
         // keyboard: an unfocused bar lets the game have the arrow keys.)
         const ImGuiContext& g = *ImGui::GetCurrentContext();
         const bool refocus = g_focus_bar
-            || (g.NavInputSource == ImGuiInputSource_Gamepad && g.NavWindow != bar && !g_crt_window
+            || ((g.NavInputSource == ImGuiInputSource_Gamepad || g_remote_nav) && g.NavWindow != bar && !g_crt_window
                 && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId));
         if (g_focus_bar)
             g_last_menu = 0;
@@ -286,6 +293,43 @@ MenuChoice menu_frame(const MenuState& state)
         if (begin_menu("Game")) {
             if (ImGui::MenuItem("Reset", "Ctrl+R"))
                 choice.action = MenuAction::Reset;
+            ImGui::Separator();
+            const bool states = !state.states_blocked;
+            if (ImGui::MenuItem("Save", "F5", false, states))
+                choice.action = MenuAction::SaveState;
+            if (states)
+                ImGui::SetItemTooltip("Saves the game as it is now to slot %d.", state.save_slot);
+            else
+                ImGui::SetItemTooltip("%s.", state.states_blocked);
+            if (ImGui::MenuItem("Load", "F7", false, states))
+                choice.action = MenuAction::LoadState;
+            if (states)
+                ImGui::SetItemTooltip("Goes back to the game saved in slot %d.", state.save_slot);
+            else
+                ImGui::SetItemTooltip("%s.", state.states_blocked);
+            if (ImGui::BeginMenu("Save Slot")) {
+                for (int slot = 1; slot <= 5; slot++)
+                {
+                    if (ImGui::MenuItem(state.slot_labels[slot - 1].c_str(), nullptr, state.save_slot == slot)) {
+                        choice.action = MenuAction::ChooseSaveSlot;
+                        choice.save_slot = slot;
+                    }
+                    // The game as it was saved, a quarter of the window across in a small window
+                    // down to a sixth in a large one, so it stays big enough to make out.
+                    const SlotPicture& picture = state.slot_pictures[slot - 1];
+                    if (picture.texture && picture.width > 0 && ImGui::BeginItemTooltip()) {
+                        const ImVec2 screen = ImGui::GetIO().DisplaySize;
+                        const float t = std::clamp((screen.x - 1280.0f) / (2560.0f - 1280.0f), 0.0f, 1.0f);
+                        float w = screen.x * (0.25f + t * (1.0f / 6.0f - 0.25f));
+                        float h = w * picture.height / picture.width;
+                        if (h > screen.y * 0.5f)
+                            h = screen.y * 0.5f, w = h * picture.width / picture.height;
+                        ImGui::Image((ImTextureID)picture.texture, ImVec2(w, h));
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::EndMenu();
+            }
             ImGui::Separator();
             if (state.update_tag) {
                 char label[96];
@@ -388,57 +432,120 @@ MenuChoice menu_frame(const MenuState& state)
                     ImGui::SetItemTooltip("Put an MD+ pack (its .cue, .md and WAV files) in a folder named mdplus\n"
                                           "beside rom/ to play its soundtrack instead of the game's music.");
 #endif
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear FM", nullptr, *state.clear_fm)) {
+                    *state.clear_fm = !*state.clear_fm;
+                    choice.save_settings = true;
+                }
+                ImGui::SetItemTooltip("The FM sound chip without the \"ladder effect\", the distortion of the first\n"
+                                      "consoles' YM2612 that adds a buzzy hiss to quiet notes and fades. It sounds\n"
+                                      "as the later consoles' chip does. Off: as the first consoles.");
+                if (ImGui::MenuItem("Clean PSG", nullptr, *state.clean_psg)) {
+                    *state.clean_psg = !*state.clean_psg;
+                    choice.save_settings = true;
+                }
+                ImGui::SetItemTooltip("The square-wave chip (high notes, drums and noise) without the faint,\n"
+                                      "out-of-tune overtones the port's simpler mixing let through.");
+                if (ImGui::MenuItem("Model 1 Low-Pass", nullptr, *state.low_pass)) {
+                    *state.low_pass = !*state.low_pass;
+                    choice.save_settings = true;
+                }
+                ImGui::SetItemTooltip("The authentic Genesis sound: the output filter of the first Mega Drive /\n"
+                                      "Genesis (Model 1), which softens the treble for a warmer, a bit more muddy\n"
+                                      "sound, as through the console's own audio out. Off: the full, clear sound.");
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Graphics")) {
-                if (ImGui::MenuItem("Smooth Swinging", nullptr, state.smooth_swing, state.smooth_swing_available))
-                    choice.action = MenuAction::ToggleSmoothSwing;
-                ImGui::SetItemTooltip(state.smooth_swing_available
-                    ? "Vines and ropes swing at 60 frames a second instead of 10."
-                    : "The swing patches do not match this ROM.");
+                if (ImGui::BeginMenu("Enhancements")) {
+                    if (ImGui::MenuItem("All On")) {
+                        choice.action = MenuAction::AllEnhancements;
+                        choice.all_on = true;
+                    }
+                    ImGui::SetItemTooltip("Switches on every enhancement in this menu.");
+                    if (ImGui::MenuItem("All Off")) {
+                        choice.action = MenuAction::AllEnhancements;
+                        choice.all_on = false;
+                    }
+                    ImGui::SetItemTooltip("Switches off every enhancement in this menu: the picture as in the original.");
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Smooth Swinging", nullptr, state.smooth_swing, state.smooth_swing_available))
+                        choice.action = MenuAction::ToggleSmoothSwing;
+                    ImGui::SetItemTooltip(state.smooth_swing_available
+                        ? "Vines and ropes swing at 60 frames a second instead of 10."
+                        : "The swing patches do not match this ROM.");
 #ifdef __ANDROID__
-                // Off with cleanEdge on a phone (main.cpp): shown unticked and greyed out.
-                const bool scroll_blocked = *state.hqx == kCleanEdge && !state.crt->enabled;
+                    // Off with cleanEdge on a phone (main.cpp): shown unticked and greyed out.
+                    const bool scroll_blocked = *state.hqx == kCleanEdge && !state.crt->enabled;
 #else
-                const bool scroll_blocked = false;
+                    const bool scroll_blocked = false;
 #endif
-                if (ImGui::MenuItem("Smooth Scrolling", nullptr, state.smooth_scroll && !scroll_blocked, !scroll_blocked))
-                    choice.action = MenuAction::ToggleSmoothScroll;
-                ImGui::SetItemTooltip(scroll_blocked
-                    ? "Not available with cleanEdge on a phone: it would be too much for the GPU."
-                    : "Scrolling moves in even steps, using fractions of a pixel, instead of the\n"
-                      "game's uneven whole-pixel steps.");
-                if (ImGui::MenuItem("Clean Rock Edges", nullptr, *state.clean_rock_edges)) {
-                    *state.clean_rock_edges = !*state.clean_rock_edges;
-                    choice.save_settings = true;
+                    if (ImGui::MenuItem("Smooth Scrolling", nullptr, state.smooth_scroll && !scroll_blocked, !scroll_blocked))
+                        choice.action = MenuAction::ToggleSmoothScroll;
+                    ImGui::SetItemTooltip(scroll_blocked
+                        ? "Not available with cleanEdge on a phone: it would be too much for the GPU."
+                        : "Scrolling moves in even steps, using fractions of a pixel, instead of the\n"
+                          "game's uneven whole-pixel steps.");
+                    if (ImGui::MenuItem("Clean Rock Edges", nullptr, *state.clean_rock_edges)) {
+                        *state.clean_rock_edges = !*state.clean_rock_edges;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("In the forest, the black gaps between stones no longer show as black\n"
+                                          "notches where the rock walls meet the background. Off: as in the original.");
+                    if (ImGui::MenuItem("Smooth Fades", nullptr, *state.smooth_fades)) {
+                        *state.smooth_fades = !*state.smooth_fades;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("Fades in and out between screens change colour smoothly instead of in\n"
+                                          "the game's few steps. Off: as in the original.");
+                    if (ImGui::MenuItem("Smooth Water", nullptr, *state.smooth_water)) {
+                        *state.smooth_water = !*state.smooth_water;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("Water the game draws with dithering (the tea, the flooded castle, the\n"
+                                          "waterfalls and their foam, Toyland's jello) is see-through instead, and\n"
+                                          "flowing water moves smoothly. Off: as in the original.");
+                    if (ImGui::MenuItem("Smooth Glass", nullptr, *state.smooth_glass)) {
+                        *state.smooth_glass = !*state.smooth_glass;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("The library's glass jars, which the game draws with dithering, are\n"
+                                          "see-through instead. Off: as in the original.");
+                    if (ImGui::MenuItem("Remove Sprite Limit", nullptr, *state.remove_sprite_limit)) {
+                        *state.remove_sprite_limit = !*state.remove_sprite_limit;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("The console shows at most 20 sprites on a line and drops the rest, so busy\n"
+                                          "lines lose parts of sprites. With this on, every sprite is drawn.");
+#ifndef __ANDROID__
+                    if (ImGui::MenuItem("Co-op Dynamic Camera", nullptr, *state.coop_camera)) {   // (no co-op on Android yet)
+                        *state.coop_camera = !*state.coop_camera;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip("Two-player co-op: the picture zooms in a little while the players are close\n"
+                                          "together (more once both have stood still a moment; not in boss stages),\n"
+                                          "and out by a tenth while they are far apart. Only the picture changes: the\n"
+                                          "game, its camera and the HUD are as they are.");
+#endif
+                    const bool animation_ok = state.gpu_renderer && state.gpu_available;
+                    if (ImGui::MenuItem("Smooth Animation", nullptr, *state.smooth_animation && animation_ok, animation_ok)) {
+                        *state.smooth_animation = !*state.smooth_animation;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip(animation_ok
+                        ? "Many animations throughout the game are smoother.\n"
+                          "See the project's documentation (Settings) for the full list."
+                        : "Drawn by the GPU renderer: switch it on in the Debug menu.");
+                    if (ImGui::MenuItem("Weather - Stage 4", nullptr, *state.stage4_storm && animation_ok, animation_ok)) {
+                        *state.stage4_storm = !*state.stage4_storm;
+                        choice.save_settings = true;
+                    }
+                    ImGui::SetItemTooltip(animation_ok
+                        ? "In stage 4, about ten seconds after night falls, it starts to rain, with\n"
+                          "lightning now and then and thunder after it. No rain under the rock.\n"
+                          "Only the picture and the sound change: the game plays as it does."
+                        : "Drawn by the GPU renderer: switch it on in the Debug menu.");
+                    ImGui::EndMenu();
                 }
-                ImGui::SetItemTooltip("In the forest, the black gaps between stones no longer show as black\n"
-                                      "notches where the rock walls meet the background. Off: as in the original.");
-                if (ImGui::MenuItem("Smooth Fades", nullptr, *state.smooth_fades)) {
-                    *state.smooth_fades = !*state.smooth_fades;
-                    choice.save_settings = true;
-                }
-                ImGui::SetItemTooltip("Fades in and out between screens change colour smoothly instead of in\n"
-                                      "the game's few steps. Off: as in the original.");
-                if (ImGui::MenuItem("Smooth Water", nullptr, *state.smooth_water)) {
-                    *state.smooth_water = !*state.smooth_water;
-                    choice.save_settings = true;
-                }
-                ImGui::SetItemTooltip("Water the game draws with dithering (the tea, the flooded castle, the\n"
-                                      "waterfalls and their foam, Toyland's jello) is see-through instead, and\n"
-                                      "flowing water moves smoothly. Off: as in the original.");
-                if (ImGui::MenuItem("Smooth Glass", nullptr, *state.smooth_glass)) {
-                    *state.smooth_glass = !*state.smooth_glass;
-                    choice.save_settings = true;
-                }
-                ImGui::SetItemTooltip("The library's glass jars, which the game draws with dithering, are\n"
-                                      "see-through instead. Off: as in the original.");
-                if (ImGui::MenuItem("Remove Sprite Limit", nullptr, *state.remove_sprite_limit)) {
-                    *state.remove_sprite_limit = !*state.remove_sprite_limit;
-                    choice.save_settings = true;
-                }
-                ImGui::SetItemTooltip("The console shows at most 20 sprites on a line and drops the rest, so busy\n"
-                                      "lines lose parts of sprites. With this on, every sprite is drawn.");
                 ImGui::Separator();
                 if (ImGui::BeginMenu("Upscaler", !state.crt->enabled)) {
 #ifdef __ANDROID__
@@ -500,6 +607,34 @@ MenuChoice menu_frame(const MenuState& state)
                     g_crt_window = true;
                     g_focus_crt_window = true;
                 }
+                // Texture Packs: on or off, and which of the packs in texture_packs/ to draw with.
+                ImGui::SeparatorText("Texture Packs (Experimental)");
+                const std::vector<std::string>& packs = *state.texture_pack_names;
+                if (ImGui::MenuItem("Use a Texture Pack", nullptr, state.texture_packs))
+                    choice.action = MenuAction::ToggleTexturePacks;
+                if (state.texture_pack_blocked)
+                    ImGui::SetItemTooltip("%s", state.texture_pack_blocked);
+                else
+                    ImGui::SetItemTooltip("Draws the game with redrawn art from the pack chosen below, at four times the\n"
+                                          "size. Each pack is a folder in a folder named texture_packs beside rom/.\n"
+                                          "Experimental: still being worked on, so you may run into bugs.");
+                if (packs.empty()) {
+                    ImGui::TextDisabled("No packs in texture_packs/");
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_DelayShort))
+                        ImGui::SetTooltip("Put each pack in its own folder in a folder named texture_packs beside rom/\n"
+                                          "(texture_packs/<pack name>/, laid out as coi-art-dump's art-dump folder).\n"
+                                          "Packs added while the game runs show after switching Use a Texture Pack off and on.");
+                }
+                ImGui::BeginDisabled(!state.texture_packs);
+                for (int i = 0; i < (int)packs.size(); i++) {
+                    const bool loading = state.texture_pack_loading && packs[i] == state.texture_pack_loading;
+                    if (ImGui::MenuItem(packs[i].c_str(), loading ? "loading..." : nullptr, i == state.texture_pack)
+                        && i != state.texture_pack) {
+                        choice.action = MenuAction::ChooseTexturePack;
+                        choice.texture_pack = i;
+                    }
+                }
+                ImGui::EndDisabled();
                 ImGui::EndMenu();
             }
             ImGui::EndMenu();
@@ -568,6 +703,17 @@ MenuChoice menu_frame(const MenuState& state)
             }
             ImGui::SetItemTooltip("Shows the stage, Mickey's position and the camera's in the top right\n"
                                   "(below the FPS counter when that is on), for reporting where something happened.");
+            // On unless it gives trouble: here rather than in Graphics, so players switch it off
+            // only when the picture looks wrong or the game runs badly with it.
+            ImGui::Separator();
+            if (ImGui::MenuItem("GPU Renderer", nullptr, state.gpu_renderer && state.gpu_available, state.gpu_available))
+                choice.action = MenuAction::ToggleGpuRenderer;
+            ImGui::SetItemTooltip(state.gpu_available
+                ? "The picture is drawn by the graphics card, which takes most of the drawing\n"
+                  "off the processor; it looks exactly the same. Leave it on: switch it off only if\n"
+                  "the picture looks wrong or the game runs badly, and the processor draws it."
+                : "Not available: the graphics card could not start it, so the processor draws\n"
+                  "the picture.");
             ImGui::EndMenu();
         }
         // At the right, inside the safe area (clear of a phone's camera cutout): with the touch
@@ -668,18 +814,40 @@ MenuChoice menu_frame(const MenuState& state)
         }
         ImGui::End();
     }
-    if (state.busy) {
-        // Centred over the game, with a progress bar when there is progress to show.
+    if (state.texture_pack_loading) {
+        // A texture pack being read: its name and a progress bar at the top centre.
         const ImGuiViewport* view = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x / 2, view->Pos.y + view->Size.y / 2),
-                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x / 2, view->Pos.y + ImGui::GetFontSize() * 3),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                                     | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
+                                     | ImGuiWindowFlags_NoSavedSettings;
+        if (ImGui::Begin("##texture_pack", nullptr, flags)) {
+            ImGui::Text("Loading texture pack: %s", state.texture_pack_loading);
+            ImGui::ProgressBar(state.texture_pack_progress, ImVec2(ImGui::GetFontSize() * 20, 0));
+        }
+        ImGui::End();
+    }
+    if (state.busy) {
+        // Centred over the game (or in the bottom left corner), with a progress bar when there
+        // is progress to show.
+        const ImGuiViewport* view = ImGui::GetMainViewport();
+        const float margin = ImGui::GetFontSize();
+        if (state.busy_corner)
+            ImGui::SetNextWindowPos(ImVec2(view->WorkPos.x + margin, view->WorkPos.y + view->WorkSize.y - margin),
+                                    ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        else
+            ImGui::SetNextWindowPos(ImVec2(view->Pos.x + view->Size.x / 2, view->Pos.y + view->Size.y / 2),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
                                      | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing
                                      | ImGuiWindowFlags_NoSavedSettings;
         if (ImGui::Begin("##busy", nullptr, flags)) {
             ImGui::TextUnformatted(state.busy);
-            if (state.busy_progress >= 0)
-                ImGui::ProgressBar(state.busy_progress, ImVec2(ImGui::GetFontSize() * 16, 0));
+            if (state.busy_progress >= 0)       // (in the corner: as wide as the text, no percentage)
+                ImGui::ProgressBar(state.busy_progress, ImVec2(state.busy_corner ? -FLT_MIN : ImGui::GetFontSize() * 16, 0),
+                                   state.busy_corner ? "" : nullptr);
         }
         ImGui::End();
     }

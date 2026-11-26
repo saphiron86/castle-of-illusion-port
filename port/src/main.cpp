@@ -14,7 +14,10 @@
 //   --show-fps   start with the FPS counter shown (Video)
 //   --interpolate start with High Refresh Interpolation on (Video); --no-interpolate off
 //   --frame-rate N start at frame rate N: 60, 120 or 240, or 0 for the display's (Video)
+//   --coop-camera, --no-coop-camera  start with Co-op Dynamic Camera on or off (Enhancements > Graphics)
 //   --mdplus, --no-mdplus  play the MD+ pack in mdplus/ or not (Enhancements > Audio);
+//   --clear-fm, --clean-psg, --model1-low-pass  start with that sound enhancement on (Enhancements >
+//                Audio; headless runs have them off otherwise); --no-clear-fm, --no-clean-psg off
 //   --log-mdplus print the MD+ commands the game sends (testing)
 //   --cheat NAME switch a cheat on for this run (Cheats): invincibility, infinite-power,
 //                infinite-tries, infinite-items, infinite-continues, full-power, walk-faster,
@@ -27,26 +30,45 @@
 // Menu settings are remembered between runs (settings.cpp); the options above apply to
 // this run only. Headless runs ignore the saved settings.
 // While running: F1 opens the menu, F11 or Alt+Enter toggles fullscreen, F12 the CRT shader,
-// Ctrl+R resets, F2/F3/F4 pick the Quick Settings (Enhanced, Vanilla, Custom); holding
+// Ctrl+R resets, F5 saves a state and F7 loads it (Game > Save Slot), F2/F3/F4 pick the Quick
+// Settings (Enhanced, Vanilla, Custom); holding
 // Backspace (or a controller's Y) fast-forwards the story scenes 4x (kFastForward).
-// Testing (headless): --poke FRAME:ADDR=VALUE, --poke-file FILE, --peek ADDR, --watch ADDR, --ram FILE,
+// Testing (headless): --poke FRAME:ADDR=VALUE (a word; FRAME:ADDR.b=VALUE a byte), --poke-file FILE, --peek ADDR, --watch ADDR, --ram FILE,
 //   --vram FILE, --cram FILE (CRAM, registers, VSRAM), --wav FILE, --log-state, --log-ram ADDR, --trace-vdp, --no-sprite-masking,
 //   --capture FRAME FILE (windowed: save the window's picture after FRAME frames, then quit)
 //   Debug builds: F9 saves the frame and the --ram/--vram/--cram files as snapshots/snapN.* beside
 //   the exe (--snapshots DIR to save them elsewhere); --sprite-capture DIR (headless) saves the
-//   VRAM and CRAM behind each sprite set the run shows (see capture_sprites)
+//   VRAM and CRAM behind each sprite set the run shows (see capture_sprites); --vdp-every N DIR
+//   (headless) saves RAM, VRAM and CRAM every N frames as DIR/fFRAME.* (the art dump's screens)
 //   --switch-widescreen FRAME, --switch-smooth-swing FRAME, --reset FRAME, --go-to-stage FRAME:STAGE (the menu's
 //   actions, at the start of a frame)
 //   --frames N   run N frames without a window, then exit (with --dump: save the last frame);
 //                strictly N pictures, which are more game frames with --fast-forward
 //   --fast-forward FIRST-LAST  hold fast forward over pictures FIRST-LAST (also windowed)
+//   --gpu-vdp: the GPU renderer (gpu_vdp.h, docs/notes/native-renderer.md) draws the frames it
+//   can (all but water or Clean Rock Edges together with a strip rule): a window's default
+//   (Debug > GPU Renderer), off headless unless asked; --no-gpu-vdp: off for
+//   this run; --gpu-vdp-check: drawn by both, and each compared (also headless: a hidden window
+//   gives it OpenGL), the differences printed.
+//   --between N  (headless) draw N pictures between each two frames, as interpolation at (N + 1) x 60 Hz
+//   does (for timing, and with --gpu-vdp-check to check them; that with --interp-back draws 3);
+//   --layers  (headless) with --hqx and Smooth Scrolling, draw the layers a window would (for
+//   timing; --gpu-vdp does it by itself)
 //   --state-hash FILE  (headless) write each game frame's number, picture and machine hash
+//   --save-state-at N FILE  (headless) save a state as game frame N ends
+//   --load-state FILE  (headless) start from a save state; game frames count on from its own
 //   --show-touch show the touch controls on a desktop too (windowed)
 //   --interp-back X  with --dump: draw the last frame as interpolation would X frames earlier (0-1)
 //   --refresh HZ treat the display as running at HZ (windowed; for testing the pacing)
 //   --no-native  run the game on the interpreter only (builds with the translator, COI_JIT, run
 //                its translation of the ROM by default; docs/native.md)
 //   --press      hold a button (up/down/left/right/a/b/c/start) for a range of frames (also windowed)
+//   --dump-tiles DIR  save each tile the game shows as DIR/<hash>.png (8 x 8, in its colours), with
+//                the colours in DIR/palettes.txt: the start of an art pack (artpack.h)
+//   --art-pack DIR  draw with the art pack in DIR (otherwise, in a window, the one chosen in
+//                Graphics > Texture Packs from texture_packs/, found as rom/ is; headless, an artpack
+//                folder found so); --no-art-pack: none. The GPU renderer draws it, without an
+//                upscaler or the CRT shader
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -59,6 +81,7 @@
 #include <thread>
 #include <unistd.h>
 #endif
+#include "artpack.h"
 #include "touch.h"
 #include "icon_data.h"
 #ifdef COI_NATIVE
@@ -76,10 +99,14 @@
 #endif
 
 #include <algorithm>
+#include <future>
 #include <map>
+#include <memory>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -90,16 +117,22 @@
 #include "cheats.h"
 #include "display.h"
 #include "fade.h"
+#include "gpu_vdp.h"
 #include "interp.h"
+#include "smooth_animation.h"
+#include "storm.h"
 #include "mdplus.h"
 #include "menu.h"
 #include "update_check.h"
 #include "coop.h"
+#include "tv_remote.h"
 
 #ifdef __ANDROID__
 constexpr const char* kMenuHint = "Press Back to open the Menu";
+constexpr bool kEscapeIsBack = true;                // a TV remote's Back comes as Escape (tv_remote.cpp)
 #else
 constexpr const char* kMenuHint = "Press F1 to open the Menu";
+constexpr bool kEscapeIsBack = false;
 #endif
 #include "patches.h"
 #include "rom_family.h"
@@ -108,6 +141,7 @@ constexpr const char* kMenuHint = "Press F1 to open the Menu";
 #include "smooth_swing.h"
 #include "sound.h"
 #include "stages.h"
+#include "state_io.h"
 #include "vdp.h"
 
 extern "C" {
@@ -215,6 +249,8 @@ bool g_coop_rom = false;                            // the image has co-op's pat
 bool g_easy_bounce = false;
 bool g_clean_rock_edges = true;                     // Enhancements > Graphics > Clean Rock Edges
 bool g_smooth_fades = true;                         // Enhancements > Graphics > Smooth Fades (fade.cpp)
+bool g_storm = false;                               // Enhancements > Graphics > Weather - Stage 4 (storm.h)
+int g_storm_forced = -1;                            // --storm 1, --no-storm 0: for this run, whatever the setting
 bool g_smooth_water = true;                         // Enhancements > Graphics > Smooth Water
 bool g_smooth_glass = true;                         // Enhancements > Graphics > Smooth Glass
 FadeSmoother g_fade;
@@ -240,13 +276,45 @@ std::vector<uint16_t> g_b_sprite_tiles;           // see run_frame: first tile (
 // (with kLayerMargin extra pixels each side), which the display enlarges one by one and
 // moves by the smoother's fractions of a pixel. g_scale stays 1.
 constexpr int kLayerMargin = 2;
-constexpr int kLayerStride = kWideWidth + 2 * kLayerMargin;   // room for any width
+// Co-op Zoom's zoom out (docs/notes/coop.md, "Zooming out"): while it can zoom out, the frame
+// is drawn a tenth wider (kOverscanWidth more pixels each side of the 400 or 320; the planes
+// always hold 112 pixels left of the camera and 385 right) and the lines under the HUD that
+// the wider picture's shape needs (kOverscanRows from kOverscanSplit, the HUD's first line)
+// are drawn a second time without the HUD (the window plane) and the sprites' masking. Near a
+// level's bottom, where the rows under the HUD are never meant to be seen (the HUD always hides
+// the level's last 32 lines; stage 27's arena has filler there), g_overscan_above of them are
+// lines above the view instead, drawn with the planes and sprites moved down. The frame's rows:
+// the lines above, the view's play lines, the lines under the HUD (kOverscanRows in all), then
+// the HUD's lines.
+constexpr int kOverscanSplit = 192, kOverscanRows = 20;
+constexpr int kMaxOutWidth = kWideWidth + kWideWidth / 10;
+constexpr int kFrameRows = Vdp::kScreenHeight + kOverscanRows;
+bool g_overscan_wanted = false;                     // co-op level play with zoom out on (set per frame)
+bool g_overscan = false;                            // this frame is drawn so
+int g_overscan_above = 0;                           // of its kOverscanRows, the rows above the view
+int g_frame_rows = Vdp::kScreenHeight;
+bool g_scroll_replay = false;                       // smooth_scroll repeats an answer (the second pass)
+bool g_scroll_replay_own = false;                   // ... this line's own (lines above the view)
+// The line whose scrolling a line being drawn follows: its own, except that Co-op Zoom's lines
+// under the HUD (the second pass, g_scroll_replay) follow the last line of play, as their
+// scroll does (Vdp::line_scroll). With High Refresh Interpolation they took the HUD's lines'
+// movement between frames (none), so they stepped once a frame while the rest moved smoothly:
+// the user's "the bottom of the screen twitches".
+extern Vdp g_vdp;
+int scroll_line(int line)
+{
+    const int split = (g_vdp.reg[18] & 0x1F) * 8;
+    return g_scroll_replay && !g_scroll_replay_own && (g_vdp.reg[18] & 0x80) && split > 0 && line >= split
+               ? split - 1 : line;
+}
+int g_scroll_last[2] = {0, 0};
+constexpr int kLayerStride = kMaxOutWidth + 2 * kLayerMargin;   // room for any width
 bool g_layered = false;
 std::vector<uint32_t> g_layers[LayeredFrame::kLayers];
 std::vector<uint32_t> g_water_layers[2];            // Smooth Water: plane A's water, low and high priority
 static_assert(LayeredFrame::kLayers == Vdp::LineLayers::kCount, "layer counts differ");
-float g_line_shifts[Vdp::kScreenHeight * 4];
-uint32_t g_line_backdrop[Vdp::kScreenHeight];
+float g_line_shifts[kFrameRows * 4];                // per frame row
+uint32_t g_line_backdrop[kFrameRows];
 int g_layer_clip_left = 0, g_layer_clip_right = 0;
 constexpr int kLines = 262;                         // NTSC
 constexpr int kCyclesPerLine = 488;                 // 7.67 MHz / 59.92 Hz / 262 lines
@@ -602,33 +670,35 @@ bool extend_plane_b(int view_x, int line, int& plane_x, int& plane_y)
     return false;
 }
 
-// Draws one line as layers (g_layered), with the shifts that move them when drawn.
-void render_layer_line(Vdp& vdp, int line, bool wide)
+// Draws one line as layers (g_layered) into the frame's row `row`, with the shifts that move
+// them when drawn.
+void render_layer_line(Vdp& vdp, int line, int row_index, bool wide)
 {
+    const bool full = wide || g_overscan;           // the whole frame's width is the view
     const int stride = g_out_width + 2 * kLayerMargin;
     // Outside widescreen play, the original 320 pixels sit in the middle of the frame.
-    const int border = wide ? 0 : (g_out_width - kWidth) / 2;
+    const int border = full ? 0 : (g_out_width - kWidth) / 2;
     // There the margins are the black border, as in the flat picture (the game never shows
     // what lies beyond those 320 pixels); elsewhere they hold the planes beyond the edge.
     const int margin = border ? 0 : kLayerMargin;
     Vdp::LineLayers layers;
     for (int i = 0; i < Vdp::LineLayers::kCount; i++) {
-        uint32_t* row = &g_layers[i][line * stride];
+        uint32_t* row = &g_layers[i][row_index * stride];
         std::fill(row, row + stride, i == 0 && border ? 0xFF000000u : 0u);
         layers.layer[i] = row + border + kLayerMargin - margin;
     }
     for (int i = 0; i < 2; i++) {
-        uint32_t* row = &g_water_layers[i][line * stride];
+        uint32_t* row = &g_water_layers[i][row_index * stride];
         std::fill(row, row + stride, 0u);
         layers.water[i] = row + border + kLayerMargin - margin;
     }
     layers.sub_scale = kSubpixels;
-    if (wide)
-        vdp.render_line(line, nullptr, kWideWidth + 2 * margin, kWideMargin + margin, 1, &layers);
+    if (full)
+        vdp.render_line(line, nullptr, g_out_width + 2 * margin, (g_out_width - kWidth) / 2 + margin, 1, &layers);
     else
         vdp.render_line(line, nullptr, kWidth + 2 * margin, margin, 1, &layers);
 
-    float* shift = &g_line_shifts[line * 4];
+    float* shift = &g_line_shifts[row_index * 4];
     shift[0] = layers.window_line ? 0.0f : (float)layers.sub_a / kSubpixels;   // the window stays put
     shift[1] = (float)layers.sub_sprites / kSubpixels;                          // sprites move with plane A
     shift[2] = (float)layers.sub_b / kSubpixels;
@@ -639,7 +709,7 @@ void render_layer_line(Vdp& vdp, int line, bool wide)
     // moves with the layer in front of it, its hidden pixels take the front pixel's colour.
     using L = Vdp::LineLayers;
     const float moves[L::kCount] = {shift[2], shift[0], shift[1], shift[2], shift[0], shift[3], shift[1]};
-    const int count = (wide ? kWideWidth : kWidth) + 2 * margin;
+    const int count = (full ? g_out_width : kWidth) + 2 * margin;
     for (int x = 0; x < count; x++) {
         int top = L::kCount - 1;
         while (top > 0 && !layers.layer[top][x])
@@ -648,27 +718,70 @@ void render_layer_line(Vdp& vdp, int line, bool wide)
             if (moves[i] == moves[top])
                 layers.layer[i][x] = layers.layer[top][x];
     }
-    g_line_backdrop[line] = layers.backdrop;
+    g_line_backdrop[row_index] = layers.backdrop;
     g_layer_clip_left = border;
-    g_layer_clip_right = wide ? g_out_width : border + kWidth;
+    g_layer_clip_right = full ? g_out_width : border + kWidth;
 }
 
-// Draws one line: widened during level play, otherwise the original 320
-// pixels, centred with black borders when the frame buffer is wider.
-void render_line(Vdp& vdp, int line, uint32_t* row, bool wide)
+// Draws one line into the frame's row `row_index`: widened during level play, otherwise the
+// original 320 pixels, centred with black borders when the frame buffer is wider.
+void render_line(Vdp& vdp, int line, int row_index, uint32_t* pixels, bool wide)
 {
     if (g_layered) {
-        render_layer_line(vdp, line, wide);
+        render_layer_line(vdp, line, row_index, wide);
         return;
     }
-    if (wide) {
-        vdp.render_line(line, row, kWideWidth, kWideMargin, g_scale);
+    uint32_t* const row = pixels + row_index * g_out_width * g_scale;
+    if (wide || g_overscan) {
+        vdp.render_line(line, row, g_out_width, (g_out_width - kWidth) / 2, g_scale);
         return;
     }
     const int border = (g_out_width - kWidth) / 2 * g_scale, row_width = g_out_width * g_scale;
     for (int x = 0; x < border; x++)
         row[x] = row[row_width - 1 - x] = 0xFF000000;
     vdp.render_line(line, row + border, kWidth, 0, g_scale);
+}
+
+// Draws one line of the frame where it belongs: as render_line, and while overscanning
+// (g_overscan) the HUD's lines go below the extra rows, and the first kOverscanRows of them
+// are drawn a second time, without the window plane and the sprites' masking, as the picture
+// of play under the HUD. That second pass repeats the first's smooth scrolling (the smoother
+// keeps one history per line and frame).
+// The rows a line is drawn into (as render_frame_line below), with `vdp` set as for each:
+// calls draw(row) once per row.
+template <class Draw>
+void frame_line_passes(Vdp& vdp, int line, Draw draw)
+{
+    const bool hud = g_overscan && line >= kOverscanSplit;
+    const int above = g_overscan ? g_overscan_above : 0;
+    draw(line + (hud ? kOverscanRows : above));
+    if (line < above) {                             // a row above the view: line - above, drawn here
+        uint16_t vsram[40];
+        std::memcpy(vsram, vdp.vsram, sizeof(vsram));
+        for (uint16_t& v : vdp.vsram)
+            v = (uint16_t)((v - above) & 0x7FF);
+        vdp.sprite_y_shift = above;
+        g_scroll_replay = g_scroll_replay_own = true;
+        draw(line);
+        g_scroll_replay = g_scroll_replay_own = false;
+        vdp.sprite_y_shift = 0;
+        std::memcpy(vdp.vsram, vsram, sizeof(vsram));
+    }
+    if (!hud || line >= kOverscanSplit + kOverscanRows - above)
+        return;
+    const bool masking = vdp.sprite_masking;
+    vdp.sprite_masking = false;
+    vdp.ignore_window = true;
+    g_scroll_replay = true;
+    draw(line + above);
+    g_scroll_replay = false;
+    vdp.ignore_window = false;
+    vdp.sprite_masking = masking;
+}
+
+void render_frame_line(Vdp& vdp, int line, uint32_t* pixels, bool wide)
+{
+    frame_line_passes(vdp, line, [&](int row) { render_line(vdp, line, row, pixels, wide); });
 }
 
 // Smooth Water: the big waterfalls of stages 11-13 flow by palette cycling: every 3 frames
@@ -939,6 +1052,44 @@ void set_flow_colours(Vdp& vdp, std::vector<uint32_t>& out, double back)
     } else {
         vdp.plane_b_rgb = nullptr;
     }
+}
+
+// Smooth Water: stage 12's river (the flood under the floor, plane B rows 24-29, tiles
+// 513-619 on palette line 3). It moves only by plane B's scroll: the game moves its background
+// camera ($FFFAC4) 8 pixels a frame (plus the camera's own parallax), and every 16 frames
+// takes it 48 pixels back, as if the band repeated every 48 pixels; it repeats every 144 (18
+// tiles), so the waves jump right by 40 pixels four times a second. With this on, those
+// snaps are taken out of what is drawn: a change of scroll that is 48 (or 96) pixels off the
+// frame before's step is drawn as that step, the difference kept as an offset to plane B
+// (taken modulo the plane's 512 pixels). Only plane B's picture moves; the game's camera and
+// everything else are untouched.
+void update_river(bool on, uint16_t state)
+{
+    static int last = -1, step = 0, add = 0;
+    const int stage = g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43];
+    g_vdp.plane_b_hs_add = 0;
+    if (!on || state != 0x0E || stage != 11) {
+        last = -1, add = 0;
+        return;
+    }
+    int hs_a, hs_b;
+    g_vdp.line_scroll(0, hs_a, hs_b);               // the game's own (plane_b_hs_add is 0 here)
+    if (last >= 0) {
+        int d = (hs_b - last) & 0x3FF;
+        if (d >= 512)
+            d -= 1024;
+        const int off = d - step, snaps = (int)std::lround(off / 48.0);
+        if (snaps != 0 && std::abs(snaps) <= 2 && std::abs(off - snaps * 48) <= 6) {
+            add -= snaps * 48;
+            d -= snaps * 48;
+        }
+        step = d;
+    } else {
+        step = 0;
+    }
+    last = hs_b;
+    add &= 0x1FF;                                   // (plane B is 512 pixels wide)
+    g_vdp.plane_b_hs_add = add;
 }
 
 // Smooth Water: stage 10's waterspouts (object $0E, sprites from tile 848 to 917 on palette
@@ -1555,12 +1706,25 @@ void fill_plain_palette(PaletteOverride& out, const uint16_t* cram)
 // High Refresh Interpolation (interp.cpp): the last two game frames, and a second VDP that
 // redraws the current one for a moment between them.
 FrameInterpolator g_interp;
+bool g_smooth_animation = false;                    // Smooth Animation (Enhancements > Graphics > Enhancements; smooth_animation.h)
 bool g_interp_capture = false;                      // snapshots are being taken
 Vdp g_interp_vdp(g_bus);
 
 // Draws the current game frame as it was `back` frames earlier (0-1) into `pixels` (or the
 // layers), moving the planes and sprites back along their movement since the previous frame.
-void render_interpolated(uint32_t* pixels, double back)
+bool gpu_vdp_plain(const Vdp& v);
+void gpu_capture(GpuVdp* gpu, const Vdp& v, int line, int row, bool wide);
+int gpu_draw_and_check(GpuVdp* gpu, bool wide, const uint32_t* pixels, const char* what, long long number,
+                       long long& differ_count);
+extern GpuVdp* g_gpu_between;
+extern bool g_gpu_check;
+extern long long g_gpu_between_pictures, g_gpu_between_differ;
+void gpu_vdp_report();
+
+// Draws the picture `back` of a frame before the current one (0-1). With --gpu-vdp, when the
+// GPU can draw it, it does (and the CPU too with --gpu-vdp-check, to compare): returns the GPU
+// that drew it then (its picture, or its layers), otherwise nullptr (in `pixels` or the layers).
+GpuVdp* render_interpolated(uint32_t* pixels, double back)
 {
     const FrameInterpolator::Snapshot& now = g_interp.current();
     const FrameInterpolator::Snapshot& before = g_interp.previous();
@@ -1570,6 +1734,7 @@ void render_interpolated(uint32_t* pixels, double back)
     v.extend_plane_a_inside = g_vdp.extend_plane_a_inside;
     v.extend_plane_b = g_vdp.extend_plane_b;
     v.extend_plane_b_inside = g_vdp.extend_plane_b_inside;
+    v.plane_b_hs_add = g_vdp.plane_b_hs_add;
     v.strip_b_priority_right = g_vdp.strip_b_priority_right;
     v.strip_fill_in_front = g_vdp.strip_fill_in_front;
     v.strip_fill_in_front_left = g_vdp.strip_fill_in_front_left;
@@ -1581,6 +1746,7 @@ void render_interpolated(uint32_t* pixels, double back)
     v.edge_tiles = g_vdp.edge_tiles;
     v.water_tiles = g_vdp.water_tiles;
     v.hidden_sprites = g_vdp.hidden_sprites;
+    smooth_animation::between(v, g_vdp, back);
     spout_overlays(v, back);
     set_flow_colours(v, g_flow_rgb_back, back);
     set_tile_swaps(v, back);
@@ -1596,6 +1762,7 @@ void render_interpolated(uint32_t* pixels, double back)
             fill_plain_palette(g_fade_palette_back, g_vdp.cram);
         for (const WaterCycle& cycle : g_water_cycles)
             cycle.apply(g_fade_palette_back, back);
+        storm::apply(g_fade_palette_back, back);
         v.palette = &g_fade_palette_back;
     }
     v.sprite_masking = g_vdp.sprite_masking;
@@ -1629,8 +1796,8 @@ void render_interpolated(uint32_t* pixels, double back)
 
     v.scroll_at_scale_1 = true;
     v.smooth_scroll = [](int line, int, int, int scale, int& sub_a, int& sub_b) {
-        sub_a = (int)std::lround(shift[line][0] * scale);
-        sub_b = (int)std::lround(shift[line][1] * scale);
+        sub_a = (int)std::lround(shift[scroll_line(line)][0] * scale);
+        sub_b = (int)std::lround(shift[scroll_line(line)][1] * scale);
     };
     // The camera's part of a level sprite's movement: how much further right than in the
     // current frame it puts things at this moment. From the smoother's fitted camera movement
@@ -1639,6 +1806,11 @@ void render_interpolated(uint32_t* pixels, double back)
     const bool camera_smoothed = smoothing && g_scroll_smoother.camera_a_at(back, camera_then)
                                  && g_scroll_smoother.camera_a_at(0, camera_now);
     const double camera_smoothing = camera_then - camera_now;
+    // Stage 8 upside down ($FFFF9801 set, toggled by its turn, GameState $10): DrawObject puts
+    // each sprite at Y $1C0 - Y - its height (sub_001C56), so an object moving down moves up on
+    // screen. The objects' and the camera's vertical movement is turned round to match; before,
+    // the pictures between frames moved Mickey the wrong way while he jumped or fell.
+    const int flip_y = g_bus.ram[0x9801] ? -1 : 1;
     v.sprite_offset = [&](int index, int line, uint16_t attr, int scale, int& dx, int& dy) {
         // Each sprite goes back along its object's movement and the camera's; sprites not
         // drawn by an object (masks, borders) stay put. The renderer moves sprites with plane
@@ -1649,7 +1821,7 @@ void render_interpolated(uint32_t* pixels, double back)
         const bool moving = g_interp.sprite_motion(index, mx, my, cx, cy, screen);
         const double camera = !moving || screen ? 0.0 : camera_smoothed ? camera_smoothing : back * cx;
         const int follow = moving ? (int)std::lround(-back * mx * scale) + (int)std::lround(camera * scale) : 0;
-        dy = moving ? (int)std::lround(-back * my) + (int)std::lround(back * cy) : 0;
+        dy = moving ? flip_y * ((int)std::lround(-back * my) + (int)std::lround(back * cy)) : 0;
         if (v.sprite_moves_with_b && v.sprite_moves_with_b(attr)) {
             dx = follow;                            // drawn with the frame's camera B shift
             return;
@@ -1666,16 +1838,21 @@ void render_interpolated(uint32_t* pixels, double back)
                 dx = (int)std::lround(-back * mx * scale) + (camera_smoothed ? 0 : (int)std::lround(back * cx * scale));
             return;
         }
-        const int plane_a = (int)std::lround(shift[line][0] * scale);
-        const int frame_a = (int)std::lround(shift_now[line][0] * scale);
+        const int plane_a = (int)std::lround(shift[scroll_line(line)][0] * scale);
+        const int frame_a = (int)std::lround(shift_now[scroll_line(line)][0] * scale);
         dx = follow + frame_a - plane_a;
     };
     const double layer_camera = camera_smoothed ? camera_smoothing : 0.0;
     v.sprite_layer_shift = [layer_camera](int line, int scale) {
-        return (int)std::lround((shift_now[line][0] + layer_camera) * scale);
+        return (int)std::lround((shift_now[scroll_line(line)][0] + layer_camera) * scale);
     };
 
-    uint32_t* const row_base = pixels;
+    GpuVdp* gpu = g_gpu_between && gpu_vdp_plain(v) ? g_gpu_between : nullptr;
+    if (gpu) {
+        gpu->layered = g_layered;
+        gpu->scale = gpu->hd ? GpuVdp::kHdScale : g_layered ? 1 : g_scale;
+        gpu->begin_frame(g_frame_rows);
+    }
     for (int line = 0; line < Vdp::kScreenHeight; line++) {
         const FrameInterpolator::Line& l = now.lines[line];
         const FrameInterpolator::Line& p = before.lines[line];
@@ -1685,11 +1862,23 @@ void render_interpolated(uint32_t* pixels, double back)
             const int d = scroll_difference(p.vsram[i] & 0x3FF, l.vsram[i] & 0x3FF);
             v.vsram[i] = d >= -32 && d <= 32 ? (uint16_t)((l.vsram[i] - std::lround(back * d)) & 0x7FF) : l.vsram[i];
         }
-        render_line(v, line, row_base + line * g_out_width * g_scale, now.wide);
+        frame_line_passes(v, line, [&](int row) {
+            if (gpu)
+                gpu_capture(gpu, v, line, row, now.wide);
+            if (!gpu || g_gpu_check)
+                render_line(v, line, row, pixels, now.wide);
+        });
+    }
+    if (gpu) {
+        gpu_draw_and_check(gpu, now.wide, pixels, "picture between frames", g_gpu_between_pictures, g_gpu_between_differ);
+        g_gpu_between_pictures++;
+        if (g_gpu_check && g_gpu_between_pictures % 1200 == 0)   // (a running total, as for frames)
+            gpu_vdp_report();
     }
     v.sprite_offset = nullptr;
     v.sprite_layer_shift = nullptr;
     v.smooth_scroll = nullptr;
+    return gpu;
 }
 
 void set_smooth_scroll(bool on)
@@ -1716,6 +1905,87 @@ void fix_spawn_grid(uint16_t level, uint16_t act)
         return;
     grid[kCell5] = 1;
     grid[kCell6] = 0;
+}
+
+// The grid column of the spawn entry whose spawned byte is at `spawned` (an object's $24), or -1.
+int spawn_column(const uint8_t* ram, uint16_t spawned)
+{
+    const uint8_t* grid = &ram[0xCA00];
+    const int width = grid[2], height = grid[3];
+    const uint16_t lists = grid[0] << 8 | grid[1];
+    if (!lists || width * height == 0 || 4 + width * height > lists)
+        return -1;
+    for (int cell = 0; cell < width * height; cell++) {
+        const int list = grid[4 + cell];
+        if (!list)
+            continue;
+        const uint32_t at = 0xCA00 + lists + 2 * (list - 1);
+        const uint32_t start = 0xCA00 + lists + (ram[at & 0xFFFF] << 8 | ram[(at + 1) & 0xFFFF]);
+        const uint32_t offset = ((uint32_t)spawned - (start + 4)) & 0xFFFF;
+        if (offset % 9 == 0 && (int)(offset / 9) <= ram[start & 0xFFFF])
+            return cell % width;
+    }
+    return -1;
+}
+
+// Widescreen spawns a column of objects 40 pixels early (UpdateSpawns, patches.cpp), and a
+// vine or rope starts its swing as it spawns, so in widescreen each swing ran ahead of the
+// console's: stage 1's first vine swung away just as Mickey reached it, where on the console
+// he can grab it at once. A vine spawned early is held where it spawned (its animation bytes,
+// +6 to +$C, put back after every frame) until the frame the console's own crossing spawns
+// its column (moving right, column (X + 384) / 128 as X crosses a multiple of 128; moving
+// left, (X - 113) / 128), and from there it swings exactly as on the console. It is still
+// past the view's edge while held.
+struct VineHold {
+    uint16_t entry = 0;   // the object's $24 (its spawn entry), 0: not a vine
+    bool held = false;
+    int column = 0;
+    uint8_t anim[7] = {};
+};
+VineHold g_vine_holds[(0xF000 - 0xC000) / 0x40];
+int g_vine_camera_x = -1;   // the camera's X after the last level frame, -1: none
+
+void hold_early_vines(bool level)
+{
+    uint8_t* ram = g_bus.ram;
+    if (!level) {
+        g_vine_camera_x = -1;
+        for (VineHold& h : g_vine_holds)
+            h = VineHold{};
+        return;
+    }
+    const int x = (int16_t)(ram[0xFA84] << 8 | ram[0xFA85]);
+    const int last = g_vine_camera_x;
+    g_vine_camera_x = x;
+    // A widened column crossing this frame (X + 40 or X - 40 over a multiple of 128): the
+    // only way a column spawns early. The level's first frame spawns as the console does.
+    const bool crossed = last >= 0 && (((x + 40) >> 7 != (last + 40) >> 7) || ((x - 40) >> 7 != (last - 40) >> 7));
+    const auto console_has = [x](int column) { return x >= column * 128 - 384 && x < column * 128 + 241; };
+    for (uint32_t o = 0xC000; o < 0xF000; o += 0x40) {
+        uint8_t* obj = ram + o;
+        VineHold& h = g_vine_holds[(o - 0xC000) / 0x40];
+        const uint32_t script = (uint32_t)obj[6] << 24 | obj[7] << 16 | obj[8] << 8 | obj[9];
+        const uint16_t entry = obj[0x24] << 8 | obj[0x25];
+        if (!(obj[0] | obj[1]) || !is_swing_script(script) || !entry) {
+            h = VineHold{};
+            continue;
+        }
+        if (h.entry != entry) {                     // spawned this frame
+            h = VineHold{};
+            h.entry = entry;
+            h.column = crossed ? spawn_column(ram, entry) : -1;
+            h.held = h.column >= 0 && !console_has(h.column);
+            std::memcpy(h.anim, obj + 6, sizeof(h.anim));
+            continue;
+        }
+        if (!h.held)
+            continue;
+        if (std::memcmp(h.anim, obj + 6, 4) != 0)   // Smooth Swinging switched: held as converted
+            std::memcpy(h.anim, obj + 6, sizeof(h.anim));
+        else
+            std::memcpy(obj + 6, h.anim, sizeof(h.anim));
+        h.held = !console_has(h.column);
+    }
 }
 
 // Spawn entries the widescreen SpawnCell patch marked missed (bit 1 of the spawned byte, no
@@ -1769,13 +2039,12 @@ void retry_missed_spawns()
     }
 }
 
-#ifndef NDEBUG
-// --sprite-capture DIR (Debug builds, headless): for each sprite set an object shows (its
+// --sprite-capture DIR (headless; the art dump's sweep, artdump.cpp): for each sprite set an object shows (its
 // mapping table at $6 and tile base at $4), once the object has been alive for 8 frames,
 // save VRAM, CRAM and the palette at $FFF800 (what fades move towards) as DIR/capN.vram,
 // .cram and .pal, and add a line to DIR/captures.txt
 // (N, stage index, object ID, mapping address, tile base, RAM slot, frame). The animation
-// frames are drawn from these by a script outside the repository.
+// frames are drawn from these by coi-art-dump (artdump.cpp).
 void save_state(const std::string& ram_path, const std::string& vram_path, const std::string& cram_path);
 
 void capture_sprites(const std::string& dir, int frame)
@@ -1806,12 +2075,40 @@ void capture_sprites(const std::string& dir, int frame)
                 }
             }
         }
-        if (s.age != 8 || mapping == 0 || mapping >= 0x80000 || (mapping & 1))
+        if (s.age < 8 || mapping == 0 || mapping >= 0x80000 || (mapping & 1))   // (shown 8 frames)
             continue;
         const uint64_t full = (uint64_t)stage << 56 | (uint64_t)id << 48 | (uint64_t)base << 32 | mapping;
+        // Its palette line without colours yet (one colour in CRAM and in the fade's target):
+        // captured, but again once it has them (the dump keeps a set's last capture). Stage
+        // 28's Mizrabel shows before her colours are loaded, and was dumped all black.
+        const int line = (base >> 13) & 3;
+        auto colours = [&](const uint16_t* c) {
+            int n = 0;
+            for (int i = 1; i < 16; i++) {
+                bool again = false;
+                for (int j = 1; j < i; j++)
+                    again |= (c[line * 16 + j] & 0xEEE) == (c[line * 16 + i] & 0xEEE);
+                n += !again;
+            }
+            return n;
+        };
+        uint16_t target[64];
+        for (int i = 0; i < 64; i++)
+            target[i] = (uint16_t)w(0xF800 + i * 2);
+        const bool blank = colours(g_vdp.cram) <= 1 && colours(target) <= 1;
+        static std::vector<uint64_t> blank_seen;
         if (std::find(seen.begin(), seen.end(), full) != seen.end())
             continue;
-        seen.push_back(full);
+        const auto was_blank = std::find(blank_seen.begin(), blank_seen.end(), full);
+        if (was_blank != blank_seen.end()) {
+            if (blank)
+                continue;
+            blank_seen.erase(was_blank);
+        }
+        if (blank)
+            blank_seen.push_back(full);
+        else
+            seen.push_back(full);
         const std::string name = dir + "/cap" + std::to_string(++captures);
         save_state("", name + ".vram", name + ".cram");
         if (FILE* f = std::fopen((name + ".pal").c_str(), "wb")) {   // the palette fades move towards
@@ -1824,7 +2121,6 @@ void capture_sprites(const std::string& dir, int frame)
         }
     }
 }
-#endif
 
 #ifdef COI_TIMING_LOG
 // Performance check (logged with the frame timings in main; Android builds made with
@@ -1958,6 +2254,7 @@ void write_block_column(uint32_t camera, uint32_t plane, int block)
             g_vdp.vram[a] = (uint8_t)(cells[k] >> 8);
             g_vdp.vram[a + 1] = (uint8_t)cells[k];
         }
+        g_vdp.vram_writes++;                        // (for --gpu-vdp's copies)
         a1 += flipped ? (uint32_t)-width : (uint32_t)width;
     }
 }
@@ -2033,8 +2330,452 @@ void update_water_tiles(bool water, bool glass, uint16_t state)
         }
 }
 
+// --gpu-vdp (gpu_vdp.h): g_gpu is set while it is on (with an OpenGL context).
+GpuVdp* g_gpu = nullptr;
+bool g_gpu_check = false;                           // --gpu-vdp-check: the CPU draws them too
+bool g_gpu_frame = false;                           // this frame is drawn by the GPU
+bool g_gpu_wide = false;                            // and is widescreen play
+long long g_gpu_frames = 0, g_gpu_checked = 0, g_gpu_differ = 0, g_gpu_all_frames = 0;
+
+GpuVdp* g_gpu_between = nullptr;                    // --gpu-vdp's pictures between frames
+long long g_gpu_between_pictures = 0, g_gpu_between_differ = 0;
+long long g_gpu_layered = 0, g_gpu_clear_layers = 0;   // layered pictures, and their layers counted clear
+long long g_gpu_overscan_frames = 0, g_gpu_above_frames = 0;   // GPU frames with overscan's rows, and with rows above the view
+long long g_gpu_cpu_clear_layers = 0;                   // (checked) the layers the CPU left clear
+
+// True when the CPU renderer would draw this frame (or with `v`, a picture between frames) with
+// none of the port's additions but widescreen (with its strip rules), Smooth Scrolling (flat or
+// in layers), the pictures between frames, palette overrides (Smooth Fades) and Smooth Water
+// with its kin (Smooth Glass, the spouts, the background falls' colours, tile pictures),
+// Clean Rock Edges, co-op's recolour and overscan (co-op's zoom out, with its extra rows): all
+// but the background falls' colours together with a strip rule (never seen).
+bool gpu_vdp_plain(const Vdp& v = g_vdp)
+{
+    return !(v.plane_b_rgb && g_strip_rule != StripRule::None);
+}
+
+// render_line's width and left for a line of the frame (render_line in this file).
+// The layers' line shifts and backdrops as the GPU's capture found them (render_layer_line's
+// g_line_shifts and g_line_backdrop): copied there for the display, or compared with them.
+float g_gpu_line_shifts[kFrameRows * 4];             // (per frame row)
+uint32_t g_gpu_line_backdrop[kFrameRows];
+
+// The layers' frame (render_layer_line): texels across, where the view is, and black sides.
+struct LayerFrame { int stride, start, count, view_left, border; bool full; };
+LayerFrame layer_frame(bool wide)
+{
+    LayerFrame f;
+    f.full = wide || g_overscan;
+    f.border = f.full ? 0 : (g_out_width - kWidth) / 2;
+    const int margin = f.border ? 0 : kLayerMargin;
+    f.stride = g_out_width + 2 * kLayerMargin;
+    f.start = f.border + kLayerMargin - margin;
+    f.count = (f.full ? g_out_width : kWidth) + 2 * margin;
+    f.view_left = (f.full ? (g_out_width - kWidth) / 2 : 0) + margin;
+    return f;
+}
+
+void gpu_capture(GpuVdp* gpu, const Vdp& v, int line, int row, bool wide)
+{
+    if (gpu->layered) {
+        const LayerFrame f = layer_frame(wide);
+        gpu->capture_line(v, line, row, f.count, f.view_left);
+        int s[4];
+        bool window_line;
+        gpu->layer_line(row, s, window_line, g_gpu_line_backdrop[row]);
+        float* shift = &g_gpu_line_shifts[row * 4];   // (as render_layer_line works them out)
+        shift[0] = window_line ? 0.0f : (float)s[0] / kSubpixels;
+        shift[1] = (float)s[1] / kSubpixels;
+        shift[2] = (float)s[2] / kSubpixels;
+        shift[3] = (float)s[3] / kSubpixels;
+        return;
+    }
+    if (wide || g_overscan)
+        gpu->capture_line(v, line, row, g_out_width, (g_out_width - kWidth) / 2);
+    else
+        gpu->capture_line(v, line, row, kWidth, 0);
+}
+
+// Draws `gpu`'s captured picture; with --gpu-vdp-check, compares it with the CPU's in
+// `pixels`, counting into `differ`. Returns how many pixels differ.
+int gpu_draw_and_check(GpuVdp* gpu, bool wide, const uint32_t* pixels, const char* what, long long number,
+                       long long& differ_count)
+{
+    if (gpu->layered) {                             // the seven layers, the line shifts, the backdrops
+        const LayerFrame f = layer_frame(wide);
+        gpu->render_layers(f.stride, f.start, f.count, f.view_left, f.border != 0);
+        g_gpu_layered++;
+        for (unsigned clear = gpu->empty_layers(); clear; clear &= clear - 1)
+            g_gpu_clear_layers++;
+        g_layer_clip_left = f.border;
+        g_layer_clip_right = f.full ? g_out_width : f.border + kWidth;
+        if (!g_gpu_check) {
+            std::memcpy(g_line_shifts, g_gpu_line_shifts, sizeof(g_gpu_line_shifts));
+            std::memcpy(g_line_backdrop, g_gpu_line_backdrop, sizeof(g_gpu_line_backdrop));
+            return 0;
+        }
+        int differ = 0;
+        const char* first = nullptr;
+        int first_at = 0;
+        static std::vector<uint32_t> got;
+        const int n = f.stride * g_frame_rows;
+        const unsigned empty = gpu->empty_layers();     // (they must be: draw_layers skips them)
+        for (int i = 0; i < LayeredFrame::kLayers; i++)
+            if (std::all_of(g_layers[i].begin(), g_layers[i].begin() + n, [](uint32_t c) { return c == 0; }))
+                g_gpu_cpu_clear_layers++;
+        for (int i = 0; i < LayeredFrame::kLayers; i++)
+            for (int p = 0; empty >> i & 1 && p < n; p++)
+                if (g_layers[i][p] && !differ++) {
+                    static char name[64];
+                    std::snprintf(name, sizeof(name), "layer %d, counted clear (CPU %08X)", i, g_layers[i][p]);
+                    first = name, first_at = p;
+                }
+        for (int i = 0; i < LayeredFrame::kLayers; i++) {
+            gpu->read_layer(i, got);
+            for (int p = 0; p < n; p++)
+                if (got[p] != g_layers[i][p]) {
+                    if (!differ++) {
+                        static char name[64];
+                        std::snprintf(name, sizeof(name), "layer %d (GPU %08X, CPU %08X)", i, got[p], g_layers[i][p]);
+                        first = name, first_at = p;
+                    }
+                }
+        }
+        for (int i = 0; i < 2; i++) {                // Smooth Water's layers (clear when the GPU has none)
+            if (gpu->has_water())
+                gpu->read_water(i, got);
+            else
+                got.assign(n, 0u);
+            for (int p = 0; p < n; p++)
+                if (got[p] != g_water_layers[i][p] && !differ++) {
+                    static char name[64];
+                    std::snprintf(name, sizeof(name), "water layer %d (GPU %08X, CPU %08X)", i, got[p],
+                                  g_water_layers[i][p]);
+                    first = name, first_at = p;
+                }
+        }
+        for (int line = 0; line < g_frame_rows; line++) {
+            if (std::memcmp(&g_gpu_line_shifts[line * 4], &g_line_shifts[line * 4], 4 * sizeof(float)) && !differ++)
+                first = "line shifts", first_at = line * f.stride;
+            if (g_gpu_line_backdrop[line] != g_line_backdrop[line] && !differ++)
+                first = "backdrop", first_at = line * f.stride;
+        }
+        if (differ && ++differ_count <= 20)
+            std::printf("gpu-vdp: %s %lld differs in %d places, first %s at (%d, %d)\n", what, number, differ, first,
+                        first_at % f.stride, first_at / f.stride);
+        return differ;
+    }
+    if (wide || g_overscan)
+        gpu->render(g_out_width * gpu->scale, 0, g_out_width * gpu->scale, (g_out_width - kWidth) / 2);
+    else
+        gpu->render(g_out_width * gpu->scale, (g_out_width - kWidth) / 2 * gpu->scale, kWidth * gpu->scale, 0);
+    if (!g_gpu_check)
+        return 0;
+    static std::vector<uint32_t> got;
+    gpu->read(got);
+    const int n = g_out_width * g_scale * g_frame_rows;
+    int differ = 0, first = -1;
+    for (int i = 0; i < n; i++)
+        if (got[i] != pixels[i]) {
+            differ++;
+            if (first < 0)
+                first = i;
+        }
+    if (differ && ++differ_count <= 20)
+        std::printf("gpu-vdp: %s %lld differs in %d pixels, first at (%d, %d): GPU %08X, CPU %08X\n", what, number,
+                    differ, first % (g_out_width * g_scale), first / (g_out_width * g_scale), got[first], pixels[first]);
+    return differ;
+}
+
+// One line's drawing: captured for the GPU, and drawn by the CPU unless the GPU draws it alone.
+void video_line(int line, uint32_t* pixels, bool wide)
+{
+    if (!g_gpu) {
+        render_frame_line(g_vdp, line, pixels, wide);
+        return;
+    }
+    // Each row the line is drawn into (overscan: some lines twice): captured, then drawn by the
+    // CPU unless the GPU draws the frame alone. The smoother keeps a history, so it is asked
+    // once a row: the CPU's row replays the shifts the capture got.
+    frame_line_passes(g_vdp, line, [&](int row) {
+        gpu_capture(g_gpu, g_vdp, line, row, wide);
+        if (g_gpu_frame && !g_gpu_check)
+            return;
+        int sub_a, sub_b;
+        if (g_gpu_frame && g_gpu->line_shifts(row, sub_a, sub_b)) {
+            auto smooth = std::move(g_vdp.smooth_scroll);
+            g_vdp.smooth_scroll = [&](int, int, int, int, int& a, int& b) { a = sub_a, b = sub_b; };
+            render_line(g_vdp, line, row, pixels, wide);
+            g_vdp.smooth_scroll = std::move(smooth);
+        } else {
+            render_line(g_vdp, line, row, pixels, wide);
+        }
+    });
+}
+
+void gpu_vdp_report();
+
+// After a frame: the GPU draws it (when it is the GPU's), and with --gpu-vdp-check it is
+// compared with the CPU's picture in `pixels`; otherwise (`read_back`) the GPU's picture is
+// read into `pixels` (a headless run's last frame, for --dump). Returns the GPU that drew it (its
+// picture or layers to show), or nullptr.
+GpuVdp* gpu_vdp_finish(uint32_t* pixels, int frame, bool read_back)
+{
+    if (!g_gpu || !g_gpu_frame)
+        return nullptr;
+    gpu_draw_and_check(g_gpu, g_gpu_wide, pixels, "frame", frame, g_gpu_differ);
+    g_gpu_frames++;
+    if (g_gpu_check) {
+        g_gpu_checked++;
+        if (g_gpu_checked % 1200 == 0)                // (a running total: Android never reaches the end)
+            gpu_vdp_report();
+    } else if (read_back && !g_gpu->layered && !g_gpu->hd) {   // (an art pack's picture is bigger)
+        static std::vector<uint32_t> got;
+        g_gpu->read(got);
+        std::copy(got.begin(), got.end(), pixels);
+    }
+    return g_gpu;
+}
+
+void gpu_vdp_report()
+{
+    if (!g_gpu)
+        return;
+    std::printf("gpu-vdp: %lld of %lld frames drawn by the GPU", g_gpu_frames, g_gpu_all_frames);
+    if (g_gpu_check)
+        std::printf(", %lld checked, %lld differ", g_gpu_checked, g_gpu_differ);
+    std::printf("; VRAM copies %.2f a frame, at most %d", g_gpu_all_frames ? (double)g_gpu->copies / g_gpu_all_frames : 0.0,
+                g_gpu->most_copies);
+    std::printf("; %lld with remapped strips; scale %d%s", g_gpu->strip_frames, g_scale, g_layered ? ", layers" : "");
+    if (g_gpu_overscan_frames)
+        std::printf("; %lld with overscan (%lld with rows above)", g_gpu_overscan_frames, g_gpu_above_frames);
+    if (g_gpu->overlay_lines + g_gpu_between->overlay_lines)
+        std::printf("; %lld lines with overlays", g_gpu->overlay_lines + g_gpu_between->overlay_lines);
+    if (g_gpu->overlay_overflow + g_gpu_between->overlay_overflow)
+        std::printf("; %lld lines with too many overlay rows", g_gpu->overlay_overflow + g_gpu_between->overlay_overflow);
+    if (g_gpu_layered)
+        std::printf(" (%.2f of 7 counted clear", (double)g_gpu_clear_layers / g_gpu_layered);
+    if (g_gpu_layered && g_gpu_check)
+        std::printf(", %.2f clear on the CPU", (double)g_gpu_cpu_clear_layers / g_gpu_layered);
+    if (g_gpu_layered)
+        std::printf(")");
+    if (g_gpu_between_pictures)
+        std::printf("; %lld pictures between frames, %lld differ", g_gpu_between_pictures, g_gpu_between_differ);
+    if (g_gpu->gpu_renders)
+        std::printf("; GPU %.3f ms a frame", g_gpu->gpu_ms / g_gpu->gpu_renders);
+    std::printf("\n");
+}
+
+// Art packs (artpack.h): the pack loaded (--art-pack DIR, or an artpack folder found as rom/
+// is), which the GPU renderer draws in the flat picture, with no upscaler or CRT shader
+// (g_art_allowed); and --dump-tiles DIR's dump of the tiles shown.
+art::Pack* g_art_pack = nullptr;                    // the pack drawn (nullptr: none)
+bool g_art_allowed = true;
+art::Dumper* g_tile_dump = nullptr;
+
+// Sets up --gpu-vdp with the current OpenGL context; off (with a message) if it can't be.
+bool g_gpu_failed = false;                          // the GPU renderer could not start
+bool g_gpu_building = false;                        // its program is being built on a thread (gpu_shader)
+bool g_gpu_check_wanted = false;                    // (gpu_vdp_start's `check`, for after the build)
+bool g_gpu_wanted = false;                          // (switched off in the menu meanwhile: not put in place)
+
+void gpu_vdp_make(bool check)
+{
+    g_gpu = new GpuVdp;
+    g_gpu_between = new GpuVdp;
+    g_gpu_check = check;
+    g_gpu->timed = g_gpu_between->timed = check;  // (the report's GPU time; the wait is no cost to a check)
+    if (!g_gpu->init() || !g_gpu_between->init()) {
+        std::fprintf(stderr, "gpu-vdp: not available, the CPU draws every frame\n");
+        delete g_gpu;
+        delete g_gpu_between;
+        g_gpu = g_gpu_between = nullptr;
+        g_gpu_failed = true;
+        return;
+    }
+    if (g_art_pack)
+        g_gpu->pack = g_gpu_between->pack = g_art_pack;
+}
+
+// With `background`, a program that has to be built is built on a thread while the CPU draws
+// the frames (gpu_vdp_poll puts the GPU renderer in place once it is done); otherwise here.
+void gpu_vdp_start(bool check, bool background = false)
+{
+    g_gpu_wanted = true;
+    if (g_gpu)
+        return;
+    g_gpu_check_wanted = check;
+    switch (gpu_shader::start(background)) {
+    case gpu_shader::State::Building:
+        g_gpu_building = true;
+        break;
+    case gpu_shader::State::Ready:
+        gpu_vdp_make(check);
+        break;
+    default:
+        gpu_vdp_make(check);                        // (fails, with its message)
+        break;
+    }
+}
+
+// Called between frames: the GPU renderer in place once its program's build is done, if it
+// is still wanted.
+void gpu_vdp_poll()
+{
+    if (!g_gpu_building || gpu_shader::poll() == gpu_shader::State::Building)
+        return;
+    g_gpu_building = false;
+    if (g_gpu_wanted && !g_gpu)
+        gpu_vdp_make(g_gpu_check_wanted);
+}
+
+// The box shown over the game while the program builds (after the first half second): its
+// text and progress (estimated from the last build's time, so it never quite fills).
+// On the Shield (g_gpu_hold) the game waits at launch until the build is done, drawing only
+// this, so its first frames are the GPU renderer's.
+bool g_gpu_hold = false;
+
+std::string gpu_vdp_build_text(float& progress)
+{
+    if (!g_gpu_building)
+        return {};
+    const double elapsed = gpu_shader::elapsed(), expected = gpu_shader::expected();
+    if (elapsed < 0.5 && !g_gpu_hold)
+        return {};
+    progress = (float)std::min(elapsed / expected, 0.97);
+    const int left = (int)std::ceil(expected - elapsed);
+    std::string text = "Preparing the GPU renderer (once for each version)\n";
+    text += left >= 2 ? "About " + std::to_string(left) + " seconds left" : "Almost done";
+    return text;
+}
+
+// Graphics > Texture Packs: the packs found (each a folder in texture_packs/, found as rom/
+// is; an old-style artpack folder counts too), and the one wanted, loaded on a thread of its
+// own (thousands of pictures to read) and put in place between frames.
+struct TexturePacks {
+    std::vector<std::string> names;
+    std::vector<std::filesystem::path> dirs;
+    std::string drawn;                              // the pack in g_art_pack ("" none, or --art-pack's)
+    std::string wanted;                             // the pack to draw ("" none)
+    std::string loading;                            // the pack the thread is reading ("" none)
+    std::future<std::unique_ptr<art::Pack>> job;
+    std::shared_ptr<std::atomic<float>> progress = std::make_shared<std::atomic<float>>(0.0f);
+    bool hold_start = false;                        // the game waits for the pack chosen before (at launch)
+};
+TexturePacks g_packs;
+
+void find_texture_packs()
+{
+    g_packs.names.clear();
+    g_packs.dirs.clear();
+    auto add = [](const std::string& name, const std::filesystem::path& dir) {
+        if (std::find(g_packs.names.begin(), g_packs.names.end(), name) == g_packs.names.end()) {
+            g_packs.names.push_back(name);
+            g_packs.dirs.push_back(dir);
+        }
+    };
+    std::error_code error;
+    for (const auto& root : search_dirs("texture_packs")) {
+        if (!std::filesystem::is_directory(root, error))
+            continue;
+        std::vector<std::filesystem::path> found;
+        for (const auto& entry : std::filesystem::directory_iterator(root, error))
+            if (entry.is_directory(error))
+                found.push_back(entry.path());
+        std::sort(found.begin(), found.end());
+        for (const auto& dir : found)
+            add(dir.filename().string(), dir);
+    }
+    for (const auto& dir : search_dirs("artpack"))
+        if (std::filesystem::is_directory(dir, error)) {
+            add("artpack", dir);
+            break;
+        }
+}
+
+// Puts `pack` in place (nullptr: none) for both GPU renderers and frees the one before.
+void set_art_pack(art::Pack* pack, const std::string& name)
+{
+    art::Pack* old = g_art_pack;
+    g_art_pack = pack;
+    for (GpuVdp* gpu : {g_gpu, g_gpu_between})
+        if (gpu)
+            gpu->set_pack(pack);
+    delete old;
+    g_packs.drawn = name;
+}
+
+// Called every frame: starts reading the wanted pack, and puts it in place once read.
+void update_texture_pack()
+{
+    if (!g_packs.loading.empty()) {
+        if (g_packs.job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+            return;
+        std::unique_ptr<art::Pack> pack = g_packs.job.get();
+        const std::string name = g_packs.loading;
+        g_packs.loading.clear();
+        if (name == g_packs.wanted) {
+            if (pack) {
+                set_art_pack(pack.release(), name);
+                menu_notice(("Texture pack: " + name).c_str(), 3.0);
+            } else {
+                set_art_pack(nullptr, name);    // (not tried again until another is chosen)
+                menu_notice(("Texture pack " + name + " could not be used: it has no pictures it can draw").c_str(), 6.0);
+            }
+        }
+    }
+    if (g_packs.wanted == g_packs.drawn)
+        return;
+    auto at = std::find(g_packs.names.begin(), g_packs.names.end(), g_packs.wanted);
+    if (g_packs.wanted.empty() || at == g_packs.names.end()) {
+        set_art_pack(nullptr, g_packs.wanted);
+        return;
+    }
+    const std::filesystem::path dir = g_packs.dirs[at - g_packs.names.begin()];
+    g_packs.loading = g_packs.wanted;
+    g_packs.progress->store(0.0f);
+    g_packs.job = std::async(std::launch::async, [dir, progress = g_packs.progress] {
+        auto pack = std::make_unique<art::Pack>();
+        std::string why;
+        if (!pack->load(dir, why, progress.get())) {
+            std::fprintf(stderr, "texture pack %s: %s\n", dir.string().c_str(), why.c_str());
+            return std::unique_ptr<art::Pack>();
+        }
+        return pack;
+    });
+}
+
+// The pack the settings ask for: the one chosen, else the first found; none when switched off.
+void want_texture_pack(const Settings& settings)
+{
+    if (!settings.texture_packs || g_packs.names.empty())
+        g_packs.wanted.clear();
+    else if (std::find(g_packs.names.begin(), g_packs.names.end(), settings.texture_pack) != g_packs.names.end())
+        g_packs.wanted = settings.texture_pack;
+    else
+        g_packs.wanted = g_packs.names.front();
+}
+
+// The menu's GPU Renderer switched off: the CPU draws from the next frame (run_frame stops it
+// there, so a frame the GPU was to draw still is).
+bool g_gpu_stop_wanted = false;
+void gpu_vdp_stop()
+{
+    for (GpuVdp** gpu : {&g_gpu, &g_gpu_between})
+        if (*gpu) {
+            (*gpu)->shutdown();
+            delete *gpu;
+            *gpu = nullptr;
+        }
+    g_gpu_frame = false;
+}
+
 void run_frame(uint32_t* pixels)
 {
+    if (g_gpu_stop_wanted) {                        // (the menu's GPU Renderer, switched off)
+        gpu_vdp_stop();
+        g_gpu_stop_wanted = false;
+    }
 #ifdef COI_NATIVE
     native_poll();                                  // a ROM image translated meanwhile (--jit)
 #endif
@@ -2049,6 +2790,7 @@ void run_frame(uint32_t* pixels)
         cycling |= cycle.on;
     }
     if (g_smooth_fades) {                           // CRAM holds this frame's colours by now
+        g_fade.ease_steps = state == 0x0E && stage_index == 1;   // stage 4's day-to-night
         g_fade.update(g_vdp.cram);
         g_fade.fill(g_fade_palette);
         g_vdp.palette = &g_fade_palette;
@@ -2063,13 +2805,32 @@ void run_frame(uint32_t* pixels)
     if (g_vdp.palette)
         for (const WaterCycle& cycle : g_water_cycles)
             cycle.apply(g_fade_palette, 0.0);
+    storm::update(g_bus.ram, g_bus.rom, g_storm && g_gpu);
+    if (storm::flashing()) {                        // Weather - Stage 4's lightning
+        if (!g_vdp.palette) {
+            fill_plain_palette(g_fade_palette, g_vdp.cram);
+            g_vdp.palette = &g_fade_palette;
+        }
+        storm::apply(g_fade_palette, 0.0);
+    }
     const uint16_t level = g_bus.ram[0xFF44] << 8 | g_bus.ram[0xFF45];
     const uint16_t act = g_bus.ram[0xFF46] << 8 | g_bus.ram[0xFF47];
     const bool wide = g_widescreen && is_wide_state(state, level, g_bus.ram);
+    // Co-op Zoom's zoom out: level play with the HUD as the window from line 192 (register
+    // 18 = $98). The frame is a tenth wider, with the rows under the HUD added.
+    g_overscan = g_overscan_wanted && state == 0x0E && g_vdp.reg[18] == 0x98;
+    g_out_width = (g_widescreen ? kWideWidth : kWidth) * (g_overscan ? 11 : 10) / 10;
+    g_frame_rows = g_overscan ? kFrameRows : Vdp::kScreenHeight;
+    // The rows above the view: as many as the level has no lines meant to be seen under the
+    // HUD (CameraA's Y $FFFA80, its height in blocks $FFFA8C: the HUD always hides the last 32).
+    const int below = (g_bus.ram[0xFA8C] << 8 | g_bus.ram[0xFA8D]) * 16 - Vdp::kScreenHeight
+                      - (int16_t)(g_bus.ram[0xFA80] << 8 | g_bus.ram[0xFA81]);
+    g_overscan_above = g_overscan ? std::clamp(kOverscanRows - below, 0, kOverscanRows) : 0;
     if (g_widescreen)
         fix_spawn_grid(level, act);
     if (state == 0x0E)
         retry_missed_spawns();
+    hold_early_vines(state == 0x0E);
     // Co-op: Player 2 (coop.asm, in the level while $FFFC00 is set) draws from tiles $580 on;
     // his shorts (palette line 0, values 7-9: Mickey's reds, in areas big enough) in blue.
     if (g_coop_rom)                                 // the view's extra width for coop.asm's pull
@@ -2125,6 +2886,7 @@ void run_frame(uint32_t* pixels)
     spout_overlays(g_vdp, 0.0);
     update_flows(g_smooth_water, state);
     set_flow_colours(g_vdp, g_flow_rgb, 0.0);
+    update_river(g_smooth_water, state);
     update_tile_swaps(g_smooth_water, state);
     update_cream(g_smooth_water, state);
     set_tile_swaps(g_vdp, 0.0);
@@ -2146,13 +2908,32 @@ void run_frame(uint32_t* pixels)
         g_vdp.sub_sprites_b = g_scroll_smoother.camera(-(g_bus.ram[0xFAC4] << 8 | g_bus.ram[0xFAC5]), kSubpixels);
     if (g_interp_capture && (g_scale > 1 || g_layered))   // for level sprites between frames
         g_scroll_smoother.camera_a(-(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]));
+    if (g_tile_dump)
+        g_tile_dump->frame(g_vdp);
+    // Smooth Animation: the objects drawn turned, from the sprite table the frame shows.
+    smooth_animation::update(g_vdp, g_interp, g_bus.ram, g_bus.rom.data(), g_bus.rom.size(), g_smooth_animation && g_gpu);
+    g_gpu_frame = g_gpu && gpu_vdp_plain();
+    g_gpu_wide = wide;
+    if (g_gpu) {
+        g_gpu->strips = g_gpu_between->strips = g_strip_rule != StripRule::None;
+        // An art pack's frame: the flat picture at GpuVdp::kHdScale texels a game pixel each way.
+        // Smooth Animation without a pack: the same size while a turned object shows.
+        g_gpu->hd = g_gpu_between->hd = g_gpu_frame && !g_layered && g_art_allowed && (g_art_pack || !g_vdp.rotated.empty() || !g_vdp.spinners.empty() || !g_vdp.gliders.empty() || !g_vdp.cyclers.empty() || !g_vdp.drums.empty() || !g_vdp.shutters.empty() || !g_vdp.buds.empty() || !g_vdp.chains.empty());
+        g_gpu->scale = g_gpu->hd ? GpuVdp::kHdScale
+                     : g_gpu_frame && !g_layered ? g_scale : 1;   // (other frames leave the smoother to the CPU)
+        g_gpu->layered = g_gpu_frame && g_layered;
+        g_gpu->begin_frame(g_frame_rows);
+        g_gpu_overscan_frames += g_gpu_frame && g_overscan;
+        g_gpu_above_frames += g_gpu_frame && g_overscan && g_overscan_above > 0;
+    }
+    g_gpu_all_frames += g_gpu != nullptr;
     for (int line = 0; line < kLines; line++) {
         g_vdp.set_line(line);
         if (line < Vdp::kScreenHeight)
         {
             if (g_interp_capture)
                 g_interp.capture_line(g_vdp, line);
-            TIMED(g_time_video, render_line(g_vdp, line, pixels + line * g_out_width * g_scale, wide));
+            TIMED(g_time_video, video_line(line, pixels, wide));
         }
         if (line == Vdp::kScreenHeight) {
             g_vdp.set_vblank(true);
@@ -2180,6 +2961,20 @@ void run_frame(uint32_t* pixels)
 #endif
         TIMED(g_time_sound, g_sound.run(kZ80CyclesPerLine, g_audio));
     }
+    storm::mix(g_audio, g_sound.sample_rate());     // Weather - Stage 4's thunder
+}
+
+// Weather - Stage 4: the rain over the picture the GPU drew (`back`: a picture between frames).
+// Returns true when it drew any.
+bool draw_storm(GpuVdp* drawn, double back)
+{
+    storm::Picture p;
+    if (!drawn || !storm::picture(p, back))
+        return false;
+    const int window_line = (g_vdp.reg[18] & 0x1F) * 8;
+    p.hud_top = (g_vdp.reg[18] & 0x80) && window_line > 0 ? window_line : Vdp::kScreenHeight;
+    drawn->draw_storm(p);
+    return true;
 }
 
 // The stage being played (1-28) for the menu's check mark: level start and play outside
@@ -2217,12 +3012,13 @@ bool finale_white()
 // height. Take-off is bit 0 of $FFF406, set by the jump routine ($00C834) and cleared on
 // landing (falling off a ledge doesn't set it). Where the stage swaps Up and Down (bit 0 of
 // $FFF441, handled by $00CE3C), the tap is Up, which the game then reads as Down.
+bool g_was_airborne = false;                        // (at the last frame's start; save states keep it)
+
 uint8_t easy_bounce_buttons()
 {
-    static bool was_airborne = false;
     const bool airborne = g_bus.ram[0xF406] & 1;
-    const bool took_off = airborne && !was_airborne;
-    was_airborne = airborne;
+    const bool took_off = airborne && !g_was_airborne;
+    g_was_airborne = airborne;
     const bool playing = (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E && !g_bus.ram[0xF40A];
     if (!g_easy_bounce || !took_off || !playing)
         return 0;
@@ -2749,6 +3545,7 @@ void close_gamepad(SDL_JoystickID id)
 
 // Co-op: Player 2's drop-in input (coop.cpp); Player 1 gets every other device.
 CoopInput g_coop;
+CoopZoom g_coop_zoom;                               // Enhancements > Graphics > Co-op Dynamic Camera
 
 // Back to single player (the co-op image is switched out): co-op's RAM cleared (coop.asm: Player
 // 2 out of the level, each player's state, the port's requests), and the HUD's two rows as the
@@ -2766,6 +3563,7 @@ void coop_ended()
     auto put = [](int at, uint16_t entry) {
         g_vdp.vram[at] = entry >> 8;
         g_vdp.vram[at + 1] = entry & 0xFF;
+        g_vdp.vram_writes++;                        // (for --gpu-vdp's copies)
     };
     for (int i = 0; i < 80; i++)                // rows 25 and 26 (64 tiles a row)
         put(0xBC80 + (i / 40) * 0x80 + (i % 40) * 2, 0x8000 | g_rom_original[0x9A74 + i]);
@@ -4591,6 +5389,490 @@ int genesis_int_ack(int level)
 }
 }
 
+// Save states (Game > Save and Load, F5 and F7; Game > Save Slot; --save-state-at and
+// --load-state headless). A state is the whole machine between two game frames: the 68000
+// (Musashi's registers, or the translator's own copy in a build without Musashi), the
+// interrupt lines, the bus (RAM, the Z80's RAM, the I/O ports), the VDP, the Z80, the YM2612
+// and the PSG, and the port's own state that play depends on: the ROM image's settings
+// (widescreen, Smooth Swinging, cheats, co-op), the widescreen spawn bookkeeping
+// (g_vine_holds), Easy Bounce Attack's take-off, a pending plane refill and the MD+ track
+// (where it is heard, not how far it was read ahead). Boss Rush, Hardcore, co-op's
+// players and the swinging scripts all live in RAM. What only changes the picture (Smooth
+// Fades, interpolation, Smooth Animation, the storm) starts afresh after a load.
+//
+// The file: "COISTATE", the format version, a hash of the player's cartridge (and of the MD+
+// pack's ROM when MD+ was on), the stage, GameState, the game frame and the time it was
+// saved, then each part as a tagged section with its size. A state from another ROM, another
+// format or with a part of the wrong size is refused with a message, and nothing changes.
+namespace {
+constexpr char kStateMagic[8] = {'C', 'O', 'I', 'S', 'T', 'A', 'T', 'E'};
+constexpr uint32_t kStateVersion = 1;
+constexpr int kStateSlots = 5;
+
+uint64_t state_rom_hash(const std::vector<uint8_t>& rom)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint8_t b : rom)
+        h = (h ^ b) * 0x100000001B3ull;
+    return h;
+}
+
+uint64_t cartridge_hash()
+{
+    static uint64_t hash = state_rom_hash(g_rom_cartridge);     // (the cartridge never changes)
+    return hash;
+}
+
+struct StateHeader {
+    uint64_t cartridge = 0, mdplus_rom = 0;         // mdplus_rom: 0 when MD+ was off
+    int32_t stage = 0;                              // current_stage() (0: not in a level)
+    int32_t game_state = 0;                         // GameState ($FFF300)
+    int32_t frame = 0;                              // the game frames run before it
+    int64_t time = 0;                               // when it was saved (seconds since 1970)
+};
+
+bool read_state_header(StateReader& r, StateHeader& h, std::string& error)
+{
+    char magic[8];
+    r.bytes(magic, sizeof(magic));
+    if (!r.ok() || std::memcmp(magic, kStateMagic, sizeof(magic)) != 0) {
+        error = "isn't a save state";
+        return false;
+    }
+    if (r.get<uint32_t>() != kStateVersion) {
+        error = "was saved by another version of the port";
+        return false;
+    }
+    r.get(h.cartridge);
+    r.get(h.mdplus_rom);
+    r.get(h.stage);
+    r.get(h.game_state);
+    r.get(h.frame);
+    r.get(h.time);
+    if (!r.ok()) {
+        error = "is damaged";
+        return false;
+    }
+    return true;
+}
+
+void section(StateWriter& w, const char (&tag)[5], const std::function<void(StateWriter&)>& save)
+{
+    StateWriter part;
+    save(part);
+    w.bytes(tag, 4);
+    w.put<uint32_t>((uint32_t)part.data.size());
+    w.bytes(part.data.data(), part.data.size());
+}
+
+// Reads the next section, which must be `tag`; `load` must use all of it.
+bool load_section(StateReader& r, const char (&tag)[5], const std::function<bool(StateReader&)>& load)
+{
+    char got[4];
+    r.bytes(got, 4);
+    const uint32_t size = r.get<uint32_t>();
+    if (!r.ok() || std::memcmp(got, tag, 4) != 0 || size > r.left())
+        return false;
+    std::vector<uint8_t> data(size);
+    r.bytes(data.data(), size);
+    StateReader part(data.data(), data.size());
+    return load(part) && part.done();
+}
+
+// The translator's registers (CoiCpu's that count between slices).
+struct SavedCpu {
+    uint32_t d[8] = {}, a[8] = {};
+    uint8_t x = 0, n = 0, z = 0, v = 0, c = 0;
+    uint16_t sr_high = 0;
+    uint32_t usp = 0;
+    uint8_t stopped = 0;
+};
+
+#ifndef COI_NO_INTERPRETER
+extern "C" unsigned int coi_m68k_state_save(unsigned int* out);
+extern "C" void coi_m68k_state_load(const unsigned int* in);
+constexpr uint32_t kMusashiWords = 48;              // (musashi_regs.c: COI_M68K_STATE_FIELDS)
+#endif
+
+uint64_t g_mdplus_queued = 0;       // MD+ sample frames queued but not heard yet (the window's, at a save)
+
+std::vector<uint8_t> save_machine(int frame)
+{
+#ifdef COI_NATIVE
+    native_sync();          // Musashi's registers are the ones that count (with Musashi; without, ours)
+#endif
+    StateWriter w;
+    w.bytes(kStateMagic, sizeof(kStateMagic));
+    w.put(kStateVersion);
+    w.put(cartridge_hash());
+    w.put<uint64_t>(g_mdplus_on ? state_rom_hash(g_rom_mdplus) : 0);
+    w.put<int32_t>(current_stage());
+    w.put<int32_t>(g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]);
+    w.put<int32_t>(frame);
+    w.put<int64_t>((int64_t)std::time(nullptr));
+    section(w, "CPU ", [](StateWriter& s) {
+#ifndef COI_NO_INTERPRETER
+        unsigned int words[kMusashiWords];
+        const uint32_t n = coi_m68k_state_save(words);
+        s.put<uint32_t>(n);
+        for (uint32_t i = 0; i < n; i++)
+            s.put<uint32_t>(words[i]);
+#else
+        s.put<uint32_t>(0);
+#endif
+        // The translator's registers, when they are the ones that count (a build without Musashi).
+        SavedCpu c;
+#ifdef COI_NATIVE
+        std::memcpy(c.d, g_ns.cpu.d, sizeof(c.d));
+        std::memcpy(c.a, g_ns.cpu.a, sizeof(c.a));
+        c.x = g_ns.cpu.x, c.n = g_ns.cpu.n, c.z = g_ns.cpu.z, c.v = g_ns.cpu.v, c.c = g_ns.cpu.c;
+        c.sr_high = g_ns.cpu.sr_high;
+        c.usp = g_ns.cpu.usp;
+        c.stopped = g_ns.cpu.stopped;
+        s.put(g_ns.ours);
+        s.put(g_ns.pc);
+        const int32_t reset_cycles = g_reset_cycles;
+#else
+        s.put(false);
+        s.put<uint32_t>(0);
+        const int32_t reset_cycles = 0;
+#endif
+        s.put_array(c.d);
+        s.put_array(c.a);
+        for (uint8_t f : {c.x, c.n, c.z, c.v, c.c})
+            s.put(f);
+        s.put(c.sr_high);
+        s.put(c.usp);
+        s.put(c.stopped);
+        s.put(reset_cycles);
+        s.put<int32_t>(g_irq_pending);
+        s.put<int32_t>(g_irq_level);
+        s.put(g_nmi_pending);
+    });
+    section(w, "BUS ", [](StateWriter& s) { g_bus.save_state(s); });
+    section(w, "VDP ", [](StateWriter& s) { g_vdp.save_state(s); });
+    section(w, "SND ", [](StateWriter& s) { g_sound.save_state(s); });
+    section(w, "PORT", [](StateWriter& s) {
+        const RomSettings rs = current_rom_settings();
+        s.put(rs.widescreen);
+        s.put(rs.smooth_swing);
+        const Cheats& c = rs.cheats;
+        for (bool b : {c.invincibility, c.infinite_power, c.infinite_tries, c.infinite_items, c.infinite_continues,
+                       c.full_power, c.walk_faster, c.moon_jump, c.midair_jump})
+            s.put(b);
+        s.put(rs.coop);
+        for (const VineHold& h : g_vine_holds) {
+            s.put(h.entry);
+            s.put(h.held);
+            s.put<int32_t>(h.column);
+            s.put_array(h.anim);
+        }
+        s.put<int32_t>(g_vine_camera_x);
+        s.put(g_was_airborne);
+        s.put(g_plane_refill.pending);
+        s.put_array(g_plane_refill.old_x);
+        MdPlus::State m = g_mdplus.state();
+        m.position -= std::min(m.position, g_mdplus_queued);    // where the music is heard
+        s.put<int32_t>(m.track);
+        s.put(m.looping);
+        s.put(m.paused);
+        s.put(m.registers_open);
+        s.put(m.position);
+        s.put<int32_t>(m.fade_frames);
+        s.put<int32_t>(m.fade_left);
+    });
+    return std::move(w.data);
+}
+
+// What a load found besides the machine: the ROM image's settings and MD+ as saved, and the
+// header (the frame count), for the caller to bring the menu's settings in line.
+struct LoadedState {
+    StateHeader header;
+    RomSettings rom;
+    bool mdplus = false;
+    MdPlus::State music;
+};
+
+bool load_machine_parts(StateReader& r, LoadedState& out)
+{
+    bool ok = load_section(r, "CPU ", [&](StateReader& s) {
+        const uint32_t n = s.get<uint32_t>();
+        if (n > s.left() / 4)
+            return false;
+        std::vector<uint32_t> words(n);
+        for (uint32_t& v : words)
+            v = s.get<uint32_t>();
+        const bool ours = s.get<bool>();
+        const uint32_t pc = s.get<uint32_t>();
+        SavedCpu c;
+        s.get_array(c.d);
+        s.get_array(c.a);
+        for (uint8_t* f : {&c.x, &c.n, &c.z, &c.v, &c.c})
+            s.get(*f);
+        s.get(c.sr_high);
+        s.get(c.usp);
+        s.get(c.stopped);
+        const int32_t reset_cycles = s.get<int32_t>();
+        const int32_t irq_pending = s.get<int32_t>(), irq_level = s.get<int32_t>();
+        const bool nmi = s.get<bool>();
+        if (!s.ok())
+            return false;
+#ifdef COI_NO_INTERPRETER
+        if (!ours)
+            return false;                           // (Musashi's registers, and no Musashi here)
+#else
+        if (n == kMusashiWords)
+            coi_m68k_state_load(reinterpret_cast<const unsigned int*>(words.data()));
+        else if (!ours)
+            return false;
+#endif
+#ifdef COI_NATIVE
+        std::memcpy(g_ns.cpu.d, c.d, sizeof(c.d));
+        std::memcpy(g_ns.cpu.a, c.a, sizeof(c.a));
+        g_ns.cpu.x = c.x, g_ns.cpu.n = c.n, g_ns.cpu.z = c.z, g_ns.cpu.v = c.v, g_ns.cpu.c = c.c;
+        g_ns.cpu.sr_high = c.sr_high;
+        g_ns.cpu.usp = c.usp;
+        g_ns.cpu.stopped = c.stopped;
+        g_ns.cpu.cycles = g_ns.cpu.cycle_limit = 0;
+        g_ns.pc = pc;
+        g_ns.ours = ours;
+        g_reset_cycles = reset_cycles;
+        g_native_skip = ~0u;
+#else
+        if (ours)
+            return false;                           // (the translator's registers, and no translator here)
+        (void)pc, (void)reset_cycles, (void)c;
+#endif
+        g_irq_pending = irq_pending;
+        g_irq_level = irq_level;
+        g_nmi_pending = nmi;
+        return true;
+    });
+    ok = ok && load_section(r, "BUS ", [](StateReader& s) { return g_bus.load_state(s); });
+    ok = ok && load_section(r, "VDP ", [](StateReader& s) { return g_vdp.load_state(s); });
+    ok = ok && load_section(r, "SND ", [](StateReader& s) { return g_sound.load_state(s); });
+    ok = ok && load_section(r, "PORT", [&](StateReader& s) {
+        s.get(out.rom.widescreen);
+        s.get(out.rom.smooth_swing);
+        Cheats& c = out.rom.cheats;
+        for (bool* b : {&c.invincibility, &c.infinite_power, &c.infinite_tries, &c.infinite_items, &c.infinite_continues,
+                        &c.full_power, &c.walk_faster, &c.moon_jump, &c.midair_jump})
+            s.get(*b);
+        s.get(out.rom.coop);
+        for (VineHold& h : g_vine_holds) {
+            s.get(h.entry);
+            s.get(h.held);
+            h.column = s.get<int32_t>();
+            s.get_array(h.anim);
+        }
+        g_vine_camera_x = s.get<int32_t>();
+        s.get(g_was_airborne);
+        s.get(g_plane_refill.pending);
+        s.get_array(g_plane_refill.old_x);
+        out.music.track = s.get<int32_t>();
+        s.get(out.music.looping);
+        s.get(out.music.paused);
+        s.get(out.music.registers_open);
+        s.get(out.music.position);
+        out.music.fade_frames = s.get<int32_t>();
+        out.music.fade_left = s.get<int32_t>();
+        return s.ok();
+    });
+    return ok && r.done();
+}
+
+// Loads a state into the machine. The ROM image is put back as it was saved (MD+'s cartridge
+// too), so the code running is the code that was. False, with the reason, if it can't be:
+// then nothing has changed.
+bool load_machine(const std::vector<uint8_t>& data, LoadedState& out, std::string& error)
+{
+    StateReader r(data.data(), data.size());
+    if (!read_state_header(r, out.header, error))
+        return false;
+    if (out.header.cartridge != cartridge_hash()) {
+        error = "was saved with another ROM";
+        return false;
+    }
+    out.mdplus = out.header.mdplus_rom != 0;
+    if (out.mdplus && (!g_mdplus.loaded() || out.header.mdplus_rom != state_rom_hash(g_rom_mdplus))) {
+        error = "was saved with an MD+ pack that isn't here";
+        return false;
+    }
+    // Everything as it is now, put back if the state turns out to be damaged part way.
+    const std::vector<uint8_t> before = save_machine(0);
+    if (!load_machine_parts(r, out)) {
+        StateReader back(before.data(), before.size());
+        StateHeader h;
+        LoadedState ignored;
+        read_state_header(back, h, error);
+        load_machine_parts(back, ignored);
+        error = "is damaged";
+        return false;
+    }
+    g_mdplus_on = out.mdplus;
+    g_rom_original = g_mdplus_on ? g_rom_mdplus : g_rom_cartridge;
+    g_widescreen = out.rom.widescreen;
+    g_smooth_swing = out.rom.smooth_swing;
+    g_cheats = out.rom.cheats;
+    g_coop_rom = out.rom.coop;
+    g_bus.at_main_loop = nullptr;                   // (a switch due in the game left behind)
+    build_rom();
+    g_out_width = g_widescreen ? kWideWidth : kWidth;
+    if (g_mdplus_on)
+        g_mdplus.restore(out.music);
+    else
+        g_mdplus.stop();
+    // The picture's helpers start afresh.
+    g_fade.reset();
+    g_scroll_smoother.reset();
+    g_interp.reset();
+    storm::reset();
+    return true;
+}
+
+std::string state_path(int slot)
+{
+    const std::string dir = settings_folder();
+    return dir.empty() ? std::string() : dir + "states/slot" + std::to_string(slot) + ".state";
+}
+
+bool write_state_file(const std::string& path, const std::vector<uint8_t>& data)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    const std::string temp = path + ".new";         // (a crash mid-write leaves the old state)
+    FILE* f = std::fopen(temp.c_str(), "wb");
+    if (!f)
+        return false;
+    const bool written = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    if (std::fclose(f) != 0 || !written) {
+        std::filesystem::remove(temp, ec);
+        return false;
+    }
+    std::filesystem::rename(temp, path, ec);
+    return !ec;
+}
+
+bool read_state_file(const std::string& path, std::vector<uint8_t>& data)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    return true;
+}
+
+// Save and Load are off in Boss Rush (boss_rush.asm's RushActive, $FFFF1E) and in a Hardcore
+// game (hardcore.asm's $FFFF29), which are meant to be played through. nullptr: allowed.
+const char* states_blocked()
+{
+    if (g_bus.ram[0xFF1E])
+        return "Save states are off in Boss Rush";
+    if (g_bus.ram[0xFF29])
+        return "Save states are off in Hardcore";
+    return nullptr;
+}
+
+// Game > Save Slot's line for each slot (1-5): the stage and when it was saved, or "Empty".
+std::string g_slot_labels[kStateSlots];
+
+void update_slot_label(int slot)
+{
+    char label[96];
+    std::vector<uint8_t> data(64);
+    std::ifstream file(state_path(slot), std::ios::binary);
+    if (!file) {
+        std::snprintf(label, sizeof(label), "Slot %d: Empty", slot);
+        g_slot_labels[slot - 1] = label;
+        return;
+    }
+    file.read(reinterpret_cast<char*>(data.data()), (std::streamsize)data.size());
+    data.resize((size_t)file.gcount());
+    StateReader r(data.data(), data.size());
+    StateHeader h;
+    std::string error;
+    if (!read_state_header(r, h, error)) {
+        std::snprintf(label, sizeof(label), "Slot %d: (can't be loaded)", slot);
+        g_slot_labels[slot - 1] = label;
+        return;
+    }
+    char when[32] = "";
+    const std::time_t t = (std::time_t)h.time;
+    if (const std::tm* tm = std::localtime(&t))
+        std::strftime(when, sizeof(when), "%d %b %H:%M", tm);
+    const std::string where = h.stage > 0 ? "Stage " + std::to_string(h.stage) : "Not in a stage";
+    std::snprintf(label, sizeof(label), "Slot %d: %s, %s", slot, where.c_str(), when);
+    g_slot_labels[slot - 1] = label;
+}
+
+// Each slot's picture (Game > Save Slot's tooltips): the game as the window showed it when the
+// state was saved, at most kSlotPictureWidth pixels across, kept beside the state as
+// slotN.ppm (binary PPM, so it opens in an image viewer too).
+constexpr int kSlotPictureWidth = 640;
+SlotPicture g_slot_pictures[kStateSlots];
+
+std::string slot_picture_path(int slot)
+{
+    const std::string state = state_path(slot);
+    return state.empty() ? state : state.substr(0, state.size() - 6) + ".ppm";   // (".state")
+}
+
+void update_slot_picture(Display& display, int slot)
+{
+    SlotPicture& p = g_slot_pictures[slot - 1];
+    std::ifstream file(slot_picture_path(slot), std::ios::binary);
+    std::string magic;
+    int w = 0, h = 0, max = 0;
+    if (file && file >> magic >> w >> h >> max && magic == "P6" && max == 255 && w > 0 && h > 0
+        && w <= kSlotPictureWidth && h <= kSlotPictureWidth) {
+        file.get();                                 // (the one whitespace after the header)
+        std::vector<uint8_t> rgb((size_t)w * h * 3);
+        if (file.read(reinterpret_cast<char*>(rgb.data()), (std::streamsize)rgb.size())) {
+            p.texture = display.rgb_texture(rgb.data(), w, h, p.texture);
+            p.width = w, p.height = h;
+            return;
+        }
+    }
+    display.free_texture(p.texture);
+    p = SlotPicture{};
+}
+
+// The picture just drawn (before the menu is drawn over it), shrunk, as slot `slot`'s.
+void save_slot_picture(Display& display, int slot)
+{
+    std::vector<uint8_t> rgb;
+    int w = 0, h = 0;
+    std::error_code ec;
+    if (!display.read_picture(rgb, w, h)) {
+        std::filesystem::remove(slot_picture_path(slot), ec);
+        update_slot_picture(display, slot);
+        return;
+    }
+    const int tw = std::min(w, kSlotPictureWidth), th = std::max(1, std::min(kSlotPictureWidth, h * tw / w));
+    std::vector<uint8_t> small((size_t)tw * th * 3);
+    for (int y = 0; y < th; y++)                    // each pixel the average of the ones it covers
+        for (int x = 0; x < tw; x++) {
+            const int x0 = x * w / tw, x1 = std::max(x0 + 1, (x + 1) * w / tw);
+            const int y0 = y * h / th, y1 = std::max(y0 + 1, (y + 1) * h / th);
+            for (int c = 0; c < 3; c++) {
+                int sum = 0;
+                for (int sy = y0; sy < y1; sy++)
+                    for (int sx = x0; sx < x1; sx++)
+                        sum += rgb[((size_t)sy * w + sx) * 3 + c];
+                small[((size_t)y * tw + x) * 3 + c] = (uint8_t)(sum / ((x1 - x0) * (y1 - y0)));
+            }
+        }
+    const std::string path = slot_picture_path(slot);
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fprintf(f, "P6\n%d %d\n255\n", tw, th);
+        const bool written = std::fwrite(small.data(), 1, small.size(), f) == small.size();
+        if (std::fclose(f) != 0 || !written)
+            std::filesystem::remove(path, ec);
+    }
+    update_slot_picture(display, slot);
+}
+}  // namespace
+
 // On Windows the port is built as a GUI program, so no terminal window opens with it. With
 // --console it shows one for its messages: the terminal it was started from, or a new window.
 // Output that is already redirected (to a file or a pipe) is left alone.
@@ -4656,21 +5938,29 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--console") == 0)
             show_console();
     std::string rom_path, dump_path, wav_path, ram_path, vram_path, cram_path, snapshot_dir, sprite_capture_dir;
+    std::string art_pack_dir, dump_tiles_dir;      // --art-pack ("-": --no-art-pack), --dump-tiles
+    int hd_every = 0;                               // --hd-dump-every N DIR (headless, with --art-pack): the GPU's
+    std::string hd_every_dir;                       // picture every N frames, one texel a game pixel
+    int vdp_every = 0;                              // --vdp-every N DIR (headless): save RAM, VRAM, CRAM every N frames
+    std::string vdp_every_dir;
     std::string snapshot_picture;                   // F9 (Debug): where to save the window's picture once drawn
     int headless_frames = 0;
     std::vector<Press> presses;
-    std::vector<Press> presses2;                    // --press2: Player 2's (co-op), headless
-    int join2_frame = -1;                           // --join2: Player 2 joins at this frame, headless
+    std::vector<Press> presses2;                    // --press2: Player 2's (co-op), headless or windowed
+    int join2_frame = -1;                           // --join2: Player 2 joins at this frame, headless or windowed
     int leave2_frame = -1;                          // --leave2: and leaves at this one
     std::vector<std::pair<int, int>> fast_forwards; // --fast-forward FIRST-LAST, in pictures
     std::string state_hash_path;                    // --state-hash: one line per game frame
+    std::string save_state_path, load_state_path;   // --save-state-at N FILE, --load-state FILE
+    int save_state_frame = -1;
+    int gpu_vdp = 0;                                // --gpu-vdp 1, --gpu-vdp-check 2, --no-gpu-vdp -1
     std::vector<uint32_t> peeks;                   // RAM words to print after a headless run
     bool log_state = false;                         // print each GameState change with its frame number
     bool show_state = false;                        // show the GameState in the window title
     bool log_scroll = false;                        // print each frame's plane A/B scroll (line 0)
     std::vector<uint32_t> logged_bytes;             // RAM bytes to print with the frame number when they change
-    struct Poke { int frame; uint32_t address; uint16_t value; };
-    std::vector<Poke> pokes;                        // RAM words to write at the start of a frame (testing)
+    struct Poke { int frame; uint32_t address; uint16_t value; bool byte; };
+    std::vector<Poke> pokes;                        // RAM words (or bytes: ADDR.b) to write at the start of a frame (testing)
     std::vector<int> switch_frames, reset_frames;   // menu actions to run headlessly (testing)
     std::vector<int> swing_switch_frames;
     std::vector<std::pair<int, int>> stage_jumps;   // frame, stage (1-28)
@@ -4679,9 +5969,13 @@ int main(int argc, char** argv)
     bool no_smooth_scroll = false, vanilla_rock_edges = false, vanilla_fades = false, vanilla_water = false, vanilla_glass = false, show_fps = false, show_coordinates = false, interpolate = false;
     bool no_interpolate = false, log_mdplus = false;
     int mdplus = -1;                                // --mdplus / --no-mdplus
+    int clear_fm = -1, clean_psg = -1, low_pass = -1;  // --clear-fm, --clean-psg, --model1-low-pass (and --no-)
     double interp_back = -1;                        // --interp-back (testing)
+    int between = 0;                                // --between N (headless): pictures between frames, each frame
+    bool layers = false;                            // --layers (headless): layers with --hqx, as a window draws
     double refresh_override = 0;                    // --refresh (testing)
     int frame_rate = -1;                            // --frame-rate
+    int coop_camera = -1;                           // --coop-camera 1, --no-coop-camera 0
     std::vector<std::string> cheats;                // --cheat NAME (this run only)
     int scanlines = -1;                             // percent, -1 = the saved setting
     int hqx = -1;                                   // scale, -1 = the saved setting
@@ -4692,6 +5986,9 @@ int main(int argc, char** argv)
         std::string arg = argv[i];
         if (arg == "--frames" && i + 1 < argc) headless_frames = std::atoi(argv[++i]);
         else if (arg == "--dump" && i + 1 < argc) dump_path = argv[++i];
+        else if (arg == "--gpu-vdp") gpu_vdp = 1;
+        else if (arg == "--gpu-vdp-check") gpu_vdp = 2;
+        else if (arg == "--no-gpu-vdp") gpu_vdp = -1;
         else if (arg == "--trace-vdp") g_vdp.trace = true;
         else if (arg == "--wav" && i + 1 < argc) wav_path = argv[++i];
         else if (arg == "--no-widescreen") no_widescreen = true;
@@ -4706,14 +6003,27 @@ int main(int argc, char** argv)
         else if (arg == "--vanilla-glass") vanilla_glass = true;
         else if (arg == "--show-fps") show_fps = true;
         else if (arg == "--show-coordinates") show_coordinates = true;
+        else if (arg == "--smooth-animation" || arg == "--smooth-rotation") g_smooth_animation = true;   // (--smooth-rotation: its first name)
         else if (arg == "--interpolate") interpolate = true;
         else if (arg == "--no-interpolate") no_interpolate = true;
         else if (arg == "--mdplus") mdplus = 1;
         else if (arg == "--no-mdplus") mdplus = 0;
         else if (arg == "--log-mdplus") log_mdplus = true;
+        else if (arg == "--clear-fm") clear_fm = 1;
+        else if (arg == "--no-clear-fm") clear_fm = 0;
+        else if (arg == "--clean-psg") clean_psg = 1;
+        else if (arg == "--no-clean-psg") clean_psg = 0;
+        else if (arg == "--model1-low-pass") low_pass = 1;
         else if (arg == "--interp-back" && i + 1 < argc) interp_back = std::atof(argv[++i]);
+        else if (arg == "--between" && i + 1 < argc) between = std::atoi(argv[++i]);
+        else if (arg == "--layers") layers = true;
         else if (arg == "--refresh" && i + 1 < argc) refresh_override = std::atof(argv[++i]);
         else if (arg == "--frame-rate" && i + 1 < argc) frame_rate = std::atoi(argv[++i]);
+        else if (arg == "--coop-camera") coop_camera = 1;
+        else if (arg == "--storm") g_storm_forced = 1;
+        else if (arg == "--no-storm") g_storm_forced = 0;
+        else if (arg == "--storm-splash" && i + 1 < argc) storm::set_splash_scale((float)std::atof(argv[++i]));
+        else if (arg == "--no-coop-camera") coop_camera = 0;
         else if (arg == "--cheat" && i + 1 < argc) cheats.push_back(argv[++i]);
         else if (arg == "--crt") crt = true;
         else if (arg == "--console") {}           // handled first thing in main
@@ -4730,9 +6040,17 @@ int main(int argc, char** argv)
         }
         else if (arg == "--peek" && i + 1 < argc) peeks.push_back(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--ram" && i + 1 < argc) ram_path = argv[++i];
+        else if (arg == "--sprite-capture" && i + 1 < argc) sprite_capture_dir = argv[++i];
+        else if (arg == "--hd-dump-every" && i + 2 < argc) {
+            hd_every = std::atoi(argv[++i]);
+            hd_every_dir = argv[++i];
+        }
+        else if (arg == "--vdp-every" && i + 2 < argc) {
+            vdp_every = std::atoi(argv[++i]);
+            vdp_every_dir = argv[++i];
+        }
 #ifndef NDEBUG
         else if (arg == "--snapshots" && i + 1 < argc) snapshot_dir = argv[++i];
-        else if (arg == "--sprite-capture" && i + 1 < argc) sprite_capture_dir = argv[++i];
 #endif
         else if (arg == "--save-rom" && i + 1 < argc) g_save_rom_path = argv[++i];
         else if (arg == "--save-rom-family" && i + 1 < argc) g_save_rom_family = argv[++i];
@@ -4773,6 +6091,9 @@ int main(int argc, char** argv)
 #endif
         else if (arg == "--vram" && i + 1 < argc) vram_path = argv[++i];
         else if (arg == "--cram" && i + 1 < argc) cram_path = argv[++i];
+        else if (arg == "--art-pack" && i + 1 < argc) art_pack_dir = argv[++i];
+        else if (arg == "--no-art-pack") art_pack_dir = "-";
+        else if (arg == "--dump-tiles" && i + 1 < argc) dump_tiles_dir = argv[++i];
         else if (arg == "--log-state") log_state = true;
         else if (arg == "--show-state") show_state = true;
         else if (arg == "--show-touch") touch_force_shown();
@@ -4820,9 +6141,10 @@ int main(int argc, char** argv)
                     std::fprintf(stderr, "bad poke: %s\n", spec.c_str());
                     return 1;
                 }
-                pokes.push_back({std::atoi(spec.substr(0, colon).c_str()),
-                                 (uint32_t)std::strtoul(spec.substr(colon + 1, equals - colon - 1).c_str(), nullptr, 16),
-                                 (uint16_t)std::strtoul(spec.substr(equals + 1).c_str(), nullptr, 16)});
+                const std::string address = spec.substr(colon + 1, equals - colon - 1);
+                const bool byte = address.size() > 2 && address.compare(address.size() - 2, 2, ".b") == 0;
+                pokes.push_back({std::atoi(spec.substr(0, colon).c_str()), (uint32_t)std::strtoul(address.c_str(), nullptr, 16),
+                                 (uint16_t)std::strtoul(spec.substr(equals + 1).c_str(), nullptr, 16), byte});
             }
         }
         else if (arg == "--press2" && i + 1 < argc) {
@@ -4854,6 +6176,11 @@ int main(int argc, char** argv)
             fast_forwards.push_back({std::atoi(spec.c_str()), std::atoi(spec.c_str() + dash + 1)});
         } else if (arg == "--state-hash" && i + 1 < argc) {
             state_hash_path = argv[++i];
+        } else if (arg == "--save-state-at" && i + 2 < argc) {
+            save_state_frame = std::atoi(argv[++i]);
+            save_state_path = argv[++i];
+        } else if (arg == "--load-state" && i + 1 < argc) {
+            load_state_path = argv[++i];
         } else rom_path = arg;
     }
 
@@ -4887,6 +6214,27 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "Smooth swinging unavailable: %s\n", error.c_str());
     }
     find_mdplus_pack();
+    // An art pack: --art-pack's folder, else the first artpack folder found (beside the
+    // program, or here and up to three folders above); --no-art-pack: none.
+    // (In a window without --art-pack, the menu's choice is loaded once the settings are read.)
+    if (art_pack_dir != "-" && (!art_pack_dir.empty() || headless_frames > 0)) {
+        std::string why;
+        auto* pack = new art::Pack;
+        if (!art_pack_dir.empty()) {
+            if (!pack->load(art_pack_dir, why))
+                std::fprintf(stderr, "art pack: %s\n", why.c_str());
+        } else {
+            for (const auto& dir : search_dirs("artpack"))
+                if (std::filesystem::is_directory(dir) && pack->load(dir, why))
+                    break;
+        }
+        if (pack->empty())
+            delete pack;
+        else
+            g_art_pack = pack;
+    }
+    if (!dump_tiles_dir.empty())
+        g_tile_dump = new art::Dumper(dump_tiles_dir);
     Settings settings;                              // defaults for headless runs, so tests repeat
     if (headless_frames == 0)
         settings = load_settings();
@@ -4915,6 +6263,26 @@ int main(int argc, char** argv)
         settings.interpolate = false;
     if (mdplus >= 0)
         settings.mdplus = mdplus;
+    // The sound enhancements: with Enhanced or Vanilla in use they are theirs (a settings file
+    // from before they were settings has none: Vanilla stays Vanilla). Headless runs have them
+    // off unless asked, so WAVs of tests repeat.
+    if ((Quick)settings.quick != Quick::Custom) {
+        const Look look = quick_look((Quick)settings.quick);
+        settings.clear_fm = look.clear_fm;
+        settings.clean_psg = look.clean_psg;
+        settings.low_pass = look.low_pass;
+    }
+    if (headless_frames != 0)
+        settings.clear_fm = settings.clean_psg = settings.low_pass = false;
+    if (clear_fm >= 0)
+        settings.clear_fm = clear_fm;
+    if (clean_psg >= 0)
+        settings.clean_psg = clean_psg;
+    if (low_pass >= 0)
+        settings.low_pass = low_pass;
+    g_sound.clear_fm = settings.clear_fm;
+    g_sound.clean_psg = settings.clean_psg;
+    g_sound.low_pass = settings.low_pass;
     // MD+: the pack's patched ROM runs instead of the cartridge's, with the port's patches too.
     g_mdplus_on = settings.mdplus && g_mdplus.loaded();
     g_rom_original = g_mdplus_on ? g_rom_mdplus : g_rom_cartridge;
@@ -4928,6 +6296,16 @@ int main(int argc, char** argv)
         };
     if (frame_rate >= 0)
         settings.frame_rate = frame_rate;
+    if (coop_camera >= 0)
+        settings.coop_camera = coop_camera;
+    // Weather - Stage 4: with Enhanced or Vanilla in use, theirs (a settings file from before it
+    // was a setting has none). --storm / --no-storm decide for the run only; headless runs have it
+    // only with --storm, so tests repeat.
+    if ((Quick)settings.quick != Quick::Custom)
+        settings.stage4_storm = quick_look((Quick)settings.quick).stage4_storm;
+    if (headless_frames && g_storm_forced < 0)
+        g_storm_forced = 0;
+    g_storm = g_storm_forced >= 0 ? g_storm_forced == 1 : settings.stage4_storm;
     for (const std::string& name : cheats) {
         bool Cheats::*field = name == "invincibility" ? &Cheats::invincibility
                             : name == "infinite-power" ? &Cheats::infinite_power
@@ -4948,11 +6326,32 @@ int main(int argc, char** argv)
     g_smooth_fades = settings.smooth_fades;
     g_smooth_water = settings.smooth_water;
     g_smooth_glass = settings.smooth_glass;
+    // Smooth Animation: the setting, or --smooth-animation (headless runs only with that, so
+    // tests repeat and their pictures keep the game's size). With Enhanced or Vanilla in use it
+    // is theirs (a settings file from before it was a setting has none: Vanilla stays Vanilla).
+    if ((Quick)settings.quick != Quick::Custom)
+        settings.smooth_animation = quick_look((Quick)settings.quick).smooth_animation;
+    if (headless_frames == 0)
+        g_smooth_animation = g_smooth_animation || settings.smooth_animation;
+    settings.smooth_animation = g_smooth_animation;
     g_smooth_swing = (settings.smooth_swing || smooth_swing) && !no_smooth_swing && g_smooth_swing_available;
     bool smooth_scroll_on = (settings.smooth_scroll || smooth_scroll) && !no_smooth_scroll;   // chosen
     set_smooth_scroll(smooth_scroll_on);
     g_vdp.smooth_scroll = [](int line, int hs_a, int hs_b, int scale, int& sub_a, int& sub_b) {
+        // Overscan's second pass of a line under the HUD repeats the last line of play's
+        // corrections (its scroll goes on from there: Vdp::line_scroll), the HUD pass's own
+        // being for the HUD's scroll.
+        static int last_play[2] = {0, 0};
+        if (g_scroll_replay) {
+            const bool on_from_play = !g_scroll_replay_own && (g_vdp.reg[11] & 3) && (g_vdp.reg[18] & 0x80);
+            sub_a = on_from_play ? last_play[0] : g_scroll_last[0];
+            sub_b = on_from_play ? last_play[1] : g_scroll_last[1];
+            return;
+        }
         g_scroll_smoother.line(line, hs_a, hs_b, scale, sub_a, sub_b);
+        g_scroll_last[0] = sub_a, g_scroll_last[1] = sub_b;
+        if (line == (g_vdp.reg[18] & 0x1F) * 8 - 1)
+            last_play[0] = sub_a, last_play[1] = sub_b;
     };
     set_widescreen(settings.widescreen && !no_widescreen && g_wide_available);
     g_bus.vdp = &g_vdp;
@@ -4962,11 +6361,11 @@ int main(int argc, char** argv)
     g_vdp.edge_tiles = {0x123, 0x124, 0x125, 0x12A, 0x12B, 0x130, 0x1B7};   // the forest's rock edge tiles (Clean Rock Edges)
     // Frame interpolation notes who writes each sprite and when the list reaches the VDP.
     g_bus.on_sprite_list_write = [](uint16_t address) {
-        if (g_interp_capture)
+        if (g_interp_capture || g_smooth_animation)   // (Smooth Animation finds its objects' sprites so)
             g_interp.sprite_written(address, current_pc(), current_reg(8), g_bus.ram);
     };
     g_vdp.on_dma = [](uint32_t source) {
-        if (g_interp_capture)
+        if (g_interp_capture || g_smooth_animation)
             g_interp.dma(source);
     };
     g_vdp.sprite_moves_with_b = [](uint16_t attr) {
@@ -5093,20 +6492,53 @@ int main(int argc, char** argv)
 #endif
     cpu_reset();
 
-    std::vector<uint32_t> pixels(kWideWidth * kSubpixels * Vdp::kScreenHeight);   // room for any width
+    std::vector<uint32_t> pixels(kMaxOutWidth * kSubpixels * kFrameRows);   // room for any width
     for (auto& layer : g_layers)
-        layer.resize(kLayerStride * Vdp::kScreenHeight);
+        layer.resize(kLayerStride * kFrameRows);
     for (auto& layer : g_water_layers)
-        layer.resize(kLayerStride * Vdp::kScreenHeight);
+        layer.resize(kLayerStride * kFrameRows);
 
     if (headless_frames > 0) {
         std::vector<int16_t> all_audio;
-        g_interp_capture = interp_back >= 0;
+        if (gpu_vdp) {                              // OpenGL from a hidden window
+            SDL_Init(SDL_INIT_VIDEO);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            SDL_Window* hidden = SDL_CreateWindow("coi", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+            SDL_GLContext context = hidden ? SDL_GL_CreateContext(hidden) : nullptr;
+            if (context && SDL_GL_MakeCurrent(hidden, context))
+                gpu_vdp_start(gpu_vdp == 2);
+            else
+                std::fprintf(stderr, "gpu-vdp: no OpenGL context: %s\n", SDL_GetError());
+        }
+        // Layers, as a window draws them for an upscaler with Smooth Scrolling (only with
+        // --gpu-vdp or --layers: a plain headless run keeps the flat picture its --dump writes).
+        g_layered = (g_gpu || layers) && g_scale > 1 && !crt && hqx >= 2 && hqx <= kCleanEdge;
+        g_art_allowed = !crt && hqx < 2;
+        g_interp_capture = interp_back >= 0 || between > 0;
+        if (between == 0 && g_gpu_check && interp_back >= 0)
+            between = 3;                            // (checked as they're drawn)
         FILE* state_hash = state_hash_path.empty() ? nullptr : std::fopen(state_hash_path.c_str(), "w");
         // --frames counts pictures. Each runs one game frame, or with --fast-forward held over
         // it during a story scene up to kFastForward (as the windowed loop does). --press,
         // --poke and the other per-frame options count game frames, as before.
         int frame = 0;
+        if (!load_state_path.empty()) {             // --load-state: the game frames count on from it
+            std::vector<uint8_t> data;
+            LoadedState loaded;
+            std::string error;
+            if (!read_state_file(load_state_path, data)) {
+                std::fprintf(stderr, "Could not read %s\n", load_state_path.c_str());
+                return 1;
+            }
+            if (!load_machine(data, loaded, error)) {
+                std::fprintf(stderr, "%s %s\n", load_state_path.c_str(), error.c_str());
+                return 1;
+            }
+            frame = loaded.header.frame;
+            std::printf("Loaded %s (game frame %d)\n", load_state_path.c_str(), frame);
+        }
         for (int picture = 0; picture < headless_frames; picture++) {
           bool held = false;
           for (const auto& [first, last] : fast_forwards)
@@ -5122,6 +6554,9 @@ int main(int argc, char** argv)
             for (const Press& p : presses)
                 if (frame >= p.first && frame <= p.last)
                     g_bus.buttons |= p.button;
+            // Co-op's zoom out draws its wider, taller frame (overscan) headless too when asked
+            // for (--coop-camera), as a window does with the setting on.
+            g_overscan_wanted = coop_camera == 1 && g_coop_rom && g_bus.ram[0xFC00];
             static bool finale_left = false;        // (the finale's leave: not back in)
             const bool p2_in = join2_frame >= 0 && frame >= join2_frame && (leave2_frame < 0 || frame < leave2_frame)
                                && !finale_left;
@@ -5137,7 +6572,9 @@ int main(int argc, char** argv)
             }
             if (leaving) {
                 g_bus.ram[0xFF36] = g_bus.ram[0xFF38] = 1;
-                if ((g_bus.ram[0xFD68] == 0 && g_bus.ram[0xFF37]) || frame > leave_from + 600) {
+                if ((g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E && (g_bus.ram[0xF41D] & 1))
+                    leave_from++;                   // not while paused (as in a window)
+                else if ((g_bus.ram[0xFD68] == 0 && g_bus.ram[0xFF37]) || frame > leave_from + 600) {
                     leaving = false;
                     g_coop_rom = false;
                     g_bus.ram[0xFF30] = g_bus.ram[0xFF31] = 0;
@@ -5160,8 +6597,12 @@ int main(int argc, char** argv)
                 g_bus.ram[0xFF31] = 1;
             }
             for (const Poke& p : pokes)
-                if (frame == p.frame)
-                    g_bus.write16(p.address, p.value);
+                if (frame == p.frame) {
+                    if (p.byte)
+                        g_bus.ram[p.address & 0xFFFF] = (uint8_t)p.value;
+                    else
+                        g_bus.write16(p.address, p.value);
+                }
             for (int f : switch_frames)
                 if (frame == f)
                     set_widescreen(!g_widescreen);
@@ -5182,12 +6623,43 @@ int main(int argc, char** argv)
                     probe_capture(frame);
 #endif
             run_frame(pixels.data());
+            gpu_vdp_finish(pixels.data(), frame, picture == headless_frames - 1);   // (read for --dump)
+            if (between > 0 && g_interp.ready())    // pictures between frames, as at (between + 1) x 60 Hz
+                for (int n = 1; n <= between; n++)
+                    render_interpolated(pixels.data(), 1.0 - (double)n / (between + 1));
             if (state_hash)                         // game frame, picture, machine_hash
                 std::fprintf(state_hash, "%d %d %016llx\n", frame, picture, (unsigned long long)machine_hash());
-#ifndef NDEBUG
+            if (frame == save_state_frame) {        // --save-state-at N FILE: as game frame N ends
+                if (write_state_file(save_state_path, save_machine(frame + 1)))
+                    std::printf("Saved %s (game frame %d)\n", save_state_path.c_str(), frame);
+                else
+                    std::fprintf(stderr, "Could not write %s\n", save_state_path.c_str());
+            }
             if (!sprite_capture_dir.empty())
                 capture_sprites(sprite_capture_dir, frame);
-#endif
+            if (hd_every > 0 && frame % hd_every == 0 && g_gpu && g_gpu->hd && g_gpu_frame) {
+                std::vector<uint32_t> hd;
+                g_gpu->read(hd);
+                const int w = g_gpu->picture_width(), h = g_gpu->picture_rows(), k = GpuVdp::kHdScale;
+                char stem[32];
+                std::snprintf(stem, sizeof(stem), "/f%06d.ppm", frame);
+                if (FILE* f = std::fopen((hd_every_dir + stem).c_str(), "wb"); f && !hd.empty()) {
+                    std::fprintf(f, "P6\n%d %d\n255\n", w / k, h / k);
+                    for (int y = 0; y < h / k; y++)
+                        for (int x = 0; x < w / k; x++) {
+                            const uint32_t p = hd[(size_t)(y * k + 1) * w + x * k + 1];
+                            const uint8_t rgb[3] = {uint8_t(p >> 16), uint8_t(p >> 8), uint8_t(p)};
+                            std::fwrite(rgb, 1, 3, f);
+                        }
+                    std::fclose(f);
+                }
+            }
+            if (vdp_every > 0 && frame % vdp_every == 0) {  // --vdp-every N DIR: DIR/fFRAME.ram/.vram/.cram
+                char stem[32];
+                std::snprintf(stem, sizeof(stem), "/f%06d", frame);
+                const std::string s = vdp_every_dir + stem;
+                save_state(s + ".ram", s + ".vram", s + ".cram");
+            }
             if (log_scroll) {
                 int hs = (g_vdp.reg[13] & 0x3F) << 10;
                 auto word = [](const uint8_t* p) { return p[0] << 8 | p[1]; };
@@ -5246,6 +6718,7 @@ int main(int argc, char** argv)
             return native_probe() ? 1 : 0;
 #endif
 #endif
+        gpu_vdp_report();
         std::printf("YM2612 timer expirations: A=%u B=%u\n", g_sound.timer_expirations[0],
                     g_sound.timer_expirations[1]);
         std::printf("Ran %d pictures, %d game frames; PC=%06X GameState=$%02X VIntMode=$%02X\n", headless_frames, frame,
@@ -5265,8 +6738,29 @@ int main(int argc, char** argv)
         std::printf("VDP reg0=$%02X reg1=$%02X  irq pending=$%02X  SR=$%04X  RAM FF08=$%04X FF0A=$%04X\n",
                     g_vdp.reg[0], g_vdp.reg[1], g_irq_pending, cpu_sr_for_report(),
                     g_bus.ram[0xFF08] << 8 | g_bus.ram[0xFF09], g_bus.ram[0xFF0A] << 8 | g_bus.ram[0xFF0B]);
+        GpuVdp* drawn = g_gpu_frame ? g_gpu : nullptr;
         if (interp_back >= 0 && g_interp.ready())   // --interp-back: the last frame, drawn earlier
-            render_interpolated(pixels.data(), interp_back);
+            drawn = render_interpolated(pixels.data(), interp_back);
+        const bool rained = !drawn || drawn->layered ? false : draw_storm(drawn, interp_back >= 0 ? interp_back : 0.0);
+        // With an art pack (or Smooth Animation), --dump writes the GPU's picture
+        // (GpuVdp::kHdScale texels a game pixel each way) when the GPU drew the last picture;
+        // so it does with Weather - Stage 4's rain (drawn there only).
+        if (!dump_path.empty() && drawn && (drawn->hd || rained)) {
+            std::vector<uint32_t> hd;
+            drawn->read(hd);
+            FILE* f = std::fopen(dump_path.c_str(), "wb");
+            if (!f || hd.empty()) {
+                std::fprintf(stderr, "Could not write %s\n", dump_path.c_str());
+                return 1;
+            }
+            std::fprintf(f, "P6\n%d %d\n255\n", drawn->picture_width(), drawn->picture_rows());
+            for (uint32_t p : hd) {
+                const uint8_t rgb[3] = {uint8_t(p >> 16), uint8_t(p >> 8), uint8_t(p)};
+                std::fwrite(rgb, 1, 3, f);
+            }
+            std::fclose(f);
+            return 0;
+        }
         if (!dump_path.empty() && !save_ppm(dump_path.c_str(), pixels.data())) {
             std::fprintf(stderr, "Could not write %s\n", dump_path.c_str());
             return 1;
@@ -5280,6 +6774,7 @@ int main(int argc, char** argv)
     // Back (the gesture or button) opens and closes the menu instead of closing the app.
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     settings.fullscreen = true;
+    tv_remote_init();                               // Android TV: the remote's presses as keys
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -5330,6 +6825,23 @@ int main(int argc, char** argv)
     if (!display.init(window)) {
         std::fprintf(stderr, "Could not set up the display.\n");
         return 1;
+    }
+    // The GPU renderer: on by default (the setting, GPU Renderer in the Debug menu);
+    // --gpu-vdp or --gpu-vdp-check turn it on for a run, --no-gpu-vdp off. If it can't start,
+    // the CPU draws every frame and the menu says so.
+    // Its program, if it has to be built (the first start of a version), is built on a thread
+    // while the CPU draws, with its progress over the game (gpu_vdp_build_text).
+    if (gpu_vdp > 0 || (gpu_vdp == 0 && settings.gpu_renderer))
+        gpu_vdp_start(gpu_vdp == 2, gpu_vdp != 2);
+    g_gpu_hold = g_gpu_building && gpu_shader::on_nvidia_shield();
+    // Texture packs: the menu's choice, unless --art-pack or --no-art-pack chose for this run
+    // (until another is chosen in the menu).
+    find_texture_packs();
+    if (art_pack_dir.empty()) {
+        want_texture_pack(settings);
+        // The pack used last time loads before the game starts (the Sega logo shows with it):
+        // the game's frames wait while it is read, with its progress at the top.
+        g_packs.hold_start = !g_packs.wanted.empty();
     }
     if (crt)
         settings.crt.enabled = true;
@@ -5430,8 +6942,28 @@ int main(int argc, char** argv)
             SDL_ClearAudioStream(audio);
         save_settings(settings);
     };
+    // Save states: Save (1) or Load (2) asked for, done between game frames (see below).
+    int state_request = 0;
+    settings.save_slot = std::clamp(settings.save_slot, 1, kStateSlots);
+    for (int slot = 1; slot <= kStateSlots; slot++) {
+        update_slot_label(slot);
+        update_slot_picture(display, slot);
+    }
+    int picture_slot = 0;                           // a slot whose picture is taken once this frame is drawn
+    bool view_combo = false;                        // View held with LB or RB (a save state shortcut)
     auto act = [&](MenuChoice choice, bool& running) {
         switch (choice.action) {
+        case MenuAction::SaveState:
+        case MenuAction::LoadState:
+            if (const char* why = states_blocked())
+                menu_notice(why, 2.0);
+            else
+                state_request = choice.action == MenuAction::SaveState ? 1 : 2;
+            break;
+        case MenuAction::ChooseSaveSlot:
+            settings.save_slot = std::clamp(choice.save_slot, 1, kStateSlots);
+            save_settings(settings);
+            break;
         case MenuAction::Reset:
             power_on();
             if (audio)
@@ -5478,6 +7010,30 @@ int main(int argc, char** argv)
             settings.smooth_swing = g_smooth_swing;
             save_settings(settings);
             break;
+        case MenuAction::ToggleTexturePacks:
+            settings.texture_packs = !settings.texture_packs;
+            save_settings(settings);
+            find_texture_packs();                   // (folders added since)
+            want_texture_pack(settings);
+            break;
+        case MenuAction::ChooseTexturePack:
+            if (choice.texture_pack >= 0 && choice.texture_pack < (int)g_packs.names.size()) {
+                settings.texture_pack = g_packs.names[choice.texture_pack];
+                save_settings(settings);
+                want_texture_pack(settings);
+            }
+            break;
+        case MenuAction::ToggleGpuRenderer:
+            settings.gpu_renderer = !settings.gpu_renderer;
+            save_settings(settings);
+            g_gpu_stop_wanted = false;
+            if (!settings.gpu_renderer)
+                g_gpu_wanted = false;               // (a build still running isn't put in place)
+            if (settings.gpu_renderer && !g_gpu)
+                gpu_vdp_start(false, true);
+            else if (!settings.gpu_renderer && g_gpu)
+                g_gpu_stop_wanted = true;
+            break;
         case MenuAction::ToggleSmoothScroll:
             smooth_scroll_on = !smooth_scroll_on;
             settings.smooth_scroll = smooth_scroll_on;
@@ -5490,6 +7046,19 @@ int main(int argc, char** argv)
             break;
         case MenuAction::QuickSettings:
             apply_quick((Quick)choice.quick);
+            break;
+        case MenuAction::AllEnhancements:           // Enhancements > Graphics > Enhancements: All On / Off
+            if (g_smooth_swing_available && g_smooth_swing != choice.all_on)
+                set_smooth_swing(choice.all_on);
+            settings.smooth_swing = g_smooth_swing;
+            smooth_scroll_on = settings.smooth_scroll = choice.all_on;
+            settings.clean_rock_edges = settings.smooth_fades = settings.smooth_water = choice.all_on;
+            settings.smooth_glass = settings.remove_sprite_limit = settings.smooth_animation = choice.all_on;
+            settings.stage4_storm = choice.all_on;
+#ifndef __ANDROID__
+            settings.coop_camera = choice.all_on;   // (no co-op on Android yet)
+#endif
+            save_settings(settings);
             break;
         case MenuAction::GoToStage:
             g_bus.jump_stage = kStageIndex[choice.stage - 1];   // taken up at the top of the game's main loop
@@ -5664,6 +7233,7 @@ int main(int argc, char** argv)
 
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            tv_remote_event(event);                 // the remote held sideways: its D-pad turned
             const bool finger = event.type >= SDL_EVENT_FINGER_DOWN && event.type <= SDL_EVENT_FINGER_CANCELED;
             if (!finger || !menu_open())            // the menu takes touches as clicks while open
                 touch_event(event);
@@ -5683,16 +7253,32 @@ int main(int argc, char** argv)
                 g_coop.pad_removed(event.gdevice.which);
                 close_gamepad(event.gdevice.which);
             }
+            // The Xbox View button opens and closes the menu as it is let go; held, LB saves a state
+            // and RB loads it (Game > Save and Load), and then the menu stays as it was.
             else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
-                menu_toggle(true);                  // Xbox View button
-                update_cursor();
+                view_combo = false;
+            } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_UP && event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
+                if (!view_combo) {
+                    menu_toggle(true);
+                    update_cursor();
+                }
+                view_combo = false;
+            } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN
+                       && (event.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER
+                           || event.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
+                SDL_Gamepad* pad = SDL_GetGamepadFromID(event.gbutton.which);
+                if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK)) {
+                    view_combo = true;
+                    act({event.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER ? MenuAction::SaveState
+                                                                                  : MenuAction::LoadState}, running);
+                }
             } else if (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
                 update_cursor();
             else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
                 const SDL_Keycode key = event.key.key;
                 const bool ctrl = event.key.mod & SDL_KMOD_CTRL, alt = event.key.mod & SDL_KMOD_ALT;
-                if (key == SDLK_F1 || key == SDLK_AC_BACK) {    // Back on Android
-                    menu_toggle();
+                if (key == SDLK_F1 || key == SDLK_AC_BACK || (kEscapeIsBack && key == SDLK_ESCAPE)) {
+                    menu_toggle(tv_remote_on_tv());     // a remote has no mouse: the bar focused
                     update_cursor();
                 } else if (key == SDLK_F11 || (alt && key == SDLK_RETURN)) {
                     act({MenuAction::ToggleFullscreen}, running);
@@ -5700,6 +7286,8 @@ int main(int argc, char** argv)
                     act({MenuAction::Reset}, running);
                 } else if (key == SDLK_F2 || key == SDLK_F3 || key == SDLK_F4) {
                     act({MenuAction::QuickSettings, 0, (int)(key - SDLK_F2)}, running);
+                } else if (key == SDLK_F5 || key == SDLK_F7) {
+                    act({key == SDLK_F5 ? MenuAction::SaveState : MenuAction::LoadState}, running);
                 } else if (key == SDLK_F12) {
                     settings.crt.enabled = !settings.crt.enabled;
                     save_settings(settings);
@@ -5767,9 +7355,14 @@ int main(int argc, char** argv)
             }
         }
 #else
-        const std::string busy;
-        const float busy_progress = -1;
+        std::string busy;
+        float busy_progress = -1;
 #endif
+        bool busy_corner = false;
+        if (busy.empty()) {                         // (the GPU renderer's program being built)
+            busy = gpu_vdp_build_text(busy_progress);
+            busy_corner = !busy.empty();
+        }
         // Alt+Enter must not also press Start; the menu keeps its keys while it has focus.
         const bool* keys = SDL_GetKeyboardState(nullptr);
         const bool keyboard_free = !menu_wants_keyboard() && !keys[SDL_SCANCODE_LALT] && !keys[SDL_SCANCODE_RALT];
@@ -5813,6 +7406,8 @@ int main(int argc, char** argv)
         g_coop.p2_out = g_coop_rom && g_bus.ram[0xFD69] == 4;
         g_coop.p1_parked = g_coop_rom && g_bus.ram[0xFD68] >= 1 && g_bus.ram[0xFD68] <= 5;
         g_coop.update(g_gamepads, keyboard_free, can_join);
+        if (join2_frame >= 0 && frames_run >= join2_frame && !g_coop.joined && can_join)
+            g_coop.joined = true;                   // --join2 in a window (testing; no device of its own)
         if (g_coop.joined && finale_white())
             g_coop.finale_leave();                  // the final boss's fade to white: alone from here
         static bool continue_p1 = false, continue_p2 = false;   // until a frame has run with them
@@ -5821,7 +7416,11 @@ int main(int argc, char** argv)
         if (g_coop.leave_pending) {                 // Player 1 back in play first (coop.asm's ReviveP1),
             static int waited = 0;                  // and in a level the camera on him alone (CoopSettled)
             const bool in_level = (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E;
-            if ((!g_coop.p1_parked && (!in_level || g_bus.ram[0xFF37])) || ++waited > 600) {
+            // Not while the game is paused (PauseFlag $FFF41D bit 0): the game draws nothing new
+            // then, so switched mid-pause both Mickeys stayed on screen, red, with the HUD's
+            // numbers gone (the user's report: Player 2's controller went to sleep in a pause).
+            if (in_level && (g_bus.ram[0xF41D] & 1)) {
+            } else if ((!g_coop.p1_parked && (!in_level || g_bus.ram[0xFF37])) || ++waited > 600) {
                 waited = 0;
                 g_coop.finish_leave();
             }
@@ -5839,7 +7438,15 @@ int main(int argc, char** argv)
             };
         }
         const uint8_t player1 = pad_held_over ? (keyboard_free ? read_keys(0) : 0) : g_coop.p1;
+        menu_remote_nav(tv_remote_on_tv());
         menu_hint_text(SDL_HasGamepad() ? "Press the View button to open the Menu" : kMenuHint);
+        // How to play with a TV remote, the first time it is the only way to play (once the
+        // game runs: not over the GPU renderer's first build).
+        if (tv_remote_active() && !settings.tv_remote_help_shown && busy.empty() && !menu_open()) {
+            settings.tv_remote_help_shown = true;
+            save_settings(settings);
+            menu_notice(tv_remote_help(), 10.0);
+        }
         static std::string update_tag;
         if (update_tag.empty() && settings.check_for_updates && !(update_tag = update_available()).empty())
             menu_notice(("Update available! " + update_tag + " is out: see Game in the Menu").c_str(), 8.0);
@@ -5853,8 +7460,72 @@ int main(int argc, char** argv)
                         g_bus.ram[0xFF42] << 8 | g_bus.ram[0xFF43], g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301],
                         (int16_t)(g_bus.ram[0xDC10] << 8 | g_bus.ram[0xDC11]), (int16_t)(g_bus.ram[0xDC14] << 8 | g_bus.ram[0xDC15]),
                         (int16_t)(g_bus.ram[0xFA84] << 8 | g_bus.ram[0xFA85]), (int16_t)(g_bus.ram[0xFA80] << 8 | g_bus.ram[0xFA81]),
-                        settings.check_for_updates, update_tag.empty() ? nullptr : update_tag.c_str()}),
+                        settings.check_for_updates, update_tag.empty() ? nullptr : update_tag.c_str(), &settings.coop_camera,
+                        settings.gpu_renderer, !g_gpu_failed, settings.texture_packs, &g_packs.names,
+                        (int)(std::find(g_packs.names.begin(), g_packs.names.end(), g_packs.wanted) - g_packs.names.begin()) < (int)g_packs.names.size()
+                            ? (int)(std::find(g_packs.names.begin(), g_packs.names.end(), g_packs.wanted) - g_packs.names.begin())
+                            : -1,
+                        g_packs.loading.empty() ? nullptr : g_packs.loading.c_str(), g_packs.progress->load(),
+                        !g_gpu ? "Texture packs are drawn by the GPU renderer: switch it on in the Debug menu."
+                        : settings.crt.enabled ? "Texture packs don't show with the CRT shader: switch it off to see the pack."
+                        : hqx_on() ? "Texture packs don't show with an upscaler: set Upscaler to Off to see the pack."
+                        : nullptr, &settings.smooth_animation, busy_corner,
+                        &settings.clear_fm, &settings.clean_psg, &settings.low_pass, &settings.stage4_storm,
+                        settings.save_slot, g_slot_labels, g_slot_pictures, states_blocked()}),
             running);
+        // Save and Load (Game, F5, F7) between game frames. A save waits while co-op's ROM
+        // image is still to be switched (at the top of the game's main loop), so the state
+        // never holds a game halfway between images.
+        if (state_request == 1 && !g_bus.at_main_loop) {
+            state_request = 0;
+            const int slot = settings.save_slot;
+            char text[96];
+            g_mdplus_queued = music ? uint64_t(SDL_GetAudioStreamQueued(music) / 4) : 0;  // (16-bit stereo)
+            if (const std::string path = state_path(slot); !path.empty() && write_state_file(path, save_machine(frames_run))) {
+                std::snprintf(text, sizeof(text), "Saved to slot %d", slot);
+                update_slot_label(slot);
+                picture_slot = slot;
+            } else {
+                std::snprintf(text, sizeof(text), "Could not save to slot %d", slot);
+                std::fprintf(stderr, "Could not write %s\n", path.c_str());
+            }
+            menu_notice(text, 2.0);
+        } else if (state_request == 2) {
+            state_request = 0;
+            const int slot = settings.save_slot;
+            char text[160];
+            std::vector<uint8_t> data;
+            LoadedState loaded;
+            std::string error;
+            // The player's own settings, put back over the state's once it's in (as the menu
+            // switches them in play).
+            const bool wide = g_widescreen, swing = g_smooth_swing;
+            if (!read_state_file(state_path(slot), data)) {
+                std::snprintf(text, sizeof(text), "Slot %d is empty", slot);
+            } else if (!load_machine(data, loaded, error)) {
+                std::snprintf(text, sizeof(text), "Slot %d %s", slot, error.c_str());
+            } else {
+                if (g_widescreen != wide)
+                    set_widescreen(wide);
+                if (g_smooth_swing != swing)
+                    set_smooth_swing(swing);
+                if (std::memcmp(&g_cheats, &settings.cheats, sizeof(Cheats)) != 0) {
+                    g_cheats = settings.cheats;
+                    build_rom();
+                }
+                if (settings.mdplus != g_mdplus_on) {   // MD+ as the state had it (another cartridge)
+                    settings.mdplus = g_mdplus_on;
+                    save_settings(settings);
+                }
+                g_coop.state_loaded(g_coop_rom);
+                if (audio)
+                    SDL_ClearAudioStream(audio);
+                if (music)
+                    SDL_ClearAudioStream(music);
+                std::snprintf(text, sizeof(text), "Loaded slot %d", slot);
+            }
+            menu_notice(text, 2.0);
+        }
         if ((Quick)settings.quick != Quick::Custom && look_of(settings) != quick_look((Quick)settings.quick)) {
             settings.quick = (int)Quick::Custom;    // one of its settings was changed by hand
             save_settings(settings);
@@ -5863,6 +7534,11 @@ int main(int argc, char** argv)
         g_smooth_fades = settings.smooth_fades;
         g_smooth_water = settings.smooth_water;
         g_smooth_glass = settings.smooth_glass;
+        g_smooth_animation = settings.smooth_animation;
+        g_storm = g_storm_forced >= 0 ? g_storm_forced == 1 : settings.stage4_storm;
+        g_sound.clear_fm = settings.clear_fm;
+        g_sound.clean_psg = settings.clean_psg;
+        g_sound.low_pass = settings.low_pass;
         g_vdp.sprite_limit = !settings.remove_sprite_limit;
         if ((scrolling_smoothly() && !hqx_on()) != (g_scale > 1))
             set_smooth_scroll(scrolling_smoothly() && !hqx_on());
@@ -5870,6 +7546,19 @@ int main(int argc, char** argv)
             g_layered = !g_layered;
             g_scroll_smoother.reset();
         }
+        g_art_allowed = !hqx_on() && !settings.crt.enabled;
+        gpu_vdp_poll();
+        update_texture_pack();
+        if (g_packs.hold_start && (!g_packs.loading.empty() || g_packs.wanted != g_packs.drawn))
+            due = 0;                                // (launch: the game waits for its pack)
+        else
+            g_packs.hold_start = false;
+        if (g_gpu_hold && g_gpu_building) {
+            due = 0;                                // (the Shield, at launch: the game waits for the GPU renderer)
+            // Few pictures meanwhile: each one waits on the driver, which slows the build.
+            SDL_Delay(200);
+        } else
+            g_gpu_hold = false;
 
         const uint8_t buttons = player1 | touch_buttons() | (g_coop.p2_start_to_game ? BTN_START : 0);
         // Fast forward: held, with the menu closed, while a story scene plays (is_cutscene_state).
@@ -5912,6 +7601,13 @@ int main(int argc, char** argv)
                     g_bus.ram[0xFF35] = 1, continue_p2 = false;
                 g_bus.ram[0xFF36] = g_coop.leave_pending;
                 g_bus.ram[0xFF38] = g_coop.leave_pending;   // (never cleared by coop.asm)
+                if (join2_frame >= 0 && g_coop.joined) {    // --press2 in a window (testing)
+                    uint8_t p2 = 0;
+                    for (const Press& p : presses2)
+                        if (frames_run >= p.first && frames_run <= p.last)
+                            p2 |= p.button;
+                    g_bus.ram[0xFF30] = p2 & (uint8_t)~BTN_START;
+                }
             }
             for (const Press& p : presses)          // --press works in a window too
                 if (frames_run >= p.first && frames_run <= p.last)
@@ -5919,9 +7615,27 @@ int main(int argc, char** argv)
             for (const auto& [f, stage] : stage_jumps)  // --go-to-stage works in a window too
                 if (frames_run == f)
                     g_bus.jump_stage = kStageIndex[stage - 1];
+            g_overscan_wanted = settings.coop_camera && g_coop_rom && g_bus.ram[0xFC00];
             run_frame(pixels.data());
-            frames_run++;
-            fps_run++;
+            frames_run++;            fps_run++;
+            {
+                // Co-op Zoom: co-op level play, the setting on. The HUD's rows are the window
+                // plane's, from the line in VDP register 18 down (192 in play): not enlarged.
+                // Zooming out, the frame just drawn is wider (g_overscan, run_frame).
+                const bool zoom_on = settings.coop_camera && g_coop_rom
+                                     && g_bus.ram[0xFC00] && (g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301]) == 0x0E;
+                const int window_line = (g_vdp.reg[18] & 0x1F) * 8;
+                CoopZoom::Frame f;
+                f.width = g_out_width;
+                f.rows = g_frame_rows;
+                f.view_width = g_widescreen ? kWideWidth : kWidth;
+                f.view_left = (g_out_width - f.view_width) / 2;
+                f.camera_left = (g_out_width - kWidth) / 2;
+                f.play_lines = (g_vdp.reg[18] & 0x80) && window_line > 0 ? window_line : Vdp::kScreenHeight;
+                f.extra_rows = g_overscan ? kOverscanRows : 0;
+                f.view_top = g_overscan ? g_overscan_above : 0;
+                g_coop_zoom.step(g_bus.ram, zoom_on, f);
+            }
             if (show_state) {
                 static int shown = -1;
                 int state = g_bus.ram[0xF300] << 8 | g_bus.ram[0xF301];
@@ -5954,9 +7668,15 @@ int main(int argc, char** argv)
         const Uint64 timing_emulated = SDL_GetTicksNS();
         g_gpu_timer.begin();
 #endif
+        GpuVdp* drawn = nullptr;                    // (--gpu-vdp: the GPU that drew the picture)
         if (interpolating && g_interp.ready())
-            render_interpolated(pixels.data(), back);
+            drawn = render_interpolated(pixels.data(), back);
+        else
+            drawn = gpu_vdp_finish(pixels.data(), frames_run, false);
+        draw_storm(drawn, interpolating && g_interp.ready() ? back : 0.0);
+        unsigned drawn_layers[LayeredFrame::kLayers], drawn_water[2];
         display.clean_edge_line_width = settings.clean_edge_line_width;
+        display.zoom = g_coop_zoom.view(interpolating && g_interp.ready() ? back : 0.0);
         if (g_layered) {
             LayeredFrame frame;
             for (int i = 0; i < LayeredFrame::kLayers; i++)
@@ -5965,16 +7685,36 @@ int main(int argc, char** argv)
                 frame.water[i] = g_vdp.water_tiles.empty() && g_vdp.tile_rgba_index.empty()
                                  ? nullptr : g_water_layers[i].data();   // (tile pictures draw there too)
             frame.width = g_out_width + 2 * kLayerMargin;
-            frame.height = Vdp::kScreenHeight;
+            frame.height = g_frame_rows;
             frame.margin = kLayerMargin;
             frame.clip_left = g_layer_clip_left;
             frame.clip_right = g_layer_clip_right;
             frame.shifts = g_line_shifts;
             frame.backdrop = g_line_backdrop;
+            if (drawn && drawn->layered) {
+                for (int i = 0; i < LayeredFrame::kLayers; i++)
+                    drawn_layers[i] = drawn->layer_texture(i);
+                frame.textures = drawn_layers;
+                frame.empty = drawn->empty_layers();
+                if (drawn->has_water()) {
+                    drawn_water[0] = drawn->water_texture(0), drawn_water[1] = drawn->water_texture(1);
+                    frame.water_textures = drawn_water;
+                }
+                frame.water[0] = frame.water[1] = nullptr;      // (the CPU's are not drawn)
+            }
             display.draw_layers(frame, settings.scanlines, settings.hqx);
         } else {
-            display.draw(pixels.data(), g_out_width * g_scale, Vdp::kScreenHeight, g_out_width, settings.crt,
+            display.source_texture = drawn && !drawn->layered ? drawn->texture() : 0;
+            if (drawn && drawn->hd)                 // an art pack's picture: 4 texels a pixel each way
+                display.source_width = drawn->picture_width(), display.source_height = drawn->picture_rows();
+            display.draw(pixels.data(), g_out_width * g_scale, g_frame_rows, g_out_width, settings.crt,
                          settings.scanlines, settings.hqx);
+            display.source_texture = 0;
+            display.source_width = display.source_height = 0;
+        }
+        if (picture_slot) {                         // a save's picture, without the menu over it
+            save_slot_picture(display, picture_slot);
+            picture_slot = 0;
         }
         menu_render();
 #ifndef NDEBUG
@@ -6099,6 +7839,9 @@ int main(int argc, char** argv)
     }
 
     menu_shutdown();
+    gpu_vdp_report();
+    if (g_gpu)
+        g_gpu->shutdown();
     display.shutdown();
     if (audio)
         SDL_DestroyAudioStream(audio);
@@ -6108,6 +7851,7 @@ int main(int argc, char** argv)
         SDL_CloseAudioDevice(audio_device);
     for (SDL_Gamepad* pad : g_gamepads)
         SDL_CloseGamepad(pad);
+    gpu_shader::abandon();                          // (a build still running ends with the process)
     SDL_GL_DestroyContext(gl);
     SDL_DestroyWindow(window);
     SDL_Quit();

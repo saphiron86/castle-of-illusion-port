@@ -13,6 +13,17 @@ extern "C" {
 }
 
 class Bus;
+class StateWriter;
+class StateReader;
+
+// The YM2612, with its DAC's "ladder effect" (the crossover distortion of the first
+// consoles' discrete YM2612) optional: off, it sounds as the YM3438 in later consoles does.
+class Opn2 : public ymfm::ym2612 {
+public:
+    using ymfm::ym2612::ym2612;
+    bool ladder = true;
+    void generate_sample(output_data* out);
+};
 
 class Sound : public ymfm::ymfm_interface {
 public:
@@ -23,6 +34,11 @@ public:
     explicit Sound(Bus& bus);
 
     void power_on();                // Z80 held in reset, chips cleared
+
+    // Save states (savestate.h): the Z80, the YM2612 (ymfm's own save), the PSG and the
+    // timing between them. The output filters' state too, so a load doesn't click.
+    void save_state(StateWriter& w);
+    bool load_state(StateReader& r);
 
     int sample_rate() const { return (int)(kYmClock / kYmClocksPerSample); }
 
@@ -36,6 +52,11 @@ public:
     void clear_irq() { cpu.int_pending = false; }
 
     void psg_write(uint8_t value) { psg.write(value); }
+
+    // Enhancements > Audio. They change only the output samples, never the chips' state.
+    bool clear_fm = false;          // Clear FM: no ladder effect
+    bool clean_psg = false;         // Clean PSG: band-limited instead of averaged
+    bool low_pass = false;          // Model 1 Low-Pass: the first console's output filter
 
     // Statistics for testing: how often each YM2612 timer has expired.
     unsigned timer_expirations[2] = {};
@@ -51,7 +72,7 @@ private:
 
     Bus& bus;
     z80 cpu{};
-    ymfm::ym2612 ym;
+    Opn2 ym;
     Psg psg;
     uint16_t bank = 0;              // 9-bit bank register: Z80 $8000-$FFFF = 68000 (bank << 15)
     bool reset_held = true;
@@ -60,4 +81,5 @@ private:
     double z80_budget = 0;          // Z80 cycles owed to the current sample
     double z80_cycles_per_sample;
     double dc_in[2] = {}, dc_out[2] = {};   // DC-blocking filter state, like the console's output capacitors
+    double lp[2] = {};              // Model 1 Low-Pass state
 };

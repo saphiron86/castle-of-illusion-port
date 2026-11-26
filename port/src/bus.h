@@ -10,6 +10,8 @@ uint32_t current_pc();
 
 class Vdp;
 class Sound;
+class StateWriter;
+class StateReader;
 
 // Controller buttons, as bits of Bus::buttons (1 = pressed).
 enum Button : uint8_t {
@@ -67,6 +69,10 @@ public:
             port_ctrl[i] = s.port_ctrl[i];
         z80_bus_requested = s.z80_bus_requested;
     }
+
+    // Save states (savestate.h): memory, the I/O state and the stage select's bookkeeping.
+    void save_state(StateWriter& w) const;
+    bool load_state(StateReader& r);
 
 private:
     void apply_stage_select();

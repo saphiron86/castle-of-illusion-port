@@ -170,6 +170,8 @@ std::string apply_smooth_swing(std::vector<uint8_t>& rom)
     return "";
 }
 
+bool is_swing_script(uint32_t script) { return script == kOriginalScript || script == kScript; }
+
 void convert_swing_objects(uint8_t* ram, bool to_smooth)
 {
     // Object slots are $40 bytes; a vine has its script pointer at +6, step at +$B and the

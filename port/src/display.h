@@ -41,6 +41,29 @@ struct LayeredFrame {
     // 0xAARRGGBB (0 = none), each width x height, laid over the layers behind it after plane
     // A's layer of the same priority (moving with it); nullptr: none.
     const uint32_t* water[2] = {nullptr, nullptr};
+    // When set, the layers are these textures (RGBA, width x height; --gpu-vdp drew them) and
+    // `layers` is not read: no upload, and each layer is upscaled whole, unless its bit in
+    // `empty` says it is clear.
+    const unsigned* textures = nullptr;
+    unsigned empty = 0;         // (with textures) bit i: layer i is clear
+    // With textures: Smooth Water's two layers as textures (RGBA, premultiplied; --gpu-vdp drew
+    // them), or nullptr for none (`water` is not read).
+    const unsigned* water_textures = nullptr;
+};
+
+// Co-op Zoom (CoopZoom in coop.h): the part of the screen above `split` (0-1 of its height)
+// shows this rectangle of the picture (left, top, width and height, each 0-1 of the picture),
+// enlarged or reduced, and the part below it (the game's HUD) the hud_ rectangle. The screen
+// has the shape screen_width x screen_height (game pixels), whatever the picture's. width 0:
+// no zoom, the picture as it is. `resample`: the view isn't at the usual scale, so sharp
+// pixels are blended at their edges.
+struct ZoomView {
+    float left = 0, top = 0, width = 0, height = 0;
+    float split = 1;
+    float hud_left = 0, hud_top = 0, hud_width = 0, hud_height = 0;
+    float screen_width = 0, screen_height = 0;
+    bool resample = false;
+    bool on() const { return width > 0; }
 };
 
 // The `hqx` value that picks cleanEdge (torcado's upscaler, display.cpp) instead of hqx; it
@@ -62,6 +85,12 @@ public:
     // frame has one texel per game pixel.
     void draw(const uint32_t* pixels, int width, int height, int logical_width, const CrtSettings& crt,
               int scanlines, int hqx);
+    // When set, draw() takes the frame from this texture (RGBA, the size draw is given) instead
+    // of uploading `pixels` (--gpu-vdp: the GPU drew the frame).
+    unsigned source_texture = 0;
+    // The source texture's size when it isn't the size draw is given (an art pack's picture,
+    // 4 texels a game pixel each way); 0 = the same.
+    int source_width = 0, source_height = 0;
 
     // Draws a layered frame through hqx at scale `hqx` (2-4), or cleanEdge (kCleanEdge).
     // Returns false, drawing nothing, if that upscaler is not available.
@@ -69,13 +98,21 @@ public:
     bool hqx_available() const { return hqx_ready; }
     bool clean_edge_available() const { return clean_edge != 0; }
     float clean_edge_line_width = 1.0f;     // how wide its diagonal lines are drawn (0.45-1.14)
+    ZoomView zoom;                          // Co-op Zoom, for draw and draw_layers (not Android's half-size CRT)
 
     // Reads back the window's current picture as RGB rows, top first (for testing).
     bool read_window(std::vector<uint8_t>& rgb, int& width, int& height);
+    // The same for the game's picture alone (the last frame's letterboxed area), drawn but
+    // not yet overlaid by the menu: save state thumbnails.
+    bool read_picture(std::vector<uint8_t>& rgb, int& width, int& height);
+    // A texture (linear filtering) holding `rgb` rows, top first; `reuse`: one to refill.
+    unsigned rgb_texture(const uint8_t* rgb, int width, int height, unsigned reuse = 0);
+    void free_texture(unsigned texture);
 
 private:
     SDL_Window* window = nullptr;
     unsigned texture = 0, program = 0, vao = 0;
+    int picture_x = 0, picture_y = 0, picture_w = 0, picture_h = 0;    // the last picture's area (GL, from the bottom)
     int tex_width = 0, tex_height = 0;
     // The CRT shader at half size and the pass enlarging it (Android only; see draw()).
     unsigned crt_finish = 0, crt_half = 0, crt_half_fbo = 0;
@@ -99,7 +136,7 @@ private:
     bool init_hqx();
     bool hqx_resize(HqxTarget& target, int width, int height, int scale, bool alpha);
     void hqx_free(HqxTarget& target);
-    void hqx_run(HqxTarget& target, unsigned pass1, unsigned source, bool alpha);
+    void hqx_run(HqxTarget& target, unsigned pass1, unsigned source, bool alpha, bool rgba_source = false);
     bool hqx_ready = false;
     int clean_edge_scale(int logical_width, int height) const;
     // cleanEdge's first pass's output, per source pixel: one for each layer and one for a whole

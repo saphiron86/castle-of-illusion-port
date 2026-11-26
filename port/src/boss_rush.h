@@ -14,3 +14,7 @@ std::string apply_boss_rush(std::vector<uint8_t>& rom);
 // Co-op (coop.asm, assembled with Boss Rush's code): the patches that run Player 2. Apply after
 // apply_boss_rush, which puts the code in place.
 std::string apply_coop(std::vector<uint8_t>& rom);
+
+// Nemesis decompression (the game's NemDec, $07FBAE): the tiles at `src`, 32 bytes each, or
+// nothing if the data runs past the ROM or holds a code the table doesn't.
+std::vector<uint8_t> nemesis_decode(const std::vector<uint8_t>& rom, size_t src);

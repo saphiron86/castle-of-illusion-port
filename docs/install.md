@@ -61,6 +61,24 @@ A phone's GPU can't do everything a PC's can, so the Android menu offers HQ2x bu
 | Start   | Enter    | Menu                     |
 | Fast forward (story scenes) | Backspace (hold) | Y (hold) |
 | Port menu | F1     | Back (View)              |
+| Save / load state (Game menu) | F5 / F7 | View + LB / View + RB |
+
+### Android TV remote
+
+On an Android TV such as the NVIDIA Shield, you can play with the remote while no controller is connected. Hold it sideways, with the D-pad on the left:
+
+![The Shield remote held sideways: the D-pad moves, its centre is Start / Pause, Back opens the menu, and the next three buttons along are A, B and C](images/shield-remote-controls.svg)
+
+| Genesis | Shield remote (held sideways) |
+|---------|-------------------------------|
+| D-pad   | D-pad (turned with the remote) |
+| A       | Fast forward |
+| B       | Play / pause |
+| C       | Rewind |
+| Start   | D-pad centre |
+| Port menu | Back (the D-pad then moves in the menu, and the centre selects) |
+
+Connecting a controller switches to it at once, and the remote is back in play once it disconnects. The first time the remote is the only way to play, a notice explains the buttons. Playing with the remote adds a slight input lag, so a controller is recommended.
 
 Controllers go through SDL's gamepad support (XInput, DirectInput and other Windows input APIs; on Linux evdev, hidraw and Steam Input), can be connected at any time, and work alongside the keyboard.
 

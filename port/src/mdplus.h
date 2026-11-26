@@ -26,6 +26,17 @@ public:
     // Stops the music (a reset, or MD+ switched off).
     void stop();
 
+    // Save states (savestate.h): the track playing and where (in sample frames), restored by
+    // playing it again from there.
+    struct State {
+        int track = -1;             // -1: none
+        bool looping = false, paused = false, registers_open = false;
+        uint64_t position = 0;
+        int fade_frames = 0, fade_left = 0;
+    };
+    State state() const;
+    void restore(const State& s);
+
     // Keeps the music stream supplied; call every frame. The stream takes 44.1 kHz 16-bit
     // stereo, as the tracks are.
     void feed(SDL_AudioStream* stream);

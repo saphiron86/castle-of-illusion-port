@@ -21,6 +21,11 @@ public:
         int x = 0, y = 0;
         int camera_x = 0, camera_y = 0;
         bool screen = false;
+        // Its animation as DrawObject drew it (bytes $02, $0A-$0C) and its tile base ($04),
+        // for Smooth Animation (smooth_animation.h).
+        uint8_t flags = 0, anim = 0, anim_frame = 0, anim_timer = 0;
+        uint16_t tile_base = 0;
+        int16_t vel_x = 0;                  // ObjVelX's whole pixels ($18)
     };
     // The VDP state each active line was drawn with.
     struct Line {
@@ -51,6 +56,8 @@ public:
 
     // True once two consecutive frames are captured.
     bool ready() const;
+    // The owners of the sprite table the VDP shows now (copied at the last sprite DMA).
+    const std::array<Owner, kSprites>& shown_owners() const { return latched; }
     const Snapshot& previous() const { return snaps[cur ^ 1]; }
     const Snapshot& current() const { return snaps[cur]; }
 

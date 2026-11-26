@@ -150,6 +150,26 @@ void MdPlus::play(int number, bool loop)
     fade_frames = fade_left = 0;
 }
 
+MdPlus::State MdPlus::state() const
+{
+    return {file ? track : -1, looping, paused, registers_open, position, fade_frames, fade_left};
+}
+
+void MdPlus::restore(const State& s)
+{
+    stop();
+    registers_open = s.registers_open;
+    if (s.track < 1)
+        return;
+    play(s.track, s.looping);
+    if (!file)
+        return;
+    position = std::min<uint64_t>(s.position, data_frames);
+    paused = s.paused;
+    fade_frames = s.fade_frames;
+    fade_left = s.fade_left;
+}
+
 void MdPlus::stop()
 {
     if (file)

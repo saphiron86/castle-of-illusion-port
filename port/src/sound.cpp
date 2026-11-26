@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "bus.h"
+#include "state_io.h"
 
 // ---------------------------------------------------------------------------
 // Z80, YM2612 and mixing
@@ -26,6 +27,99 @@ void Sound::power_on()
     timer_clocks[0] = timer_clocks[1] = -1;
     z80_budget = 0;
     dc_in[0] = dc_in[1] = dc_out[0] = dc_out[1] = 0;
+    lp[0] = lp[1] = 0;
+}
+
+void Sound::save_state(StateWriter& w)
+{
+    w.put<uint64_t>(cpu.cyc);
+    for (uint16_t v : {cpu.pc, cpu.sp, cpu.ix, cpu.iy, cpu.mem_ptr})
+        w.put(v);
+    for (uint8_t v : {cpu.a, cpu.b, cpu.c, cpu.d, cpu.e, cpu.h, cpu.l, cpu.a_, cpu.b_, cpu.c_, cpu.d_, cpu.e_, cpu.h_,
+                      cpu.l_, cpu.f_, cpu.i, cpu.r})
+        w.put(v);
+    for (bool v : {(bool)cpu.sf, (bool)cpu.zf, (bool)cpu.yf, (bool)cpu.hf, (bool)cpu.xf, (bool)cpu.pf, (bool)cpu.nf,
+                   (bool)cpu.cf})
+        w.put(v);
+    w.put(cpu.iff_delay);
+    w.put(cpu.interrupt_mode);
+    w.put(cpu.int_data);
+    for (bool v : {(bool)cpu.iff1, (bool)cpu.iff2, (bool)cpu.halted, (bool)cpu.int_pending, (bool)cpu.nmi_pending})
+        w.put(v);
+    std::vector<uint8_t> chip;
+    ymfm::ymfm_saved_state saved(chip, true);
+    ym.save_restore(saved);
+    w.put<uint32_t>((uint32_t)chip.size());
+    w.bytes(chip.data(), chip.size());
+    psg.save_state(w);
+    w.put(bank);
+    w.put(reset_held);
+    w.put(bus_requested);
+    w.put_array(timer_clocks);
+    w.put(z80_budget);
+    w.put_array(dc_in);
+    w.put_array(dc_out);
+    w.put_array(lp);
+}
+
+bool Sound::load_state(StateReader& r)
+{
+    // (In a game that never released the Z80 from reset, it has no memory to run on yet.)
+    cpu.read_byte = z80_read;
+    cpu.write_byte = z80_write;
+    cpu.port_in = z80_in;
+    cpu.port_out = z80_out;
+    cpu.userdata = this;
+    cpu.cyc = (unsigned long)r.get<uint64_t>();
+    for (uint16_t* v : {&cpu.pc, &cpu.sp, &cpu.ix, &cpu.iy, &cpu.mem_ptr})
+        r.get(*v);
+    for (uint8_t* v : {&cpu.a, &cpu.b, &cpu.c, &cpu.d, &cpu.e, &cpu.h, &cpu.l, &cpu.a_, &cpu.b_, &cpu.c_, &cpu.d_, &cpu.e_,
+                       &cpu.h_, &cpu.l_, &cpu.f_, &cpu.i, &cpu.r})
+        r.get(*v);
+    cpu.sf = r.get<bool>(), cpu.zf = r.get<bool>(), cpu.yf = r.get<bool>(), cpu.hf = r.get<bool>();
+    cpu.xf = r.get<bool>(), cpu.pf = r.get<bool>(), cpu.nf = r.get<bool>(), cpu.cf = r.get<bool>();
+    r.get(cpu.iff_delay);
+    r.get(cpu.interrupt_mode);
+    r.get(cpu.int_data);
+    cpu.iff1 = r.get<bool>(), cpu.iff2 = r.get<bool>(), cpu.halted = r.get<bool>();
+    cpu.int_pending = r.get<bool>(), cpu.nmi_pending = r.get<bool>();
+    const uint32_t size = r.get<uint32_t>();
+    if (!r.ok() || size > r.left())
+        return false;
+    std::vector<uint8_t> chip(size);
+    r.bytes(chip.data(), size);
+    ymfm::ymfm_saved_state saved(chip, false);
+    ym.save_restore(saved);
+    psg.load_state(r);
+    r.get(bank);
+    r.get(reset_held);
+    r.get(bus_requested);
+    r.get_array(timer_clocks);
+    r.get(z80_budget);
+    r.get_array(dc_in);
+    r.get_array(dc_out);
+    r.get_array(lp);
+    return r.ok();
+}
+
+void Opn2::generate_sample(output_data* out)
+{
+    if (ladder) {
+        generate(out);
+        return;
+    }
+    // As ymfm::ym3438::generate: the channels summed with no DAC discontinuity.
+    m_fm.clock(fm_engine::ALL_CHANNELS);
+    if (!m_dac_enable) {
+        m_fm.output(out->clear(), 5, 256, fm_engine::ALL_CHANNELS);
+    } else {
+        int32_t dacval = int16_t(m_dac_data << 7) >> 7;
+        out->data[0] = m_fm.regs().ch_output_0(0x102) ? dacval : 0;
+        out->data[1] = m_fm.regs().ch_output_1(0x102) ? dacval : 0;
+        m_fm.output(*out, 5, 256, fm_engine::ALL_CHANNELS ^ (1 << 5));
+    }
+    out->data[0] = (out->data[0] * 128) / 6;
+    out->data[1] = (out->data[1] * 128) / 6;
 }
 
 void Sound::set_reset(bool held)
@@ -83,14 +177,18 @@ void Sound::run(double z80_cycles, std::vector<int16_t>& out)
         }
 
         ymfm::ym2612::output_data ym_out;
-        ym.generate(&ym_out);
-        int32_t psg_out = psg.sample(psg_steps_per_sample);
+        ym.ladder = !clear_fm;
+        ym.generate_sample(&ym_out);
+        int32_t psg_out = clean_psg ? psg.sample_clean(psg_steps_per_sample) : psg.sample(psg_steps_per_sample);
+        // Model 1 Low-Pass: first order at 3390 Hz (BlastEm's default for a Model 1).
+        static const double kLowPass = 1.0 - std::exp(-2.0 * 3.14159265358979 * 3390.0 / (kYmClock / kYmClocksPerSample));
         for (int c = 0; c < 2; c++) {
             // First-order high-pass (about 5 Hz) removes the constant offset of the chips' outputs.
             double in = ym_out.data[c] + psg_out;
             dc_out[c] = in - dc_in[c] + 0.9994 * dc_out[c];
             dc_in[c] = in;
-            out.push_back((int16_t)std::clamp((int)dc_out[c], -32768, 32767));
+            lp[c] += kLowPass * (dc_out[c] - lp[c]);
+            out.push_back((int16_t)std::clamp((int)(low_pass ? lp[c] : dc_out[c]), -32768, 32767));
         }
     }
 }
